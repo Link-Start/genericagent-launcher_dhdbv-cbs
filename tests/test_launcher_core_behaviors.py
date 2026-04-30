@@ -2273,7 +2273,8 @@ tg_bot_token = '123'
         self.assertIn("README-macOS.txt", src)
         self.assertIn("install-metadata.json", src)
         self.assertIn('"channel": "stable"', src)
-        self.assertIn('"version_json": "Contents/MacOS/version.json"', src)
+        self.assertIn('MACOS_VERSION_JSON_RELATIVE_PATH = "Contents/Resources/version.json"', src)
+        self.assertIn('"version_json": MACOS_VERSION_JSON_RELATIVE_PATH', src)
         self.assertIn('MACOS_INSTALL_TARGET = f"/Applications/{APP_BUNDLE_NAME}"', src)
         self.assertIn("~/Library/Application Support/GenericAgentLauncher", src)
         self.assertIn("build_macos_icon_assets", src)
@@ -2398,7 +2399,7 @@ tg_bot_token = '123'
         self.assertIn('os.readlink(applications_alias) != "/Applications"', src)
         self.assertIn("mounted dmg is missing install-metadata.json", src)
         self.assertIn("expected_arch=expected_arch", src)
-        self.assertIn("Contents/MacOS/version.json", src)
+        self.assertIn('MACOS_VERSION_JSON_RELATIVE_PATH = "Contents/Resources/version.json"', src)
 
     def test_build_bat_auto_loads_local_update_signing_key_files(self):
         root = os.path.dirname(os.path.dirname(__file__))

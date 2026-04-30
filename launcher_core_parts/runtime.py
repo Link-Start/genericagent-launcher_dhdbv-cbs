@@ -592,13 +592,30 @@ def save_version_state(state):
 
 def launcher_version_info():
     defaults = {"version": "0.0.0-dev", "channel": "stable", "commit": "", "build_time": ""}
-    candidates = [
-        os.path.join(APP_DIR, "version.json"),
-        os.path.join(os.path.dirname(APP_DIR), "version.json"),
-    ]
+    candidates = []
+    if IS_MACOS:
+        candidates.extend(
+            [
+                os.path.join(os.path.dirname(APP_DIR), "Resources", "version.json"),
+                os.path.join(APP_DIR, "version.json"),
+                os.path.join(os.path.dirname(APP_DIR), "version.json"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                os.path.join(APP_DIR, "version.json"),
+                os.path.join(os.path.dirname(APP_DIR), "version.json"),
+            ]
+        )
     if getattr(sys, "frozen", False):
         candidates.insert(0, os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "version.json"))
+    seen = set()
     for fp in candidates:
+        normalized = os.path.normcase(os.path.normpath(fp))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
         if not os.path.isfile(fp):
             continue
         payload = _read_json_file(fp, None)

@@ -71,7 +71,7 @@ class BuildMacOSReleaseTests(unittest.TestCase):
         self.assertEqual(payload["artifact_names"]["sha256"], "GenericAgentLauncher-macos-1.2.3.sha256")
         self.assertEqual(payload["artifact_names"]["readme"], "README-macOS.txt")
         self.assertEqual(payload["artifact_names"]["metadata"], "install-metadata.json")
-        self.assertEqual(payload["artifact_names"]["version_json"], "Contents/MacOS/version.json")
+        self.assertEqual(payload["artifact_names"]["version_json"], "Contents/Resources/version.json")
 
     def test_copy_app_bundle_uses_copytree_with_symlink_preservation(self):
         with tempfile.TemporaryDirectory() as td:

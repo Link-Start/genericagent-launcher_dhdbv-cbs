@@ -29,7 +29,7 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
         self.assertEqual(names["sha256"], "GenericAgentLauncher-macos-1.2.3.sha256")
         self.assertEqual(names["readme"], "README-macOS.txt")
         self.assertEqual(names["metadata"], "install-metadata.json")
-        self.assertEqual(names["version_json"], "Contents/MacOS/version.json")
+        self.assertEqual(names["version_json"], "Contents/Resources/version.json")
 
     def test_parse_sha256_file_reads_hash_and_filename(self):
         with tempfile.TemporaryDirectory() as td:
@@ -86,14 +86,14 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
             app_dir = os.path.join(td, "GenericAgent Launcher.app")
             contents = os.path.join(app_dir, "Contents")
             macos = os.path.join(contents, "MacOS")
-            frameworks = os.path.join(contents, "Frameworks")
             resources = os.path.join(contents, "Resources")
+            frameworks = os.path.join(contents, "Frameworks")
             os.makedirs(macos, exist_ok=True)
             os.makedirs(frameworks, exist_ok=True)
             os.makedirs(resources, exist_ok=True)
             with open(os.path.join(macos, "GenericAgentLauncher"), "w", encoding="utf-8") as f:
                 f.write("stub")
-            with open(os.path.join(macos, "version.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(resources, "version.json"), "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "version": "1.2.3",
@@ -130,10 +130,12 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
             app_dir = os.path.join(td, "GenericAgent Launcher.app")
             contents = os.path.join(app_dir, "Contents")
             macos = os.path.join(contents, "MacOS")
+            resources = os.path.join(contents, "Resources")
             os.makedirs(macos, exist_ok=True)
+            os.makedirs(resources, exist_ok=True)
             with open(os.path.join(macos, "GenericAgentLauncher"), "w", encoding="utf-8") as f:
                 f.write("stub")
-            with open(os.path.join(macos, "version.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(resources, "version.json"), "w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "version": "1.2.3",

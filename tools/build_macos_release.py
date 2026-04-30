@@ -24,6 +24,7 @@ MACOS_INSTALL_TARGET = f"/Applications/{APP_BUNDLE_NAME}"
 MACOS_USER_INSTALL_TARGET = f"~/Applications/{APP_BUNDLE_NAME}"
 MACOS_DATA_ROOT = "~/Library/Application Support/GenericAgentLauncher"
 MACOS_CONFIG_PATH = f"{MACOS_DATA_ROOT}/config/launcher_config.json"
+MACOS_VERSION_JSON_RELATIVE_PATH = "Contents/Resources/version.json"
 
 
 def _repo_root() -> str:
@@ -97,7 +98,7 @@ def _artifact_names(version: str) -> dict:
         "sha256": f"GenericAgentLauncher-macos-{resolved_version}.sha256",
         "readme": "README-macOS.txt",
         "metadata": "install-metadata.json",
-        "version_json": "Contents/MacOS/version.json",
+        "version_json": MACOS_VERSION_JSON_RELATIVE_PATH,
     }
 
 
@@ -269,7 +270,7 @@ def main() -> int:
 
     version_meta = _version_metadata(version, commit=str(args.commit or "").strip())
 
-    version_json = os.path.join(app_path, "Contents", "MacOS", "version.json")
+    version_json = os.path.join(app_path, *MACOS_VERSION_JSON_RELATIVE_PATH.split("/"))
     _write_json(version_json, version_meta)
     _write_bundle_info_plist_versions(app_path, version)
     _ad_hoc_codesign_bundle(app_path)

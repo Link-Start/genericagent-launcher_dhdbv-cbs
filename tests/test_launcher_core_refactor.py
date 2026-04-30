@@ -87,6 +87,46 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             finally:
                 runtime.APP_DIR = original_app_dir
 
+    def test_launcher_version_info_prefers_macos_resources_version_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = os.path.join(td, "GenericAgent Launcher.app", "Contents", "MacOS")
+            resources_dir = os.path.join(td, "GenericAgent Launcher.app", "Contents", "Resources")
+            os.makedirs(app_dir, exist_ok=True)
+            os.makedirs(resources_dir, exist_ok=True)
+            with open(os.path.join(app_dir, "version.json"), "w", encoding="utf-8") as f:
+                json.dump({"version": "0.9.0", "channel": "stable", "commit": "old", "build_time": "old-time"}, f)
+            with open(os.path.join(resources_dir, "version.json"), "w", encoding="utf-8") as f:
+                json.dump({"version": "1.2.3", "channel": "stable", "commit": "new", "build_time": "new-time"}, f)
+
+            original_app_dir = runtime.APP_DIR
+            runtime.APP_DIR = app_dir
+            try:
+                with mock.patch.object(runtime, "IS_MACOS", True), mock.patch.object(runtime.sys, "frozen", False, create=True):
+                    info = runtime.launcher_version_info()
+            finally:
+                runtime.APP_DIR = original_app_dir
+
+        self.assertEqual(info["version"], "1.2.3")
+        self.assertEqual(info["commit"], "new")
+
+    def test_launcher_version_info_falls_back_to_legacy_macos_version_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = os.path.join(td, "GenericAgent Launcher.app", "Contents", "MacOS")
+            os.makedirs(app_dir, exist_ok=True)
+            with open(os.path.join(app_dir, "version.json"), "w", encoding="utf-8") as f:
+                json.dump({"version": "1.0.1", "channel": "stable", "commit": "legacy", "build_time": "legacy-time"}, f)
+
+            original_app_dir = runtime.APP_DIR
+            runtime.APP_DIR = app_dir
+            try:
+                with mock.patch.object(runtime, "IS_MACOS", True), mock.patch.object(runtime.sys, "frozen", False, create=True):
+                    info = runtime.launcher_version_info()
+            finally:
+                runtime.APP_DIR = original_app_dir
+
+        self.assertEqual(info["version"], "1.0.1")
+        self.assertEqual(info["commit"], "legacy")
+
     def test_macos_installation_status_warns_when_running_from_disk_image(self):
         bundle = f"/Volumes/GenericAgentLauncher/{runtime.APP_DISPLAY_NAME}.app"
         executable = f"{bundle}/Contents/MacOS/GenericAgentLauncher"

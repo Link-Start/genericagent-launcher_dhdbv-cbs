@@ -16,6 +16,7 @@ INSTALL_TARGET = f"/Applications/{APP_BUNDLE_NAME}"
 USER_INSTALL_TARGET = f"~/Applications/{APP_BUNDLE_NAME}"
 DATA_ROOT = "~/Library/Application Support/GenericAgentLauncher"
 CONFIG_PATH = f"{DATA_ROOT}/config/launcher_config.json"
+MACOS_VERSION_JSON_RELATIVE_PATH = "Contents/Resources/version.json"
 
 
 def _parse_args():
@@ -80,7 +81,7 @@ def _expected_artifact_names(version: str) -> dict:
         "sha256": f"GenericAgentLauncher-macos-{resolved}.sha256",
         "readme": "README-macOS.txt",
         "metadata": "install-metadata.json",
-        "version_json": "Contents/MacOS/version.json",
+        "version_json": MACOS_VERSION_JSON_RELATIVE_PATH,
     }
 
 
@@ -196,7 +197,7 @@ def _assert_release_bundle(app_path: str, *, version: str, expected_commit: str 
     if not os.path.isdir(app_path):
         _die(f"app bundle not found: {app_path}")
     exe = os.path.join(app_path, "Contents", "MacOS", "GenericAgentLauncher")
-    version_json = os.path.join(app_path, "Contents", "MacOS", "version.json")
+    version_json = os.path.join(app_path, *MACOS_VERSION_JSON_RELATIVE_PATH.split("/"))
     info_plist = os.path.join(app_path, "Contents", "Info.plist")
     if not os.path.isfile(exe):
         _die(f"app executable missing: {exe}")
