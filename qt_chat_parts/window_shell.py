@@ -533,7 +533,7 @@ class WindowShellMixin:
             try:
                 dl.setStyleSheet(
                     f"QTextEdit {{ background: {C['layer2']}; color: {C['code_text']}; border: none; "
-                    f"border-radius: {F['radius_md']}px; font-family: Consolas, 'Microsoft YaHei UI'; font-size: 12px; padding: 10px 12px; }}"
+                    f"border-radius: {F['radius_md']}px; font-family: {F['font_family_mono']}; font-size: 12px; padding: 10px 12px; }}"
                 )
             except Exception:
                 pass
@@ -610,7 +610,7 @@ class WindowShellMixin:
             try:
                 dl.setStyleSheet(
                     f"QTextEdit {{ background: {C['layer2']}; color: {C['code_text']}; border: none; "
-                    f"border-radius: {F['radius_md']}px; font-family: Consolas, 'Microsoft YaHei UI'; font-size: 12px; padding: 10px 12px; }}"
+                    f"border-radius: {F['radius_md']}px; font-family: {F['font_family_mono']}; font-size: 12px; padding: 10px 12px; }}"
                 )
                 vp = dl.viewport()
                 if vp is not None:
@@ -631,7 +631,14 @@ class WindowShellMixin:
         auto_on = bool(self.cfg.get("autonomous_enabled", False))
         settings_action = menu.addAction("⚙  设置")
         welcome_action = menu.addAction("⌂  欢迎页")
-        tray_action = menu.addAction("🗕  缩小到托盘，仅保留悬浮窗")
+        floating_action_text = "🗕  缩小到托盘，仅保留悬浮窗"
+        floating_label_getter = getattr(self, "_functions_menu_floating_action_text", None)
+        if callable(floating_label_getter):
+            try:
+                floating_action_text = str(floating_label_getter() or floating_action_text)
+            except Exception:
+                floating_action_text = "🗕  缩小到托盘，仅保留悬浮窗"
+        tray_action = menu.addAction(floating_action_text)
         menu.addSeparator()
         reinject_action = menu.addAction("🛠  重新注入工具示范")
         pet_action = menu.addAction("🐱  启动桌面宠物")
@@ -647,7 +654,11 @@ class WindowShellMixin:
         elif chosen is welcome_action:
             self._show_welcome()
         elif chosen is tray_action:
-            self._enter_tray_floating_mode()
+            action = getattr(self, "_handle_functions_menu_floating_action", None)
+            if callable(action):
+                action()
+            else:
+                self._enter_tray_floating_mode()
         elif chosen is reinject_action:
             self._reinject_tools()
         elif chosen is pet_action:

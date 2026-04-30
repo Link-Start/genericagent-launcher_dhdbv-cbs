@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
+import sys
 import time
 
 from .runtime import (
@@ -34,6 +36,38 @@ _PACKAGE_IMPORT_NAME_MAP = {
 }
 
 
+def _macos_python_absolute_commands():
+    if sys.platform != "darwin":
+        return []
+    home = os.path.expanduser("~")
+    candidates = [
+        "/opt/homebrew/bin/python3",
+        "/opt/homebrew/bin/python",
+        "/usr/local/bin/python3",
+        "/usr/local/bin/python",
+        "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/Current/bin/python",
+    ]
+    if home and home not in ("~", "/"):
+        home_posix = str(home).replace("\\", "/")
+        candidates += [
+            posixpath.join(home_posix, ".pyenv", "shims", "python3"),
+            posixpath.join(home_posix, ".pyenv", "shims", "python"),
+        ]
+    out = []
+    seen = set()
+    for path in candidates:
+        raw = str(path or "").strip()
+        if not raw:
+            continue
+        norm = os.path.normcase(os.path.normpath(raw))
+        if norm in seen or (not os.path.isfile(raw)):
+            continue
+        seen.add(norm)
+        out.append([raw])
+    return out
+
+
 def _system_python_commands():
     candidates = []
     cfg_py = None
@@ -51,6 +85,7 @@ def _system_python_commands():
         candidates += [["py", "-3"], ["python"], ["python3"]]
     else:
         candidates += [["python3"], ["python"]]
+        candidates += _macos_python_absolute_commands()
     return candidates
 
 
@@ -419,7 +454,7 @@ def _run_dependency_install(py, install_args, *, timeout, progress=None, stage="
     for item in candidates:
         installer = str(item.get("installer") or "").strip() or "unknown"
         if item.get("missing"):
-            errors.append("uv: 未找到可用的 uv 命令（可设置 GA_LAUNCHER_UV_EXE 指向 uv.exe）")
+            errors.append("uv: 未找到可用的 uv 命令（可设置 GA_LAUNCHER_UV_EXE 指向 uv 可执行文件）")
             continue
         cmd = list(item.get("cmd") or [])
         if not cmd:
@@ -699,24 +734,24 @@ def _prepare_python_runtime_candidate(info, agent_dir, *, extra_packages=None, p
     if need_bootstrap:
         boot_ok, boot_detail = _bootstrap_python_runtime(py, progress=progress)
         if not boot_ok:
-            return False, f"{detail}\n自动升级 requests/simplejson 失败：{boot_detail}", meta
+            return False, f"解释器兼容性失败：{detail}\n依赖安装失败：自动升级 requests/simplejson 失败：{boot_detail}", meta
         meta["bootstrapped"] = True
         ok, detail = _probe_python_agent_compat(py, agent_dir)
 
     if need_sync:
         boot_ok, boot_detail = _bootstrap_python_runtime(py, progress=progress)
         if not boot_ok:
-            return False, f"基础依赖准备失败：{boot_detail}", meta
+            return False, f"依赖安装失败：基础依赖准备失败：{boot_detail}", meta
         meta["bootstrapped"] = True
         if req_path:
             req_ok, req_detail = _install_python_requirements(py, req_path, progress=progress)
             if not req_ok:
-                return False, req_detail, meta
+                return False, f"依赖安装失败：同步 GenericAgent requirements.txt 失败：{req_detail}", meta
             meta["requirements_synced"] = True
         if missing_extra:
             extra_ok, extra_detail = _install_python_packages(py, missing_extra, progress=progress, label="安装渠道依赖")
             if not extra_ok:
-                return False, extra_detail, meta
+                return False, f"依赖安装失败：安装渠道依赖失败：{extra_detail}", meta
             meta["extra_synced"] = True
         ok, detail = _probe_python_agent_compat(py, agent_dir)
 
@@ -726,7 +761,7 @@ def _prepare_python_runtime_candidate(info, agent_dir, *, extra_packages=None, p
         return True, "", meta
 
     _emit_dependency_progress(progress, "candidate_fail", f"解释器不可用：{label} -> {detail}", status="error")
-    return False, detail, meta
+    return False, f"解释器兼容性失败：{detail}", meta
 
 
 def _configured_channel_ids(parsed_mykey):
@@ -1028,10 +1063,19 @@ def _build_dependency_report(agent_dir, py, *, candidate_meta=None, failures=Non
 def _ensure_runtime_dependencies(agent_dir, *, extra_packages=None, progress=None, force_sync=False):
     candidates = _system_python_candidates()
     if not candidates:
+        if os.name == "nt":
+            error_text = "系统 Python 检测失败：未找到系统 Python。请先安装 Python 并加入 PATH，或在 launcher_config.json 中设置 python_exe。"
+        else:
+            error_text = (
+                "系统 Python 检测失败：未找到 python3 / python，也没有命中常见 macOS Python 路径"
+                "（如 /opt/homebrew/bin/python3、/usr/local/bin/python3）。"
+                "请先确认 Python 已安装；如果你使用 Homebrew 或项目虚拟环境，也可在 launcher_config.json 中把"
+                " python_exe 指向对应绝对路径，例如 /opt/homebrew/bin/python3 或 venv/bin/python。"
+            )
         return {
             "ok": False,
             "python": "",
-            "error": "未找到系统 Python。请先安装 Python 并加入 PATH，或在 launcher_config.json 中设置 python_exe。",
+            "error": error_text,
             "failures": [],
         }
     failures = []
@@ -1059,10 +1103,15 @@ def _ensure_runtime_dependencies(agent_dir, *, extra_packages=None, progress=Non
             )
             return {"ok": True, "python": info["path"], "error": "", "failures": failures, "report": report, "meta": chosen_meta}
         failures.append({"info": info, "detail": detail})
-    lines = ["已找到系统 Python，但都无法载入 GenericAgent 内核。"]
+    lines = ["系统 Python 兼容性失败：已找到系统 Python，但都无法载入 GenericAgent 内核。"]
     for item in failures[:3]:
         lines.append(f"- {_format_python_candidate_label(item.get('info'))}: {item.get('detail')}")
-    lines.append("可在 launcher_config.json 中手动指定 python_exe。")
+    if os.name == "nt":
+        lines.append("可在 launcher_config.json 中手动指定 python_exe。")
+    else:
+        lines.append("可在 launcher_config.json 中手动指定 python_exe，例如 /opt/homebrew/bin/python3 或 venv/bin/python。")
+        lines.append("如果系统里有多个解释器，建议先确认 python3，或常见 Homebrew 绝对路径是否可用。")
+    lines.append("如果上面的错误里包含 pip / uv / requirements，同样说明当前解释器需要先完成依赖安装。")
     lines.append("当前不会强制限制版本，但如果高版本解释器兼容性不稳，通常改用 Python 3.11 / 3.12 更稳。")
     error_text = "\n".join(lines)
     report = _build_dependency_report(agent_dir, "", candidate_meta=chosen_meta, failures=failures, extra_packages=extra_packages, error=error_text)

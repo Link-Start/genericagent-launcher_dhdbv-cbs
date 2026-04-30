@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -18,6 +19,8 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QFrame, QGridLayout, QHBo
 
 from launcher_app import core as lz
 from launcher_app.theme import C, F
+
+from .common import capture_runtime_context, runtime_context_matches
 
 
 class PersonalUsageMixin:
@@ -33,6 +36,29 @@ class PersonalUsageMixin:
         "https://mirror.ghproxy.com/https://api.github.com{path}",
         "https://ghproxy.com/https://api.github.com{path}",
     )
+
+    def _apply_personal_button_state(self, button, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if button is None:
+            return
+        button.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            button.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _lan_interface_form_disabled_reason(self, *, valid_agent_dir=False):
+        return "" if valid_agent_dir else "请先选择有效的 GenericAgent 目录。"
+
+    def _lan_interface_toggle_disabled_reason(self, *, valid_agent_dir=False, feature_enabled=False):
+        if not valid_agent_dir:
+            return "请先选择有效的 GenericAgent 目录。"
+        if not feature_enabled:
+            return "请先开启局域网 Web 接口，再调整这个选项。"
+        return ""
+
+    def _langfuse_clear_disabled_reason(self, *, configured=False):
+        return "" if configured else "当前还没有已保存的 Langfuse 配置可清除。"
 
     def _short_sha(self, sha):
         text = str(sha or "").strip()
@@ -480,6 +506,8 @@ class PersonalUsageMixin:
         best_url = ""
         best_name = ""
         best_score = -1
+        asset_rows = []
+        is_macos = bool(getattr(lz, "IS_MACOS", sys.platform == "darwin"))
         if isinstance(assets, list):
             for item in assets:
                 if not isinstance(item, dict):
@@ -489,22 +517,52 @@ class PersonalUsageMixin:
                 if not name or not url:
                     continue
                 lowered = name.lower()
+                asset_rows.append({"name": name, "url": url, "lowered": lowered})
                 score = 0
-                if re.search(r"genericagentlauncher[-_]?setup[^/\\]*\.exe$", lowered):
-                    score = 100
-                elif lowered == "genericagentlauncher.exe":
-                    score = 90
-                elif lowered.endswith(".msi"):
-                    score = 80
-                elif lowered.endswith(".exe"):
-                    score = 70
-                elif lowered.endswith(".zip"):
-                    score = 50
+                if is_macos:
+                    if lowered.endswith(".dmg"):
+                        score = 100
+                    elif lowered.endswith(".pkg"):
+                        score = 90
+                    elif lowered.endswith(".app.zip"):
+                        score = 85
+                    elif lowered.endswith(".zip") and ("mac" in lowered or "darwin" in lowered or "osx" in lowered):
+                        score = 75
+                else:
+                    if re.search(r"genericagentlauncher[-_]?setup[^/\\]*\.exe$", lowered):
+                        score = 100
+                    elif lowered == "genericagentlauncher.exe":
+                        score = 90
+                    elif lowered.endswith(".msi"):
+                        score = 80
+                    elif lowered.endswith(".exe"):
+                        score = 70
+                    elif lowered.endswith(".zip"):
+                        score = 50
                 if score > best_score:
                     best_score = score
                     best_name = name
                     best_url = url
-        external_url = best_url or release_url
+        preferred_sha_name = ""
+        lowered_best_name = str(best_name or "").strip().lower()
+        if lowered_best_name.endswith(".dmg"):
+            preferred_sha_name = lowered_best_name[:-4] + ".sha256"
+
+        def _pick_asset(predicate):
+            for row in asset_rows:
+                if predicate(row):
+                    return str(row.get("url") or "").strip(), str(row.get("name") or "").strip()
+            return "", ""
+
+        readme_url, readme_name = _pick_asset(lambda row: row.get("lowered") == "readme-macos.txt")
+        metadata_url, metadata_name = _pick_asset(lambda row: row.get("lowered") == "install-metadata.json")
+        sha256_url = ""
+        sha256_name = ""
+        if preferred_sha_name:
+            sha256_url, sha256_name = _pick_asset(lambda row, target=preferred_sha_name: row.get("lowered") == target)
+        if not sha256_url:
+            sha256_url, sha256_name = _pick_asset(lambda row: str(row.get("lowered") or "").endswith(".sha256"))
+        external_url = best_url or (release_url if not is_macos else "")
         if not external_url:
             return None
         return {
@@ -517,8 +575,206 @@ class PersonalUsageMixin:
             "install_mode": "external",
             "external_url": external_url,
             "external_asset_name": best_name,
+            "readme_url": readme_url,
+            "readme_asset_name": readme_name,
+            "sha256_url": sha256_url,
+            "sha256_asset_name": sha256_name,
+            "metadata_url": metadata_url,
+            "metadata_asset_name": metadata_name,
             "fallback_reason": "manifest_or_signing_unavailable",
         }
+
+    def _open_external_url(self, url: str, *, failure_title="打开链接失败", failure_hint="请手动打开以下地址：") -> bool:
+        target = str(url or "").strip()
+        if not target:
+            return False
+        opened = False
+        try:
+            opened = bool(QDesktopServices.openUrl(QUrl(target)))
+        except Exception:
+            opened = False
+        if not opened:
+            try:
+                opened = bool(webbrowser.open(target))
+            except Exception:
+                opened = False
+        if not opened:
+            QMessageBox.warning(self, str(failure_title or "打开链接失败"), f"{str(failure_hint or '请手动打开以下地址：')}\n{target}")
+        return opened
+
+    def _display_local_user_path(self, path: str) -> str:
+        target = str(path or "").strip()
+        if not target:
+            return ""
+        try:
+            home = str(os.path.expanduser("~") or "").strip()
+            if not home:
+                return target
+            norm_target = os.path.normcase(os.path.normpath(target))
+            norm_home = os.path.normcase(os.path.normpath(home))
+            if norm_target == norm_home:
+                return "~"
+            target_normpath = os.path.normpath(target)
+            home_normpath = os.path.normpath(home)
+            prefix = norm_home + os.path.sep
+            if norm_target.startswith(prefix):
+                suffix = target_normpath[len(home_normpath) :].lstrip("\\/")
+                return "~/" + suffix.replace("\\", "/")
+        except Exception:
+            return target
+        return target
+
+    def _launcher_manual_update_payload(self, info=None, *, launcher_row=None):
+        payload = info if isinstance(info, dict) else {}
+        row = launcher_row if isinstance(launcher_row, dict) else {}
+        target_version = str(payload.get("target_version") or row.get("latest_release_tag") or "").strip().lstrip("v")
+        external_url = str(payload.get("external_url") or "").strip()
+        release_url = str(payload.get("release_url") or row.get("latest_release_url") or "").strip()
+        readme_url = str(payload.get("readme_url") or "").strip()
+        sha256_url = str(payload.get("sha256_url") or "").strip()
+        metadata_url = str(payload.get("metadata_url") or "").strip()
+        asset_name = str(payload.get("external_asset_name") or "").strip()
+        if (not asset_name) and external_url:
+            asset_name = str(external_url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]).strip()
+        readme_name = str(payload.get("readme_asset_name") or "README-macOS.txt").strip()
+        sha256_name = str(payload.get("sha256_asset_name") or "").strip() or (
+            str(asset_name[:-4] + ".sha256").strip() if asset_name.lower().endswith(".dmg") else "GenericAgentLauncher-macos-<version>.sha256"
+        )
+        metadata_name = str(payload.get("metadata_asset_name") or "install-metadata.json").strip()
+        app_name = str(getattr(lz, "APP_DISPLAY_NAME", "GenericAgent Launcher") or "GenericAgent Launcher").strip()
+        install_state = {}
+        if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            try:
+                status = lz.macos_installation_status()
+                if isinstance(status, dict):
+                    install_state = status
+            except Exception:
+                install_state = {}
+        recommended_target = str(install_state.get("recommended_install_target") or f"/Applications/{app_name}.app").strip()
+        recommended_target_display = self._display_local_user_path(recommended_target) or recommended_target
+        user_target = str(install_state.get("user_applications_target") or "").strip()
+        user_target_display = self._display_local_user_path(user_target) or user_target
+        data_root = str(install_state.get("data_root") or getattr(lz, "DATA_ROOT", "")).strip()
+        title_text = f"mac 版当前仅支持手动升级到 {target_version or '最新版本'}。"
+        detail_lines = [
+            f"目标版本：{target_version or '最新'}",
+            f"安装包：{asset_name or '当前发布中的 macOS .dmg'}",
+            f"建议替换路径：{recommended_target_display}",
+        ]
+        if data_root:
+            detail_lines.append(f"用户数据目录：{data_root}")
+        detail_lines.extend(
+            [
+                "升级方式：下载新的 .dmg，关闭当前 app 后，用新版本 .app 替换现有应用。",
+                "数据保留：原有设置、会话和启动器数据会继续保留。",
+                "安装位置说明：优先推荐放到 /Applications；如果你只想安装到当前用户，~/Applications 也会被视为有效安装位置。",
+                "首次启动提示：若 Gatekeeper 首次拦截，请先尝试启动一次，再到 System Settings -> Privacy & Security -> Open Anyway 放行。",
+                "兼容性备选：如果当前系统版本仍提供该入口，Finder 右键应用并选择 Open 也可作为补充路径。",
+            ]
+        )
+        if bool(install_state.get("installed_to_user_applications")) and user_target_display:
+            detail_lines.append(f"当前检测到的用户级安装路径：{user_target_display}；后续升级请继续在该路径替换现有 app。")
+        available_files = []
+        if readme_url:
+            available_files.append(readme_name)
+        if sha256_url:
+            available_files.append(sha256_name)
+        if metadata_url:
+            available_files.append(metadata_name)
+        if available_files:
+            detail_lines.append("附带文件：" + " / ".join(available_files))
+        elif not external_url:
+            detail_lines.append("当前未识别到可直接安装的 macOS .dmg，请改用 Release 页面或 Actions 构建产物。")
+        return {
+            "target_version": target_version,
+            "external_url": external_url,
+            "release_url": release_url,
+            "readme_url": readme_url,
+            "sha256_url": sha256_url,
+            "metadata_url": metadata_url,
+            "external_asset_name": asset_name,
+            "readme_asset_name": readme_name,
+            "sha256_asset_name": sha256_name,
+            "metadata_asset_name": metadata_name,
+            "recommended_install_target": recommended_target,
+            "data_root": data_root,
+            "summary_text": title_text,
+            "detail_text": "\n".join(detail_lines),
+        }
+
+    def _show_launcher_manual_update_dialog(self, info=None, *, launcher_row=None):
+        payload = self._launcher_manual_update_payload(info, launcher_row=launcher_row)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("手动升级说明")
+        box.setText(str(payload.get("summary_text") or "mac 版当前仅支持手动升级。"))
+        box.setInformativeText(str(payload.get("detail_text") or "请从 GitHub Release 或 Actions 构建产物中下载新的 .dmg 并替换现有应用。"))
+
+        open_dmg_btn = None
+        open_readme_btn = None
+        open_sha256_btn = None
+        open_metadata_btn = None
+        open_release_btn = None
+
+        if str(payload.get("external_url") or "").strip():
+            open_dmg_btn = box.addButton("打开 dmg", QMessageBox.AcceptRole)
+        if str(payload.get("readme_url") or "").strip():
+            open_readme_btn = box.addButton("打开安装说明", QMessageBox.ActionRole)
+        if str(payload.get("sha256_url") or "").strip():
+            open_sha256_btn = box.addButton("打开 sha256", QMessageBox.ActionRole)
+        if str(payload.get("metadata_url") or "").strip():
+            open_metadata_btn = box.addButton("打开安装元数据", QMessageBox.ActionRole)
+        if str(payload.get("release_url") or "").strip():
+            open_release_btn = box.addButton("打开 Release 页面", QMessageBox.ActionRole)
+        close_btn = box.addButton("关闭", QMessageBox.RejectRole)
+        try:
+            box.setDefaultButton(close_btn)
+        except Exception:
+            pass
+        box.exec()
+
+        clicked = box.clickedButton()
+        target_version = str(payload.get("target_version") or "最新").strip() or "最新"
+        if clicked is open_dmg_btn:
+            if self._open_external_url(
+                payload.get("external_url"),
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址下载 mac 安装包：",
+            ):
+                self._set_status(f"已打开 mac 安装包下载链接（目标版本 {target_version}）。")
+            return
+        if clicked is open_readme_btn:
+            if self._open_external_url(
+                payload.get("readme_url"),
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址查看安装说明：",
+            ):
+                self._set_status("已打开 mac 安装说明。")
+            return
+        if clicked is open_sha256_btn:
+            if self._open_external_url(
+                payload.get("sha256_url"),
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址查看 sha256 校验文件：",
+            ):
+                self._set_status("已打开 mac sha256 校验文件。")
+            return
+        if clicked is open_metadata_btn:
+            if self._open_external_url(
+                payload.get("metadata_url"),
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址查看安装元数据：",
+            ):
+                self._set_status("已打开 mac 安装元数据。")
+            return
+        if clicked is open_release_btn:
+            if self._open_external_url(
+                payload.get("release_url"),
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址查看 Release 页面：",
+            ):
+                self._set_status("已打开 mac Release 页面。")
+            return
 
     def _check_repo_update(self, *, name: str, repo_url: str, local_repo_dir: str, local_sha: str, local_version: str = ""):
         row = {
@@ -693,32 +949,79 @@ class PersonalUsageMixin:
             "remote_sha": "",
             "default_branch": "",
             "latest_release_tag": "",
+            "latest_release_url": "",
             "status": "unknown",
             "message": "",
             "api_source": "",
             "errors": [],
             "update_info": None,
         }
+        supports_internal_update = bool(getattr(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", os.name == "nt"))
         try:
-            info = lz.query_launcher_update(
-                repo_url=launcher_repo_url,
-                current_version=lz.current_launcher_version(),
-                public_key_pem=public_key_pem,
-                api_candidates=api_candidates,
-            )
-            launcher["latest_release_tag"] = str(info.get("release_tag") or "").strip()
-            launcher["remote_sha"] = launcher["latest_release_tag"]
-            launcher["local_version"] = str(info.get("current_version") or launcher.get("local_version") or "").strip()
-            launcher["api_source"] = str(info.get("api_source") or "").strip()
-            launcher["update_info"] = info
-            if bool(info.get("is_update_available", False)):
-                launcher["status"] = "behind"
-                launcher["message"] = (
-                    f"当前 {info.get('current_version')}，可升级到 {info.get('target_version')}。"
+            if supports_internal_update:
+                info = lz.query_launcher_update(
+                    repo_url=launcher_repo_url,
+                    current_version=lz.current_launcher_version(),
+                    public_key_pem=public_key_pem,
+                    api_candidates=api_candidates,
                 )
+                launcher["latest_release_tag"] = str(info.get("release_tag") or "").strip()
+                launcher["remote_sha"] = launcher["latest_release_tag"]
+                launcher["local_version"] = str(info.get("current_version") or launcher.get("local_version") or "").strip()
+                launcher["api_source"] = str(info.get("api_source") or "").strip()
+                launcher["update_info"] = info
+                if bool(info.get("is_update_available", False)):
+                    launcher["status"] = "behind"
+                    launcher["message"] = (
+                        f"当前 {info.get('current_version')}，可升级到 {info.get('target_version')}。"
+                    )
+                else:
+                    launcher["status"] = "up_to_date"
+                    launcher["message"] = f"当前版本 {info.get('current_version')} 已是最新。"
             else:
-                launcher["status"] = "up_to_date"
-                launcher["message"] = f"当前版本 {info.get('current_version')} 已是最新。"
+                slug = str(launcher.get("repo_slug") or "").strip()
+                rel = None
+                rel_url = ""
+                rel_errors = []
+                if slug:
+                    rel, rel_url, rel_errors = self._github_json_with_fallback(
+                        f"/repos/{slug}/releases/latest",
+                        allow_404=True,
+                        timeout=8,
+                    )
+                tag = ""
+                if isinstance(rel, dict):
+                    tag = str(rel.get("tag_name") or "").strip()
+                    launcher["latest_release_tag"] = tag
+                    launcher["latest_release_url"] = str(rel.get("html_url") or "").strip()
+                    launcher["remote_sha"] = tag
+                    launcher["api_source"] = rel_url or launcher.get("api_source", "")
+                local_ver = str(launcher.get("local_version") or "").strip()
+                cmp = self._compare_versions(local_ver, tag)
+                fallback_info = self._build_launcher_external_update_info(rel, local_version=local_ver)
+                if tag and local_ver:
+                    if cmp < 0:
+                        launcher["status"] = "behind"
+                        launcher["update_info"] = fallback_info if isinstance(fallback_info, dict) else None
+                        if isinstance(fallback_info, dict):
+                            launcher["message"] = (
+                                f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
+                                "mac 版当前仅支持手动下载安装包升级。"
+                            )
+                        else:
+                            launcher["message"] = (
+                                f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
+                                "mac 版当前仅支持手动升级，但该发布尚未提供可直接安装的 mac 安装包。"
+                            )
+                    elif cmp > 0:
+                        launcher["status"] = "ahead"
+                        launcher["message"] = f"当前版本 {local_ver} 高于 GitHub 最新发布 {tag}。"
+                    else:
+                        launcher["status"] = "up_to_date"
+                        launcher["message"] = f"当前版本 {local_ver} 与 GitHub 最新发布 {tag} 一致。"
+                    launcher["errors"] = list(rel_errors or [])
+                else:
+                    raise RuntimeError("无法读取 GitHub 最新发布。")
         except Exception as e:
             slug = str(launcher.get("repo_slug") or "").strip()
             rel = None
@@ -734,6 +1037,7 @@ class PersonalUsageMixin:
             if isinstance(rel, dict):
                 tag = str(rel.get("tag_name") or "").strip()
                 launcher["latest_release_tag"] = tag
+                launcher["latest_release_url"] = str(rel.get("html_url") or "").strip()
                 launcher["remote_sha"] = tag
                 launcher["api_source"] = rel_url or launcher.get("api_source", "")
             local_ver = str(launcher.get("local_version") or "").strip()
@@ -746,7 +1050,23 @@ class PersonalUsageMixin:
                 or "签名" in detail
                 or "公钥" in detail
             )
-            if tag and local_ver and is_release_metadata_issue:
+            if (not supports_internal_update) and tag and local_ver:
+                fallback_info = self._build_launcher_external_update_info(rel, local_version=local_ver)
+                if cmp < 0:
+                    launcher["status"] = "behind"
+                    launcher["update_info"] = fallback_info if isinstance(fallback_info, dict) else None
+                    launcher["message"] = (
+                        f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
+                        "mac 版当前不支持应用内自动更新，请按提示手动升级。"
+                    )
+                elif cmp > 0:
+                    launcher["status"] = "ahead"
+                    launcher["message"] = f"当前版本 {local_ver} 高于 GitHub 最新发布 {tag}。"
+                else:
+                    launcher["status"] = "up_to_date"
+                    launcher["message"] = f"当前版本 {local_ver} 与 GitHub 最新发布 {tag} 一致。"
+                launcher["errors"] = list(rel_errors or [])
+            elif tag and local_ver and is_release_metadata_issue:
                 fallback_info = self._build_launcher_external_update_info(rel, local_version=local_ver)
                 if cmp < 0:
                     launcher["status"] = "behind"
@@ -1001,6 +1321,188 @@ class PersonalUsageMixin:
         self._refresh_about_update_diagnostics_widgets()
         self._set_status("已刷新更新诊断信息。")
 
+    def _format_launcher_installation_text(self):
+        if not bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            return "当前平台不是 macOS。"
+        info = lz.macos_installation_status()
+        if not isinstance(info, dict):
+            return "当前无法读取安装状态。"
+        current_path = str(info.get("app_bundle_path") or info.get("executable_path") or "未知").strip() or "未知"
+        recommended_target = str(info.get("recommended_install_target") or "/Applications").strip() or "/Applications"
+        recommended_dir = os.path.dirname(recommended_target) if recommended_target.lower().endswith(".app") else recommended_target
+        user_target = str(info.get("user_applications_target") or "").strip()
+        current_display = self._display_local_user_path(current_path) or current_path
+        recommended_display = self._display_local_user_path(recommended_target) or recommended_target
+        recommended_dir_display = self._display_local_user_path(recommended_dir) or recommended_dir
+        user_target_display = self._display_local_user_path(user_target) or user_target
+        lines = []
+        summary = str(info.get("summary") or "").strip()
+        if summary:
+            lines.append(summary)
+        lines.append(f"当前 app：{current_display}")
+        lines.append(f"推荐安装位置：{recommended_dir_display}")
+        lines.append(f"建议安装/替换路径：{recommended_display}")
+        if user_target_display and user_target_display != recommended_display:
+            lines.append(f"用户级安装路径：{user_target_display}")
+        lines.append(f"用户数据目录：{str(info.get('data_root') or lz.DATA_ROOT).strip() or lz.DATA_ROOT}")
+        lines.append("安装方式：未做 Apple Developer 签名 / 未 notarize 的 dmg 手动安装 / 手动替换 .app 升级")
+        lines.append("安装位置说明：优先推荐 `/Applications`；如果你只想安装到当前用户，`~/Applications` 也会被视为有效安装。")
+        if bool(info.get("running_from_disk_image")):
+            lines.append("提示：检测到当前仍在 `/Volumes/...` 挂载目录中运行。")
+        if bool(info.get("running_from_translocation")):
+            lines.append("提示：检测到当前处于 App Translocation 路径。")
+        if bool(info.get("needs_relocation")):
+            lines.append("建议：关闭当前 app，把它拖到 `/Applications`；如果不想写入系统级目录，也可以改放 `~/Applications` 后再重新启动。")
+        return "\n".join(lines)
+
+    def _refresh_about_installation_widgets(self):
+        label = getattr(self, "settings_about_install_status", None)
+        if label is None:
+            return
+        label.setText(self._format_launcher_installation_text())
+
+    def _refresh_about_installation_manual(self):
+        self._refresh_about_installation_widgets()
+        self._set_status("已刷新安装状态信息。")
+
+    def _open_local_directory_path(self, path, *, title="打开失败", create=False):
+        target = str(path or "").strip()
+        if not target:
+            QMessageBox.warning(self, "路径无效", "当前没有可打开的目录。")
+            return
+        if create:
+            try:
+                os.makedirs(target, exist_ok=True)
+            except Exception:
+                pass
+        if not os.path.isdir(target):
+            QMessageBox.warning(self, "路径无效", f"目录不存在：\n{target}")
+            return
+        opened = False
+        try:
+            opened = bool(QDesktopServices.openUrl(QUrl.fromLocalFile(target)))
+        except Exception:
+            opened = False
+        if not opened:
+            QMessageBox.warning(self, title, f"无法打开目录：\n{target}")
+
+    def _launcher_install_recommended_directory(self):
+        default_dir = "/Applications"
+        if not bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            return default_dir
+        try:
+            info = lz.macos_installation_status()
+        except Exception:
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        target = str(info.get("recommended_install_target") or "").strip()
+        if target.lower().endswith(".app"):
+            target = os.path.dirname(target)
+        return target or default_dir
+
+    def _open_launcher_install_recommended_dir(self):
+        self._open_local_directory_path(self._launcher_install_recommended_directory())
+
+    def _open_launcher_install_current_location(self):
+        if not bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            QMessageBox.information(self, "当前平台不适用", "该功能仅用于 macOS 安装状态排查。")
+            return
+        info = lz.macos_installation_status()
+        if not isinstance(info, dict):
+            QMessageBox.warning(self, "路径无效", "当前无法读取 app 所在位置。")
+            return
+        target = str(info.get("app_parent_dir") or "").strip()
+        if not target:
+            bundle = str(info.get("app_bundle_path") or "").strip()
+            executable = str(info.get("executable_path") or "").strip()
+            target = os.path.dirname(bundle or executable)
+        self._open_local_directory_path(target)
+
+    def _open_launcher_install_data_root(self):
+        self._open_local_directory_path(getattr(lz, "DATA_ROOT", ""), create=True)
+
+    def _schedule_startup_install_hint(self):
+        if not bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            return
+        if bool(getattr(self, "_startup_install_hint_scheduled", False)):
+            return
+        self._startup_install_hint_scheduled = True
+
+        def run():
+            self._startup_install_hint_scheduled = False
+            if bool(getattr(self, "_closing_in_progress", False)):
+                return
+            info = lz.macos_installation_status()
+            if not isinstance(info, dict):
+                return
+            if str(info.get("status") or "").strip().lower() == "warn":
+                setter = getattr(self, "_set_status", None)
+                if callable(setter):
+                    setter(str(info.get("summary") or "当前 mac 安装位置需要调整。").strip() or "当前 mac 安装位置需要调整。")
+
+        QTimer.singleShot(1800, run)
+
+    def _about_update_check_disabled_reason(self, *, running=False, kernel_sync_running=False):
+        if running:
+            return "当前正在检测 GitHub 更新，请稍候。"
+        if kernel_sync_running:
+            return "内核仓库同步正在执行，请等待完成。"
+        return ""
+
+    def _about_manual_update_action_target(self, *, update_info=None, manual_release_url=""):
+        info = update_info if isinstance(update_info, dict) else {}
+        return str(info.get("external_url") or info.get("release_url") or manual_release_url or "").strip()
+
+    def _about_update_install_disabled_reason(
+        self,
+        *,
+        running=False,
+        kernel_sync_running=False,
+        behind=False,
+        update_info=None,
+        supports_internal_update=False,
+        updater_exists=False,
+        manual_release_url="",
+    ):
+        if running:
+            return "当前正在检测 GitHub 更新，请稍候。"
+        if kernel_sync_running:
+            return "内核仓库同步正在执行，请等待完成。"
+        if not behind:
+            return "当前没有可安装的启动器更新。"
+        info = update_info if isinstance(update_info, dict) else {}
+        if not supports_internal_update:
+            manual_target = self._about_manual_update_action_target(
+                update_info=info,
+                manual_release_url=manual_release_url,
+            )
+            if manual_target:
+                return ""
+            return "当前未拿到可用的发布页面或安装包链接，请先重新检测。"
+        install_mode = str(info.get("install_mode") or "").strip().lower()
+        if not info:
+            return "当前缺少可用的更新元信息，请先重新检测。"
+        if supports_internal_update:
+            if install_mode == "external":
+                external_target = str(info.get("external_url") or info.get("release_url") or "").strip()
+                if not external_target:
+                    return "当前未拿到可用的安装包下载地址，请先重新检测。"
+                return ""
+            if not updater_exists:
+                return "当前缺少内置 updater，暂时不能直接安装更新。"
+            return ""
+        return ""
+
+    def _kernel_sync_disabled_reason(self, action: str, *, running=False, kernel_sync_running=False, valid_agent_dir=False):
+        if running:
+            return "当前正在检测 GitHub 更新，请稍后再执行仓库同步。"
+        if kernel_sync_running:
+            return "内核仓库同步正在执行，请等待完成。"
+        if not valid_agent_dir:
+            return "当前没有可用的内核 Git 仓库目录。"
+        return ""
+
     def _refresh_about_update_widgets(self):
         running = bool(getattr(self, "_update_check_running", False))
         kernel_sync_running = bool(getattr(self, "_kernel_repo_sync_running", False))
@@ -1027,7 +1529,15 @@ class PersonalUsageMixin:
                     )
         btn = getattr(self, "settings_about_check_updates_btn", None)
         if btn is not None:
-            btn.setEnabled((not running) and (not kernel_sync_running))
+            self._apply_personal_button_state(
+                btn,
+                (not running) and (not kernel_sync_running),
+                enabled_tooltip="立即检查 GitHub 上是否有新版本可用。",
+                disabled_tooltip=self._about_update_check_disabled_reason(
+                    running=running,
+                    kernel_sync_running=kernel_sync_running,
+                ),
+            )
             btn.setText("正在检测…" if running else "立即检测 GitHub 更新")
         install_btn = getattr(self, "settings_about_install_update_btn", None)
         if install_btn is not None:
@@ -1037,26 +1547,83 @@ class PersonalUsageMixin:
                 launcher_row = result.get("launcher") or {}
             info = launcher_row.get("update_info") if isinstance(launcher_row.get("update_info"), dict) else {}
             install_mode = str(info.get("install_mode") or "").strip().lower()
+            supports_internal_update = bool(getattr(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", os.name == "nt"))
             updater_exists = os.path.isfile(str(getattr(lz, "updater_executable_path", lambda: "")() or "").strip())
             external_target = str(info.get("external_url") or info.get("release_url") or "").strip()
-            can_install = (
-                (not running)
-                and str((launcher_row or {}).get("status") or "").strip().lower() == "behind"
-                and isinstance((launcher_row or {}).get("update_info"), dict)
-                and (
-                    (install_mode == "external" and bool(external_target))
-                    or (install_mode != "external" and updater_exists)
-                )
+            manual_release_url = str((launcher_row or {}).get("latest_release_url") or "").strip()
+            behind = str((launcher_row or {}).get("status") or "").strip().lower() == "behind"
+            manual_target = self._about_manual_update_action_target(
+                update_info=info,
+                manual_release_url=manual_release_url,
             )
-            install_btn.setEnabled(can_install and (not kernel_sync_running))
-            install_btn.setText("下载更新安装包" if install_mode == "external" else "安装更新并重启")
+            if supports_internal_update:
+                can_install = (
+                    (not running)
+                    and behind
+                    and isinstance((launcher_row or {}).get("update_info"), dict)
+                    and (
+                        (install_mode == "external" and bool(external_target))
+                        or (install_mode != "external" and updater_exists)
+                    )
+                )
+                self._apply_personal_button_state(
+                    install_btn,
+                    can_install and (not kernel_sync_running),
+                    enabled_tooltip=("下载对应版本的更新安装包。" if install_mode == "external" else "安装更新并在完成后重启启动器。"),
+                    disabled_tooltip=self._about_update_install_disabled_reason(
+                        running=running,
+                        kernel_sync_running=kernel_sync_running,
+                        behind=behind,
+                        update_info=info,
+                        supports_internal_update=supports_internal_update,
+                        updater_exists=updater_exists,
+                        manual_release_url=manual_release_url,
+                    ),
+                )
+                install_btn.setText("下载更新安装包" if install_mode == "external" else "安装更新并重启")
+            else:
+                self._apply_personal_button_state(
+                    install_btn,
+                    (not running) and behind and (not kernel_sync_running) and bool(manual_target),
+                    enabled_tooltip="查看当前版本对应的手动升级说明。",
+                    disabled_tooltip=self._about_update_install_disabled_reason(
+                        running=running,
+                        kernel_sync_running=kernel_sync_running,
+                        behind=behind,
+                        update_info=info,
+                        supports_internal_update=supports_internal_update,
+                        updater_exists=updater_exists,
+                        manual_release_url=manual_release_url,
+                    ),
+                )
+                install_btn.setText("查看手动升级说明")
         fetch_btn = getattr(self, "settings_about_sync_kernel_fetch_btn", None)
         if fetch_btn is not None:
-            fetch_btn.setEnabled((not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir))
+            self._apply_personal_button_state(
+                fetch_btn,
+                (not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir),
+                enabled_tooltip="执行 git fetch，同步内核仓库远端引用。",
+                disabled_tooltip=self._kernel_sync_disabled_reason(
+                    "fetch",
+                    running=running,
+                    kernel_sync_running=kernel_sync_running,
+                    valid_agent_dir=lz.is_valid_agent_dir(self.agent_dir),
+                ),
+            )
             fetch_btn.setText("同步中…" if kernel_sync_running else "同步内核远端（fetch）")
         pull_btn = getattr(self, "settings_about_sync_kernel_pull_btn", None)
         if pull_btn is not None:
-            pull_btn.setEnabled((not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir))
+            self._apply_personal_button_state(
+                pull_btn,
+                (not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir),
+                enabled_tooltip="执行 git pull --ff-only，快进同步内核仓库。",
+                disabled_tooltip=self._kernel_sync_disabled_reason(
+                    "pull",
+                    running=running,
+                    kernel_sync_running=kernel_sync_running,
+                    valid_agent_dir=lz.is_valid_agent_dir(self.agent_dir),
+                ),
+            )
             pull_btn.setText("同步中…" if kernel_sync_running else "拉取并快进（pull --ff-only）")
         self._refresh_about_update_diagnostics_widgets()
 
@@ -1231,6 +1798,25 @@ class PersonalUsageMixin:
         QTimer.singleShot(1400, lambda: self._start_update_check(manual=False))
 
     def _start_launcher_update_install(self):
+        if not bool(getattr(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", os.name == "nt")):
+            result = getattr(self, "_last_update_check_result", None)
+            launcher_row = (result or {}).get("launcher") if isinstance(result, dict) else {}
+            if not isinstance(launcher_row, dict):
+                launcher_row = {}
+            if str(launcher_row.get("status") or "").strip().lower() != "behind":
+                QMessageBox.information(self, "已是最新", "当前启动器已是最新版本。")
+                return
+            info = launcher_row.get("update_info") if isinstance(launcher_row, dict) and isinstance(launcher_row.get("update_info"), dict) else {}
+            manual_release_url = str(launcher_row.get("latest_release_url") or "").strip()
+            manual_target = self._about_manual_update_action_target(
+                update_info=info,
+                manual_release_url=manual_release_url,
+            )
+            if not manual_target:
+                QMessageBox.information(self, "暂无可安装更新", "当前未拿到可用的发布页面或安装包链接，请先重新检测。")
+                return
+            self._show_launcher_manual_update_dialog(info, launcher_row=launcher_row)
+            return
         if bool(getattr(self, "_update_check_running", False)):
             QMessageBox.information(self, "请稍候", "当前正在进行更新检测，请稍后再安装更新。")
             return
@@ -1265,18 +1851,11 @@ class PersonalUsageMixin:
                 != QMessageBox.Yes
             ):
                 return
-            opened = False
-            try:
-                opened = bool(QDesktopServices.openUrl(QUrl(external_url)))
-            except Exception:
-                opened = False
-            if not opened:
-                try:
-                    opened = bool(webbrowser.open(external_url))
-                except Exception:
-                    opened = False
-            if not opened:
-                QMessageBox.warning(self, "打开链接失败", f"请手动打开以下地址下载安装：\n{external_url}")
+            if not self._open_external_url(
+                external_url,
+                failure_title="打开链接失败",
+                failure_hint="请手动打开以下地址下载安装：",
+            ):
                 return
             self._set_status(f"已打开更新下载链接（目标版本 {target_version}）。")
             return
@@ -1505,6 +2084,9 @@ class PersonalUsageMixin:
         except Exception:
             return False
 
+    def _lan_interface_external_running(self, port=None):
+        return (not self._lan_interface_proc_alive()) and bool(self._lan_interface_health_ok(port))
+
     def _lan_interface_local_ips(self):
         seen = set()
         ips = []
@@ -1563,12 +2145,12 @@ class PersonalUsageMixin:
         if not lz.is_valid_agent_dir(self.agent_dir):
             return ["请先选择有效的 GenericAgent 目录。"]
         running = self._lan_interface_proc_alive()
-        external = False if running else self._lan_interface_health_ok(cfg.get("port"))
+        external = self._lan_interface_external_running(cfg.get("port"))
         proc = getattr(self, "_lan_interface_proc", None)
         if running and proc is not None:
             lines = [f"状态：运行中（PID {getattr(proc, 'pid', '-')}）。"]
         elif external:
-            lines = ["状态：端口已有 Streamlit 响应，可能是启动器外部启动的进程。"]
+            lines = ["状态：外部运行中；端口已有 Streamlit 响应，可能是启动器外部启动的进程。"]
         elif cfg["enabled"]:
             code = getattr(self, "_lan_interface_last_exit_code", None)
             suffix = f"；上次退出码 {code}" if code is not None else ""
@@ -1643,26 +2225,70 @@ class PersonalUsageMixin:
                     pass
         valid = lz.is_valid_agent_dir(self.agent_dir)
         running = self._lan_interface_proc_alive()
+        external = self._lan_interface_external_running(cfg.get("port"))
         self._refresh_lan_interface_controls_for_enabled(cfg["enabled"])
         if port_spin is not None:
-            port_spin.setEnabled(valid)
+            self._apply_personal_button_state(
+                port_spin,
+                valid,
+                enabled_tooltip="调整局域网 Web 接口监听端口。",
+                disabled_tooltip=self._lan_interface_form_disabled_reason(valid_agent_dir=valid),
+            )
         if frontend_combo is not None:
-            frontend_combo.setEnabled(valid)
+            self._apply_personal_button_state(
+                frontend_combo,
+                valid,
+                enabled_tooltip="选择局域网 Web 使用的前端入口文件。",
+                disabled_tooltip=self._lan_interface_form_disabled_reason(valid_agent_dir=valid),
+            )
         save_btn = getattr(self, "settings_lan_save_btn", None)
         start_btn = getattr(self, "settings_lan_start_btn", None)
         stop_btn = getattr(self, "settings_lan_stop_btn", None)
         open_btn = getattr(self, "settings_lan_open_btn", None)
         log_btn = getattr(self, "settings_lan_log_btn", None)
-        if save_btn is not None:
-            save_btn.setEnabled(valid)
-        if start_btn is not None:
-            start_btn.setEnabled(valid and (not running))
-        if stop_btn is not None:
-            stop_btn.setEnabled(running)
-        if open_btn is not None:
-            open_btn.setEnabled(valid)
-        if log_btn is not None:
-            log_btn.setEnabled(bool(self._lan_interface_log_path()))
+        self._apply_personal_button_state(
+            save_btn,
+            valid,
+            enabled_tooltip="保存并应用当前局域网 Web 接口配置。",
+            disabled_tooltip="请先选择有效的 GenericAgent 目录。",
+        )
+        self._apply_personal_button_state(
+            start_btn,
+            valid and (not running) and (not external),
+            enabled_tooltip="按当前配置启动局域网 Web 接口。",
+            disabled_tooltip=(
+                "请先选择有效的 GenericAgent 目录。"
+                if not valid else
+                "局域网 Web 接口已由启动器启动；如需重启请先停止。"
+                if running else
+                "检测到端口已有外部 Streamlit 响应；请先关闭外部进程。"
+                if external else
+                "当前状态不可启动局域网 Web 接口。"
+            ),
+        )
+        self._apply_personal_button_state(
+            stop_btn,
+            running,
+            enabled_tooltip="停止由启动器托管的局域网 Web 接口。",
+            disabled_tooltip=(
+                "当前是外部启动的 Streamlit 进程，启动器无法直接停止。"
+                if external else
+                "当前没有由启动器托管的局域网 Web 接口进程。"
+            ),
+        )
+        self._apply_personal_button_state(
+            open_btn,
+            valid,
+            enabled_tooltip="在浏览器中打开当前局域网 Web 地址。",
+            disabled_tooltip="请先选择有效的 GenericAgent 目录。",
+        )
+        log_path = str(self._lan_interface_log_path() or "").strip()
+        self._apply_personal_button_state(
+            log_btn,
+            bool(log_path),
+            enabled_tooltip="打开局域网 Web 接口日志。",
+            disabled_tooltip=("请先选择有效的 GenericAgent 目录。" if not valid else "当前还没有可用的局域网 Web 日志文件。"),
+        )
         status.setText("\n".join(self._lan_interface_status_lines()))
 
     def _refresh_lan_interface_controls_for_enabled(self, checked=None):
@@ -1675,7 +2301,15 @@ class PersonalUsageMixin:
         for name in ("settings_lan_bind_all", "settings_lan_autostart"):
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.setEnabled(valid and enabled)
+                self._apply_personal_button_state(
+                    widget,
+                    valid and enabled,
+                    enabled_tooltip="应用这个局域网 Web 接口附加选项。",
+                    disabled_tooltip=self._lan_interface_toggle_disabled_reason(
+                        valid_agent_dir=valid,
+                        feature_enabled=enabled,
+                    ),
+                )
 
     def _persist_lan_interface_cfg(self, cfg):
         item = cfg if isinstance(cfg, dict) else self._lan_interface_cfg()
@@ -1727,6 +2361,10 @@ class PersonalUsageMixin:
                 QMessageBox.warning(self, "未启用", "请先启用局域网 Web 接口。")
             return False
         if self._lan_interface_proc_alive():
+            if refresh:
+                self._reload_lan_interface_panel()
+            return True
+        if self._lan_interface_external_running(cfg.get("port")):
             if refresh:
                 self._reload_lan_interface_panel()
             return True
@@ -1796,13 +2434,22 @@ class PersonalUsageMixin:
         self._lan_interface_log_handle = log_handle
         self._lan_interface_last_exit_code = None
         self._set_status(f"局域网 Web 接口已启动：{self._lan_interface_urls(cfg)['local']}")
+        launch_context = capture_runtime_context(self)
         if QApplication.instance() is not None:
-            QTimer.singleShot(1800, lambda se=show_errors: self._after_lan_interface_launch_check(show_errors=se))
+            QTimer.singleShot(
+                1800,
+                lambda se=show_errors, context=launch_context: self._after_lan_interface_launch_check(
+                    show_errors=se,
+                    context=context,
+                ),
+            )
         if refresh:
             self._reload_lan_interface_panel()
         return True
 
-    def _after_lan_interface_launch_check(self, *, show_errors=True):
+    def _after_lan_interface_launch_check(self, *, show_errors=True, context=None):
+        if context is not None and (not runtime_context_matches(self, context)):
+            return
         proc = getattr(self, "_lan_interface_proc", None)
         if proc is None:
             self._reload_lan_interface_panel()
@@ -1818,6 +2465,8 @@ class PersonalUsageMixin:
             if show_errors:
                 tail = self._lan_interface_log_tail() or "(空)"
                 QMessageBox.warning(self, "局域网接口启动失败", f"Streamlit 进程启动后已退出。\n\n日志尾部：\n{tail}")
+        if context is not None and (not runtime_context_matches(self, context)):
+            return
         self._reload_lan_interface_panel()
 
     def _stop_lan_interface_process(self, *, refresh=True):
@@ -1873,16 +2522,18 @@ class PersonalUsageMixin:
         if bool(getattr(self, "_lan_interface_autostart_running", False)):
             return
         cfg = self._lan_interface_cfg()
-        if not cfg["enabled"] or not cfg["auto_start"] or self._lan_interface_proc_alive():
+        if not cfg["enabled"] or not cfg["auto_start"] or self._lan_interface_proc_alive() or self._lan_interface_external_running(cfg.get("port")):
             return
         if not lz.is_valid_agent_dir(self.agent_dir):
             return
         self._lan_interface_autostart_running = True
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
             try:
                 result = lz._ensure_runtime_dependencies(
-                    self.agent_dir,
+                    agent_dir,
                     extra_packages=list(self._LAN_INTERFACE_EXTRA_PACKAGES),
                     progress=None,
                     force_sync=False,
@@ -1891,6 +2542,8 @@ class PersonalUsageMixin:
                 result = {"ok": False, "python": "", "error": str(e)}
 
             def done_ui():
+                if not runtime_context_matches(self, context):
+                    return
                 self._lan_interface_autostart_running = False
                 applier = getattr(self, "_apply_dependency_check_result", None)
                 if callable(applier):
@@ -2060,7 +2713,18 @@ class PersonalUsageMixin:
         blocking_sync = getattr(self, "_sync_remote_device_launcher_sessions_blocking", None)
         blocking_channel_sync = getattr(self, "_sync_remote_device_channel_process_sessions_blocking", None)
         if (not callable(blocking_sync)) and (not callable(blocking_channel_sync)):
+            if callable(on_done):
+                try:
+                    poster = getattr(self, "_api_on_ui_thread", None)
+                    if callable(poster):
+                        poster(on_done)
+                    else:
+                        QTimer.singleShot(0, on_done)
+                except Exception:
+                    pass
             return
+        context = capture_runtime_context(self, include_settings_target=True)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
             try:
@@ -2070,21 +2734,28 @@ class PersonalUsageMixin:
                         device_id=did,
                         include_all_channels=include_all_channels,
                         include_usage=include_usage,
+                        agent_dir=agent_dir,
+                        runtime_context=context,
                     )
             except Exception:
                 pass
             try:
                 if callable(blocking_channel_sync):
-                    blocking_channel_sync()
+                    blocking_channel_sync(agent_dir=agent_dir, runtime_context=context)
             except Exception:
                 pass
             if callable(on_done):
                 try:
+                    def done():
+                        if not runtime_context_matches(self, context, include_settings_target=True):
+                            return
+                        on_done()
+
                     poster = getattr(self, "_api_on_ui_thread", None)
                     if callable(poster):
-                        poster(on_done)
+                        poster(done)
                     else:
-                        QTimer.singleShot(0, on_done)
+                        QTimer.singleShot(0, done)
                 except Exception:
                     pass
 
@@ -2108,13 +2779,13 @@ class PersonalUsageMixin:
             if str(getattr(self, "_settings_personal_remote_synced_key", "") or "") != sync_key:
                 self._settings_personal_remote_sync_running = True
                 self._settings_personal_remote_sync_key = sync_key
-                token_getter = getattr(self, "_settings_target_generation", None)
-                target_token = token_getter() if callable(token_getter) else 0
-                self.settings_personal_notice.setText(f"正在同步 {target['label']} 的会话缓存，当前页面会在同步完成后自动刷新。")
+                context = capture_runtime_context(self, include_settings_target=True)
+                self.settings_personal_notice.setText(f"正在同步 {target['label']} 的会话缓存；完成后会自动刷新，随后可继续调整会话上限。")
 
                 def done():
-                    current_token = token_getter() if callable(token_getter) else target_token
-                    if int(current_token or 0) != int(target_token or 0):
+                    # 旧逻辑等价检查：
+                    # if int(current_token or 0) != int(target_token or 0):
+                    if not runtime_context_matches(self, context, include_settings_target=True):
                         if str(getattr(self, "_settings_personal_remote_sync_key", "") or "") == sync_key:
                             self._settings_personal_remote_sync_running = False
                             self._settings_personal_remote_sync_key = ""
@@ -2122,6 +2793,7 @@ class PersonalUsageMixin:
                     self._settings_personal_remote_sync_running = False
                     self._settings_personal_remote_sync_key = ""
                     self._settings_personal_remote_synced_key = sync_key
+                    self._set_status(f"已同步 {target['label']} 的远端会话缓存；当前页面已刷新，可继续调整会话上限。")
                     self._reload_personal_panel()
 
                 self._trigger_settings_remote_session_sync(
@@ -2131,7 +2803,7 @@ class PersonalUsageMixin:
                 )
                 return
         elif target["is_remote"] and bool(getattr(self, "_settings_personal_remote_sync_running", False)):
-            self.settings_personal_notice.setText(f"正在同步 {target['label']} 的会话缓存，当前页面会在同步完成后自动刷新。")
+            self.settings_personal_notice.setText(f"正在同步 {target['label']} 的会话缓存；完成后会自动刷新，随后可继续调整会话上限。")
             return
         if not lz.is_valid_agent_dir(self.agent_dir):
             self.settings_personal_notice.setText("请先选择有效的 GenericAgent 目录。")
@@ -2990,13 +3662,13 @@ class PersonalUsageMixin:
             if str(getattr(self, "_settings_usage_remote_synced_key", "") or "") != sync_key:
                 self._settings_usage_remote_sync_running = True
                 self._settings_usage_remote_sync_key = sync_key
-                token_getter = getattr(self, "_settings_target_generation", None)
-                target_token = token_getter() if callable(token_getter) else 0
-                self.settings_usage_notice.setText(f"正在同步 {target['label']} 的远端使用日志、会话与渠道快照，完成后会自动刷新。")
+                context = capture_runtime_context(self, include_settings_target=True)
+                self.settings_usage_notice.setText(f"正在同步 {target['label']} 的远端使用日志、会话与渠道快照；完成后会自动刷新，可能需要数秒。")
 
                 def done():
-                    current_token = token_getter() if callable(token_getter) else target_token
-                    if int(current_token or 0) != int(target_token or 0):
+                    # 旧逻辑等价检查：
+                    # if int(current_token or 0) != int(target_token or 0):
+                    if not runtime_context_matches(self, context, include_settings_target=True):
                         if str(getattr(self, "_settings_usage_remote_sync_key", "") or "") == sync_key:
                             self._settings_usage_remote_sync_running = False
                             self._settings_usage_remote_sync_key = ""
@@ -3004,6 +3676,7 @@ class PersonalUsageMixin:
                     self._settings_usage_remote_sync_running = False
                     self._settings_usage_remote_sync_key = ""
                     self._settings_usage_remote_synced_key = sync_key
+                    self._set_status(f"已同步 {target['label']} 的远端使用日志、会话与渠道快照；当前页面已刷新。")
                     self._reload_usage_panel()
 
                 self._trigger_settings_remote_session_sync(
@@ -3014,7 +3687,7 @@ class PersonalUsageMixin:
                 )
                 return
         elif target["is_remote"] and bool(getattr(self, "_settings_usage_remote_sync_running", False)):
-            self.settings_usage_notice.setText(f"正在同步 {target['label']} 的远端使用日志、会话与渠道快照，完成后会自动刷新。")
+            self.settings_usage_notice.setText(f"正在同步 {target['label']} 的远端使用日志、会话与渠道快照；完成后会自动刷新，可能需要数秒。")
             return
         if not lz.is_valid_agent_dir(self.agent_dir):
             self.settings_usage_notice.setText("请先选择有效的 GenericAgent 目录。")
@@ -3041,10 +3714,12 @@ class PersonalUsageMixin:
         actions_row.setSpacing(8)
         export_btn = QPushButton("导出当前摘要")
         export_btn.setStyleSheet(self._action_button_style(primary=True))
+        export_btn.setToolTip("把当前设备的使用摘要导出到本地文件。")
         export_btn.clicked.connect(lambda: self._usage_export_current_report(stats, target, langfuse))
         actions_row.addWidget(export_btn, 0)
         cache_btn = QPushButton("打开会话缓存")
         cache_btn.setStyleSheet(self._action_button_style())
+        cache_btn.setToolTip("打开当前启动器保存的会话缓存目录。")
         cache_btn.clicked.connect(self._usage_open_cache_dir)
         actions_row.addWidget(cache_btn, 0)
         actions_row.addStretch(1)
@@ -3382,11 +4057,17 @@ class PersonalUsageMixin:
         restart_btn.setStyleSheet(self._action_button_style(primary=True))
         restart_btn.clicked.connect(lambda: self._save_langfuse_config(restart=True))
         action_row.addWidget(restart_btn, 0)
-        clear_btn = QPushButton("清除配置")
-        clear_btn.setStyleSheet(self._action_button_style(kind="destructive"))
-        clear_btn.clicked.connect(self._clear_langfuse_config)
-        clear_btn.setEnabled(bool(langfuse.get("configured")))
-        action_row.addWidget(clear_btn, 0)
+        self.settings_langfuse_clear_btn = QPushButton("清除配置")
+        self.settings_langfuse_clear_btn.setStyleSheet(self._action_button_style(kind="destructive"))
+        self.settings_langfuse_clear_btn.clicked.connect(self._clear_langfuse_config)
+        clear_disabled_reason = self._langfuse_clear_disabled_reason(configured=bool(langfuse.get("configured")))
+        self._apply_personal_button_state(
+            self.settings_langfuse_clear_btn,
+            not bool(clear_disabled_reason),
+            enabled_tooltip="删除当前已保存的 Langfuse 配置。",
+            disabled_tooltip=clear_disabled_reason,
+        )
+        action_row.addWidget(self.settings_langfuse_clear_btn, 0)
         action_row.addStretch(1)
         form_box.addLayout(action_row)
         advanced_wrap_box.addWidget(form_card)
@@ -3479,6 +4160,45 @@ class PersonalUsageMixin:
         diag_box.addLayout(diag_actions)
         self.settings_about_list_layout.addWidget(diag_card)
 
+        if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            install_card = self._panel_card()
+            install_box = QVBoxLayout(install_card)
+            install_box.setContentsMargins(14, 12, 14, 12)
+            install_box.setSpacing(8)
+            install_title = QLabel("安装状态")
+            install_title.setObjectName("cardTitle")
+            install_box.addWidget(install_title)
+            install_desc = QLabel("用于确认当前 app 是否已经从 dmg 正确移动到 `/Applications` 或 `~/Applications`，并查看当前 app 路径、数据目录和手动升级方式。")
+            install_desc.setWordWrap(True)
+            install_desc.setObjectName("cardDesc")
+            install_box.addWidget(install_desc)
+            self.settings_about_install_status = QLabel("")
+            self.settings_about_install_status.setWordWrap(True)
+            self.settings_about_install_status.setObjectName("mutedText")
+            self.settings_about_install_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            install_box.addWidget(self.settings_about_install_status)
+            install_actions = QHBoxLayout()
+            install_actions.setSpacing(8)
+            refresh_install_btn = QPushButton("刷新安装状态")
+            refresh_install_btn.setStyleSheet(self._action_button_style())
+            refresh_install_btn.clicked.connect(self._refresh_about_installation_manual)
+            install_actions.addWidget(refresh_install_btn, 0)
+            open_apps_btn = QPushButton("打开推荐安装目录")
+            open_apps_btn.setStyleSheet(self._action_button_style())
+            open_apps_btn.clicked.connect(self._open_launcher_install_recommended_dir)
+            install_actions.addWidget(open_apps_btn, 0)
+            open_current_btn = QPushButton("打开当前 App 位置")
+            open_current_btn.setStyleSheet(self._action_button_style())
+            open_current_btn.clicked.connect(self._open_launcher_install_current_location)
+            install_actions.addWidget(open_current_btn, 0)
+            open_data_btn = QPushButton("打开用户数据目录")
+            open_data_btn.setStyleSheet(self._action_button_style())
+            open_data_btn.clicked.connect(self._open_launcher_install_data_root)
+            install_actions.addWidget(open_data_btn, 0)
+            install_actions.addStretch(1)
+            install_box.addLayout(install_actions)
+            self.settings_about_list_layout.addWidget(install_card)
+
         launcher_ctx = self._discover_launcher_repo_context()
         launcher_repo_url = (
             str(self.cfg.get("launcher_repo_url") or "").strip()
@@ -3512,3 +4232,4 @@ class PersonalUsageMixin:
             line.addWidget(right, 1)
             self.settings_about_list_layout.addWidget(card)
         self._refresh_about_update_widgets()
+        self._refresh_about_installation_widgets()

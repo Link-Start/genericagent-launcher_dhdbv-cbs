@@ -13,6 +13,8 @@ DefaultDirName={localappdata}\Programs\GenericAgentLauncher
 DisableDirPage=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+CloseApplications=yes
+RestartApplications=no
 OutputDir=..\release\{#MyVersion}\installer
 OutputBaseFilename=GenericAgentLauncher-Setup-{#MyVersion}
 Compression=lzma
@@ -40,6 +42,35 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Filename: "{app}\LauncherBootstrap.exe"; Description: "启动 GenericAgent Launcher"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-Type: files; Name: "{app}\*"
-Type: dirifempty; Name: "{app}\app\versions"
-Type: dirifempty; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\app"
+
+[Code]
+function LauncherStateJson(): String;
+begin
+  Result :=
+    '{' + #13#10 +
+    '  "current_version": "{#MyVersion}",' + #13#10 +
+    '  "previous_version": "",' + #13#10 +
+    '  "pending_update": {},' + #13#10 +
+    '  "updated_at": 0' + #13#10 +
+    '}';
+end;
+
+procedure InitializeLauncherState();
+var
+  StateDir: String;
+  StatePath: String;
+begin
+  StateDir := ExpandConstant('{localappdata}\GenericAgentLauncher\state');
+  if not DirExists(StateDir) then
+    ForceDirectories(StateDir);
+  StatePath := AddBackslash(StateDir) + 'current.json';
+  if not SaveStringToFile(StatePath, LauncherStateJson(), False) then
+    Log('Failed to initialize launcher state: ' + StatePath);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    InitializeLauncherState();
+end;

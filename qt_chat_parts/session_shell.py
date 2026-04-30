@@ -9,6 +9,41 @@ from launcher_app import core as lz
 
 
 class SessionShellMixin:
+    def _apply_composer_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _composer_send_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅用于回顾日志与快照，不能在这里继续发送消息。"
+        if bool(getattr(self, "_busy", False)):
+            return "当前正在等待模型回复，请稍候或先停止当前任务。"
+        return ""
+
+    def _composer_stop_disabled_reason(self, *, disabled=False, remote=False):
+        if bool(disabled):
+            return "渠道进程会话仅用于回顾日志与快照，不能在这里停止任务。"
+        if bool(remote):
+            return "当前会话在远程设备执行，这里不支持直接停止远端任务。"
+        if not bool(getattr(self, "_busy", False)):
+            return "当前没有正在执行的本地回复任务。"
+        if bool(getattr(self, "_abort_requested", False)):
+            return "停止请求已发送，请等待当前任务退出。"
+        return ""
+
+    def _composer_llm_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅支持查看日志，不能切换模型。"
+        if not bool(getattr(self, "llms", None)):
+            return "当前还没有可用的 LLM 配置。"
+        return ""
+
     def _bind_session_to_current_bridge(self, session):
         if not isinstance(session, dict):
             return
@@ -257,6 +292,9 @@ class SessionShellMixin:
         send_btn = getattr(self, "send_btn", None)
         stop_btn = getattr(self, "stop_btn", None)
         llm_combo = getattr(self, "llm_combo", None)
+        send_disabled_reason = self._composer_send_disabled_reason(disabled=disabled)
+        stop_disabled_reason = self._composer_stop_disabled_reason(disabled=disabled, remote=remote)
+        llm_disabled_reason = self._composer_llm_disabled_reason(disabled=disabled)
         if input_box is not None:
             input_box.setReadOnly(disabled)
             input_box.setPlaceholderText(
@@ -264,12 +302,35 @@ class SessionShellMixin:
                 if disabled
                 else ("当前会话在远程设备执行，使用 SSH 发送。Enter 发送，Shift+Enter 换行" if remote else "输入消息，Enter 发送，Shift+Enter 换行")
             )
+            try:
+                input_box.setToolTip(
+                    "渠道进程会话仅用于查看日志与快照。"
+                    if disabled
+                    else ("当前会话通过 SSH 在远程设备执行。" if remote else "当前会话在本机执行。")
+                )
+            except Exception:
+                pass
         if send_btn is not None:
-            send_btn.setEnabled((not disabled) and (not self._busy))
+            self._apply_composer_widget_state(
+                send_btn,
+                not bool(send_disabled_reason),
+                enabled_tooltip="发送当前输入内容。",
+                disabled_tooltip=send_disabled_reason,
+            )
         if stop_btn is not None:
-            stop_btn.setEnabled((not disabled) and (not remote) and self._busy and (not self._abort_requested))
+            self._apply_composer_widget_state(
+                stop_btn,
+                not bool(stop_disabled_reason),
+                enabled_tooltip="停止当前本地回复任务。",
+                disabled_tooltip=stop_disabled_reason,
+            )
         if llm_combo is not None:
-            llm_combo.setEnabled((not disabled) and bool(self.llms))
+            self._apply_composer_widget_state(
+                llm_combo,
+                not bool(llm_disabled_reason),
+                enabled_tooltip="切换当前会话使用的模型。",
+                disabled_tooltip=llm_disabled_reason,
+            )
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
         if callable(floating_sync):
             floating_sync()

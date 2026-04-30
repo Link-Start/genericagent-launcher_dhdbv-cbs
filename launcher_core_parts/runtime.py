@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -18,10 +19,13 @@ from contextlib import contextmanager
 
 from .constants import (
     APP_DIR,
+    APP_DISPLAY_NAME,
     BOOTSTRAP_EXE_NAME,
     CONFIG_PATH,
     CURRENT_STATE_PATH,
     DATA_ROOT,
+    IS_MACOS,
+    IS_WINDOWS,
     LEGACY_CONFIG_PATH,
     MAIN_EXE_NAME,
     PROGRAMS_ROOT,
@@ -147,6 +151,11 @@ def _run_external_subprocess(args, **kwargs):
 def _popen_external_subprocess(args, **kwargs):
     kwargs["env"] = _external_subprocess_env(kwargs.get("env"))
     _ensure_windows_no_window_creationflags(kwargs)
+    if os.name != "nt" and "start_new_session" not in kwargs:
+        # On POSIX, keep launcher-managed children in their own session so they
+        # can be terminated as a whole process group without touching the
+        # launcher's own terminal/session.
+        kwargs["start_new_session"] = True
     with _external_subprocess_runtime():
         return subprocess.Popen(args, **kwargs)
 
@@ -172,6 +181,94 @@ def _normalize_process_pid(proc_or_pid):
         return int(proc_or_pid or 0)
     except Exception:
         return 0
+
+
+def _pid_exists_posix(pid):
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _posix_process_group_ids(pid):
+    try:
+        current_pgid = int(os.getpgid(0) or 0)
+    except Exception:
+        current_pgid = 0
+    try:
+        target_pgid = int(os.getpgid(int(pid)) or 0)
+    except Exception:
+        target_pgid = 0
+    return current_pgid, target_pgid
+
+
+def _terminate_process_tree_posix(proc, pid, *, terminate_timeout=1.2, kill_timeout=1.2):
+    current_pgid, target_pgid = _posix_process_group_ids(pid)
+    use_group = bool(target_pgid > 0 and current_pgid > 0 and target_pgid != current_pgid)
+    terminate_sig = getattr(signal, "SIGTERM", 15)
+    kill_sig = getattr(signal, "SIGKILL", terminate_sig)
+
+    def target_alive():
+        if proc is not None:
+            try:
+                if proc.poll() is not None:
+                    return False
+            except Exception:
+                pass
+        return _pid_exists_posix(pid)
+
+    def wait_deadline(timeout_s):
+        deadline = time.time() + max(0.1, float(timeout_s or 0.1))
+        while time.time() < deadline:
+            if not target_alive():
+                return True
+            time.sleep(0.05)
+        return not target_alive()
+
+    def send_signal(sig):
+        try:
+            if use_group:
+                os.killpg(target_pgid, sig)
+            else:
+                os.kill(pid, sig)
+            return True
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+
+    if not target_alive():
+        if proc is not None:
+            _close_process_stream(getattr(proc, "stdout", None))
+            _close_process_stream(getattr(proc, "stderr", None))
+        return True
+
+    send_signal(terminate_sig)
+    if wait_deadline(terminate_timeout):
+        if proc is not None:
+            try:
+                proc.wait(timeout=0.2)
+            except Exception:
+                pass
+            _close_process_stream(getattr(proc, "stdout", None))
+            _close_process_stream(getattr(proc, "stderr", None))
+        return True
+
+    send_signal(kill_sig)
+    stopped = wait_deadline(kill_timeout)
+    if proc is not None:
+        try:
+            proc.wait(timeout=0.2)
+        except Exception:
+            pass
+        _close_process_stream(getattr(proc, "stdout", None))
+        _close_process_stream(getattr(proc, "stderr", None))
+    return stopped
 
 
 def terminate_process_tree(proc_or_pid, *, quit_line="", terminate_timeout=1.2, kill_timeout=1.2):
@@ -233,39 +330,12 @@ def terminate_process_tree(proc_or_pid, *, quit_line="", terminate_timeout=1.2, 
             except Exception:
                 return ok
         return ok
-    try:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-    except Exception:
-        pass
-    try:
-        if proc is not None:
-            proc.wait(timeout=max(0.1, float(terminate_timeout or 1.2)))
-            _close_process_stream(getattr(proc, "stdout", None))
-            _close_process_stream(getattr(proc, "stderr", None))
-            return True
-    except Exception:
-        pass
-    try:
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-    if proc is not None:
-        try:
-            proc.wait(timeout=max(0.2, float(kill_timeout or 1.2)))
-        except Exception:
-            pass
-        _close_process_stream(getattr(proc, "stdout", None))
-        _close_process_stream(getattr(proc, "stderr", None))
-        try:
-            return proc.poll() is not None
-        except Exception:
-            return False
-    return False
+    return _terminate_process_tree_posix(
+        proc,
+        pid,
+        terminate_timeout=terminate_timeout,
+        kill_timeout=kill_timeout,
+    )
 
 
 def _launcher_data_dirs():
@@ -449,6 +519,18 @@ def _candidate_program_root_from_dir(path):
 
 
 def resolved_programs_root():
+    if not IS_WINDOWS:
+        for candidate in (
+            os.environ.get("GA_LAUNCHER_PROGRAMS_ROOT"),
+            APP_DIR,
+            os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else "",
+            PROGRAMS_ROOT,
+        ):
+            text = os.path.normpath(str(candidate or "").strip())
+            if text:
+                return text
+        return os.path.normpath(APP_DIR)
+
     candidates = []
 
     def _push(path):
@@ -542,6 +624,148 @@ def current_launcher_version():
     except Exception:
         pass
     return resolved
+
+
+def current_launcher_executable_path():
+    raw = ""
+    if getattr(sys, "frozen", False):
+        raw = str(sys.executable or "").strip()
+    else:
+        argv0 = str(sys.argv[0] or "").strip() if getattr(sys, "argv", None) else ""
+        raw = argv0 or APP_DIR
+        if raw and (not os.path.isabs(raw)):
+            raw = os.path.join(APP_DIR, raw)
+    return os.path.abspath(raw) if raw else os.path.abspath(APP_DIR)
+
+
+def current_launcher_bundle_path():
+    start = current_launcher_executable_path()
+    probe = start if os.path.isdir(start) else os.path.dirname(start)
+    seen = set()
+    for _ in range(8):
+        if not probe:
+            break
+        norm = os.path.normcase(os.path.normpath(probe))
+        if norm in seen:
+            break
+        seen.add(norm)
+        if probe.lower().endswith(".app") and os.path.isdir(os.path.join(probe, "Contents")):
+            return probe
+        parent = os.path.dirname(probe)
+        if not parent or parent == probe:
+            break
+        probe = parent
+    return ""
+
+
+def macos_installation_status():
+    status = {
+        "platform": sys.platform,
+        "is_macos": bool(IS_MACOS),
+        "is_frozen": bool(getattr(sys, "frozen", False)),
+        "app_display_name": APP_DISPLAY_NAME,
+        "install_mode": "manual_dmg" if IS_MACOS else "",
+        "recommended_install_target": "",
+        "user_applications_target": "",
+        "app_bundle_path": "",
+        "app_parent_dir": "",
+        "executable_path": current_launcher_executable_path(),
+        "data_root": DATA_ROOT,
+        "config_path": CONFIG_PATH,
+        "installed_to_system_applications": False,
+        "installed_to_user_applications": False,
+        "running_from_disk_image": False,
+        "running_from_translocation": False,
+        "needs_relocation": False,
+        "status": "info",
+        "summary": "",
+    }
+    if not IS_MACOS:
+        status["summary"] = "当前平台不是 macOS。"
+        return status
+
+    default_recommended = os.path.join("/Applications", f"{APP_DISPLAY_NAME}.app")
+    user_target = os.path.join(os.path.expanduser("~"), "Applications", f"{APP_DISPLAY_NAME}.app")
+    bundle = current_launcher_bundle_path()
+    parent_dir = os.path.dirname(bundle) if bundle else ""
+    executable_path = str(status.get("executable_path") or "").strip()
+    combined = " ".join([bundle, executable_path]).strip()
+    lowered = combined.lower()
+    running_from_translocation = "/apptranslocation/" in lowered
+    running_from_disk_image = bool(
+        _path_is_under(bundle, "/Volumes") or _path_is_under(executable_path, "/Volumes")
+    )
+    installed_to_system = bool(parent_dir and os.path.normcase(os.path.normpath(parent_dir)) == os.path.normcase("/Applications"))
+    user_applications_dir = os.path.dirname(user_target)
+    installed_to_user = bool(parent_dir and os.path.normcase(os.path.normpath(parent_dir)) == os.path.normcase(user_applications_dir))
+    recommended = (
+        bundle
+        if bundle and (installed_to_system or installed_to_user)
+        else default_recommended
+    )
+    needs_relocation = bool(
+        status["is_frozen"]
+        and (
+            running_from_disk_image
+            or running_from_translocation
+            or (bundle and not installed_to_system and not installed_to_user)
+        )
+    )
+
+    status.update(
+        {
+            "recommended_install_target": recommended,
+            "user_applications_target": user_target,
+            "app_bundle_path": bundle,
+            "app_parent_dir": parent_dir,
+            "installed_to_system_applications": installed_to_system,
+            "installed_to_user_applications": installed_to_user,
+            "running_from_disk_image": running_from_disk_image,
+            "running_from_translocation": running_from_translocation,
+            "needs_relocation": needs_relocation,
+        }
+    )
+
+    if not status["is_frozen"]:
+        status["status"] = "info"
+        status["summary"] = "当前是源码/开发态运行，不适用 mac 安装路径检查。"
+        return status
+    user_level_hint = "如果只想安装到当前用户，也可以改放 ~/Applications"
+    if running_from_disk_image:
+        status["status"] = "warn"
+        status["summary"] = (
+            "当前仍在 dmg 挂载目录中运行，建议先拖到 /Applications；"
+            + user_level_hint
+            + "，然后重新打开。"
+        )
+        return status
+    if running_from_translocation:
+        status["status"] = "warn"
+        status["summary"] = (
+            "当前处于 App Translocation 路径，建议移动到 /Applications；"
+            + user_level_hint
+            + "，再重新启动。"
+        )
+        return status
+    if installed_to_system:
+        status["status"] = "ok"
+        status["summary"] = "当前 app 已安装在 /Applications。"
+        return status
+    if installed_to_user:
+        status["status"] = "ok"
+        status["summary"] = "当前 app 已安装在 ~/Applications。"
+        return status
+    if bundle:
+        status["status"] = "warn"
+        status["summary"] = (
+            "当前 app 不在推荐安装位置，建议移动到 /Applications；"
+            + user_level_hint
+            + "。"
+        )
+        return status
+    status["status"] = "warn"
+    status["summary"] = "当前未检测到有效的 mac app bundle 路径。"
+    return status
 
 
 def _version_dir(version):
@@ -659,6 +883,18 @@ def start_pending_update_alive_probe(delay_seconds=6):
     return True
 
 
+def _version_sort_key(text):
+    parts = []
+    for chunk in re.split(r"[.+-]", str(text or "").strip().lower().lstrip("v")):
+        if not chunk:
+            continue
+        if chunk.isdigit():
+            parts.append((0, int(chunk)))
+        else:
+            parts.append((1, chunk))
+    return tuple(parts)
+
+
 def cleanup_old_versions(*, keep_versions=None, keep_count=2):
     keep = {str(item or "").strip() for item in (keep_versions or []) if str(item or "").strip()}
     state = load_version_state()
@@ -669,10 +905,10 @@ def cleanup_old_versions(*, keep_versions=None, keep_count=2):
     if not os.path.isdir(versions_dir):
         return []
     removed = []
-    names = sorted(os.listdir(versions_dir))
+    names = sorted(os.listdir(versions_dir), key=_version_sort_key)
     protected = set(keep)
     if keep_count > 0 and len(protected) > keep_count:
-        protected = set(sorted(protected)[-keep_count:])
+        protected = set(sorted(protected, key=_version_sort_key)[-keep_count:])
     for name in names:
         target = os.path.join(versions_dir, name)
         if not os.path.isdir(target):
@@ -904,6 +1140,8 @@ def verify_authenticode_signature(file_path):
 
 
 def bootstrap_executable_path():
+    if not IS_WINDOWS or not BOOTSTRAP_EXE_NAME:
+        return ""
     roots = [APP_DIR, resolved_programs_root(), PROGRAMS_ROOT]
     seen = set()
     for root in roots:
@@ -918,6 +1156,8 @@ def bootstrap_executable_path():
 
 
 def updater_executable_path():
+    if not IS_WINDOWS or not UPDATER_EXE_NAME:
+        return ""
     roots = [APP_DIR, resolved_programs_root(), PROGRAMS_ROOT]
     seen = set()
     for root in roots:
@@ -932,6 +1172,8 @@ def updater_executable_path():
 
 
 def launch_installed_updater(job_path):
+    if not IS_WINDOWS:
+        raise RuntimeError("mac 版本当前不支持应用内更新，请手动下载新版安装包升级。")
     updater = updater_executable_path()
     if not os.path.isfile(updater):
         raise FileNotFoundError(f"Updater.exe 不存在：{updater}")

@@ -171,9 +171,76 @@ C: dict = {}
 C.update(_LIGHT_PALETTE)
 
 
+def _default_ui_font_family(platform_name: str | None = None) -> str:
+    name = str(platform_name or sys.platform or "").strip().lower()
+    if name == "darwin":
+        return '"PingFang SC", "Helvetica Neue", "Arial Unicode MS", sans-serif'
+    if name.startswith("win"):
+        return '"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif'
+    return '"Noto Sans CJK SC", "Noto Sans", "Source Han Sans SC", "DejaVu Sans", sans-serif'
+
+
+def _default_mono_font_family(platform_name: str | None = None) -> str:
+    name = str(platform_name or sys.platform or "").strip().lower()
+    if name == "darwin":
+        return '"SF Mono", Menlo, Monaco, "PingFang SC", monospace'
+    if name.startswith("win"):
+        return '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace'
+    return '"Noto Sans Mono CJK SC", "Noto Sans Mono", "DejaVu Sans Mono", monospace'
+
+
+def preferred_theme_font_families(platform_name: str | None = None) -> list[str]:
+    name = str(platform_name or sys.platform or "").strip().lower()
+    if name == "darwin":
+        ordered = [
+            "PingFang SC",
+            "Helvetica Neue",
+            "Arial Unicode MS",
+            "Segoe UI Variable Text",
+            "Segoe UI",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+        ]
+    elif name.startswith("win"):
+        ordered = [
+            "Segoe UI Variable Text",
+            "Segoe UI",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+            "Source Han Sans SC",
+        ]
+    else:
+        ordered = [
+            "Noto Sans CJK SC",
+            "Noto Sans",
+            "Source Han Sans SC",
+            "DejaVu Sans",
+            "PingFang SC",
+            "Segoe UI",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+        ]
+    seen = set()
+    result = []
+    for item in ordered:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
 F: dict = {
-    "font_family": '"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif',
-    "font_family_mono": '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace',
+    "font_family": _default_ui_font_family(),
+    "font_family_mono": _default_mono_font_family(),
 
     "font_caption": 12,
     "font_body": 14,
@@ -430,6 +497,7 @@ def build_qss() -> str:
     stroke_divider = C["stroke_divider"]
     focus = C["stroke_focus"]
     font = _format_font_family(str(_VISUAL_PREFS.get("font_family") or ""))
+    font_mono = str(F.get("font_family_mono") or "monospace")
     font_weight = int(_VISUAL_PREFS.get("font_weight") or 400)
     fs = font_body_size()
     fs_compact = max(10, fs - 3)
@@ -971,7 +1039,7 @@ def build_qss() -> str:
     QLabel#depDetail {{ color: {text_soft}; font-size: {fs_caption}px; background: transparent; }}
     QLabel#tokenTree {{
         color: {muted};
-        font-family: Consolas, 'Segoe UI', monospace;
+        font-family: {font_mono};
         font-size: {fs_compact}px;
         background: transparent;
     }}

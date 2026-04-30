@@ -18,6 +18,38 @@ from .common import PRIVATE_PYTHON_VERSION
 
 
 class DownloadMixin:
+    def _supports_private_python_installer(self):
+        return bool(getattr(lz, "PLATFORM_SUPPORTS_PRIVATE_PYTHON_INSTALLER", os.name == "nt"))
+
+    def _uses_system_python_download_mode(self):
+        return not self._supports_private_python_installer()
+
+    def _download_existing_target_ready_text(self):
+        if self._uses_system_python_download_mode():
+            return "已使用现有目录。请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。"
+        return "已使用现有目录。现在可以直接进入聊天。"
+
+    def _download_clone_ready_text(self):
+        if self._uses_system_python_download_mode():
+            return "下载完成，已设置为当前 GenericAgent 目录。请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。"
+        return "下载完成，已设置为当前 GenericAgent 目录。现在可以直接进入聊天。"
+
+    def _download_git_missing_message(self):
+        return "未检测到 Git。请先安装 Git：\nhttps://git-scm.com/downloads"
+
+    def _remove_download_target_path(self, target):
+        raw = str(target or "").strip()
+        if not raw or (not os.path.exists(raw)):
+            return True, ""
+        try:
+            if os.path.isdir(raw):
+                shutil.rmtree(raw, ignore_errors=False)
+            else:
+                os.remove(raw)
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
     def _append_download_log(self, message: str):
         box = getattr(self, "download_log", None)
         text = str(message or "").rstrip()
@@ -35,16 +67,21 @@ class DownloadMixin:
         if hasattr(self, "download_btn"):
             self.download_btn.setEnabled(not self._download_running)
             self.download_btn.setText("下载中…" if self._download_running and self._download_mode == "clone" else "开始下载")
-        if hasattr(self, "download_private_btn"):
-            self.download_private_btn.setEnabled(not self._download_running)
-            self.download_private_btn.setText(
-                "构建中…" if self._download_running and self._download_mode == "private_python" else "下载并配置 3.12 虚拟环境"
-            )
-        if hasattr(self, "download_private_only_checkbox"):
-            self.download_private_only_checkbox.setEnabled(not self._download_running)
-        if hasattr(self, "download_source_checkboxes"):
-            for cb in (self.download_source_checkboxes or {}).values():
-                cb.setEnabled(not self._download_running)
+        private_btn = getattr(self, "download_private_btn", None)
+        if private_btn is not None:
+            if self._supports_private_python_installer():
+                private_btn.setEnabled(not self._download_running)
+                private_btn.setText(
+                    "构建中…" if self._download_running and self._download_mode == "private_python" else "下载并配置 3.12 虚拟环境"
+                )
+            else:
+                private_btn.setEnabled(False)
+                private_btn.setText("mac 版使用系统 Python")
+        private_only_checkbox = getattr(self, "download_private_only_checkbox", None)
+        if private_only_checkbox is not None:
+            private_only_checkbox.setEnabled(self._supports_private_python_installer() and (not self._download_running))
+        for cb in (getattr(self, "download_source_checkboxes", None) or {}).values():
+            cb.setEnabled(self._supports_private_python_installer() and (not self._download_running))
         if hasattr(self, "download_progress"):
             if self._download_running:
                 self.download_progress.setRange(0, 0)
@@ -160,6 +197,13 @@ class DownloadMixin:
         return picked if picked else list(sources)
 
     def _start_download_repo(self, private_python=False, private_only=False):
+        if private_python and (not self._supports_private_python_installer()):
+            QMessageBox.information(
+                self,
+                "系统 Python 模式",
+                "mac 版当前不提供私有 Python 安装器。\n\n请先下载或定位 GenericAgent，再使用系统 Python 和依赖检查完成环境准备。",
+            )
+            return
         parent = str(self.install_parent or "").strip()
         if not parent or not os.path.isdir(parent):
             QMessageBox.warning(self, "位置无效", "请选择有效的安装位置。")
@@ -173,19 +217,38 @@ class DownloadMixin:
             self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 仅配置虚拟环境失败：目标目录不存在 {target}")
             return
         if os.path.exists(target):
-            if QMessageBox.question(self, "目录已存在", f"{target}\n\n已存在。是否直接使用它作为 GenericAgent 目录？") != QMessageBox.Yes:
-                return
             if lz.is_valid_agent_dir(target):
+                if QMessageBox.question(self, "目录已存在", f"{target}\n\n已存在。是否直接使用它作为 GenericAgent 目录？") != QMessageBox.Yes:
+                    return
                 if not private_python:
                     self._set_agent_dir(target)
-                    self.download_status_label.setText("已使用现有目录。现在可以直接进入聊天。")
+                    self.download_status_label.setText(self._download_existing_target_ready_text())
                     self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目录已存在，已直接接管：{target}")
                     return
                 self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目录已存在，将继续为它配置私有 3.12 虚拟环境：{target}")
             else:
-                QMessageBox.warning(self, "目录无效", "该目录存在但不是有效的 GenericAgent 目录。")
-                self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目录存在，但不是有效的 GenericAgent 根目录：{target}")
-                return
+                if private_python and private_only:
+                    QMessageBox.warning(self, "目录无效", "你勾选了“仅配置虚拟环境”，但目标目录不是有效的 GenericAgent 根目录。")
+                    self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 仅配置虚拟环境失败：目标目录不是有效的 GenericAgent 根目录：{target}")
+                    return
+                answer = QMessageBox.question(
+                    self,
+                    "目录已存在但不完整",
+                    f"{target}\n\n检测到残留目录，但它不是有效的 GenericAgent 根目录。"
+                    "\n这通常是上次下载中断、clone 失败或手动拷贝不完整留下的。"
+                    "\n\n是否删除这个目录后重新下载？",
+                )
+                if answer != QMessageBox.Yes:
+                    self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 用户取消：目录存在但不完整，未清理 {target}")
+                    return
+                removed, remove_err = self._remove_download_target_path(target)
+                if not removed:
+                    QMessageBox.warning(self, "清理失败", f"无法清理残留目录：\n{target}\n\n错误：{remove_err}")
+                    self._append_download_log(
+                        f"[{datetime.now().strftime('%H:%M:%S')}] 清理残留目录失败：{target} | {remove_err}"
+                    )
+                    return
+                self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 已清理残留目录，准备重新下载：{target}")
         elif private_python and private_only:
             QMessageBox.warning(self, "目录不存在", "你勾选了“仅配置虚拟环境”，但目标目录里还没有 GenericAgent。\n\n请先下载原项目，或取消该勾选。")
             self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 仅配置虚拟环境失败：目标目录不存在 {target}")
@@ -203,6 +266,8 @@ class DownloadMixin:
         threading.Thread(target=self._run_clone_repo, args=(target, private_python, private_only), daemon=True).start()
 
     def _private_python_spec(self):
+        if not self._supports_private_python_installer():
+            return None, "当前平台暂未接入私有 Python 3.12 自动安装。mac 版请使用系统 Python。"
         machine = (platform.machine() or "").lower()
         if machine in ("amd64", "x86_64", "x64", ""):
             arch = "amd64"
@@ -830,7 +895,7 @@ class DownloadMixin:
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
                 except Exception:
-                    self._event_queue.put({"event": "clone_error", "msg": "未检测到 Git。请先安装 Git for Windows：\nhttps://git-scm.com/download/win"})
+                    self._event_queue.put({"event": "clone_error", "msg": self._download_git_missing_message()})
                     return
                 self._event_queue.put({"event": "clone_status", "msg": f"开始下载到：{target}"})
                 proc = lz._popen_external_subprocess(
@@ -891,7 +956,7 @@ class DownloadMixin:
                 self.download_status_label.setText("下载完成，已配置私有 3.12 虚拟环境并设置为当前 GenericAgent 目录。现在可以直接进入聊天。")
                 self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 私有 3.12 虚拟环境已就绪：{python_exe}")
             else:
-                self.download_status_label.setText("下载完成，已设置为当前 GenericAgent 目录。现在可以直接进入聊天。")
+                self.download_status_label.setText(self._download_clone_ready_text())
             self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 下载完成")
             return True
         if et == "clone_error":

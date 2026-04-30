@@ -22,6 +22,8 @@ from shiboken6 import isValid
 from launcher_app import core as lz
 from launcher_app.theme import C, F
 
+from .common import capture_runtime_context, runtime_context_matches
+
 _API_ADVANCED_FIELD_META = {
     "fake_cc_system_prompt": {
         "label": "fake_cc_system_prompt",
@@ -422,7 +424,103 @@ class ApiEditorMixin:
             configs.append({"var": state["var"], "kind": kind, "data": data})
         return configs + list(self._qt_api_hidden_configs)
 
+    def _api_source_status(self) -> str:
+        return str(getattr(self, "_qt_api_source_status", "") or "").strip().lower()
+
+    def _set_api_source_status(self, status: str, *, py_path: str | None = None, error_text: str | None = None):
+        self._qt_api_source_status = str(status or "").strip().lower()
+        if py_path is not None:
+            self._qt_api_py_path = str(py_path or "")
+        if error_text is not None:
+            self._qt_api_parse_error = str(error_text or "")
+
+    def _api_source_allows_save(self) -> bool:
+        return self._api_source_status() in {"ready", "parse_error"}
+
+    def _api_source_allows_raw_edit(self) -> bool:
+        return self._api_source_status() in {"ready", "parse_error", "load_failed"}
+
+    def _api_source_disabled_reason(self, action: str, *, is_remote_target: bool = False) -> str:
+        status = self._api_source_status()
+        verb = str(action or "").strip() or "执行该操作"
+        if is_remote_target and verb == "保存并重启内核":
+            return "远端目标下不会在本机重启聊天内核；写回远端 mykey.py 后请在服务器侧重启对应进程。"
+        if status == "invalid_dir":
+            return "请先选择有效的 GenericAgent 目录。"
+        if status == "loading":
+            return "正在读取当前目标的 mykey.py，请稍候。"
+        if status == "load_failed":
+            if verb == "直接编辑文件":
+                return ""
+            return "当前 mykey.py 读取失败；如需修复请先用“直接编辑文件”处理原文。"
+        if status == "parse_error":
+            return ""
+        if status == "ready":
+            return ""
+        return f"当前状态不可{verb}。"
+
+    def _apply_api_button_state(self, button, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if button is None:
+            return
+        button.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            button.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _api_model_fetch_disabled_reason(self, state) -> str:
+        item = state if isinstance(state, dict) else {}
+        if bool(item.get("model_fetching")):
+            return "当前正在拉取该配置的模型列表，请稍候。"
+        return ""
+
+    def _refresh_api_source_actions(self):
+        target_ctx_getter = getattr(self, "_settings_target_context", None)
+        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+        is_remote_target = bool((target_ctx or {}).get("is_remote"))
+        status = self._api_source_status()
+        can_save = self._api_source_allows_save()
+        can_raw = self._api_source_allows_raw_edit()
+        add_btn = getattr(self, "settings_api_add_btn", None)
+        save_btn = getattr(self, "settings_api_save_btn", None)
+        restart_btn = getattr(self, "settings_api_restart_btn", None)
+        raw_btn = getattr(self, "settings_api_raw_btn", None)
+        self._apply_api_button_state(
+            add_btn,
+            can_save,
+            enabled_tooltip="新增一张 API 配置卡片。",
+            disabled_tooltip=self._api_source_disabled_reason("新增 API 卡片", is_remote_target=is_remote_target),
+        )
+        self._apply_api_button_state(
+            save_btn,
+            can_save,
+            enabled_tooltip="把当前 API 配置写回 mykey.py。",
+            disabled_tooltip=self._api_source_disabled_reason("保存", is_remote_target=is_remote_target),
+        )
+        restart_allowed = can_save and (not is_remote_target)
+        self._apply_api_button_state(
+            restart_btn,
+            restart_allowed,
+            enabled_tooltip="保存后立即重启本机聊天内核。",
+            disabled_tooltip=self._api_source_disabled_reason("保存并重启内核", is_remote_target=is_remote_target),
+        )
+        self._apply_api_button_state(
+            raw_btn,
+            can_raw,
+            enabled_tooltip="直接编辑当前目标的 mykey.py 原文。",
+            disabled_tooltip=self._api_source_disabled_reason("直接编辑文件", is_remote_target=is_remote_target),
+        )
+
     def _apply_loaded_api_source(self, py_path, parsed):
+        if bool((parsed or {}).get("load_failed")):
+            self._reset_api_source_state(error_text=parsed.get("error") or "读取配置失败", status="load_failed")
+            notices = [str(py_path or "").strip()]
+            if self._qt_api_parse_error:
+                notices.append(f"当前读取失败：{self._qt_api_parse_error}。请先修复读取问题，当前页面不会覆盖现有配置。")
+            self.settings_api_notice.setText("\n".join([line for line in notices if line]))
+            self._refresh_api_source_actions()
+            return
         self._qt_api_py_path = py_path
         self._qt_api_parse_error = parsed.get("error") or ""
         self._qt_api_hidden_configs = [
@@ -446,8 +544,22 @@ class ApiEditorMixin:
             notices.append(f"检测到 {len(self._qt_api_hidden_configs)} 条旧式或高级配置，本页保存时会原样保留。")
         if self._qt_api_passthrough:
             notices.append(f"检测到 {len(self._qt_api_passthrough)} 条表单不直接编辑的原文项，保存时会原样保留。")
+        self._set_api_source_status("parse_error" if self._qt_api_parse_error else "ready")
         self.settings_api_notice.setText("\n".join(notices))
         self._render_api_cards()
+        self._refresh_api_source_actions()
+
+    def _reset_api_source_state(self, *, error_text="", status="invalid_dir"):
+        self._qt_api_py_path = ""
+        self._qt_api_parse_error = str(error_text or "")
+        self._qt_api_hidden_configs = []
+        self._qt_api_state = []
+        self._qt_api_extras = {}
+        self._qt_api_passthrough = []
+        self._set_api_source_status(status, py_path="", error_text=error_text)
+        refresher = getattr(self, "_refresh_api_source_actions", None)
+        if callable(refresher):
+            refresher()
 
     def _reload_api_editor_state(self):
         if not hasattr(self, "settings_api_notice"):
@@ -456,15 +568,19 @@ class ApiEditorMixin:
         target_ctx_getter = getattr(self, "_settings_target_context", None)
         target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
         if (not bool((target_ctx or {}).get("is_remote"))) and (not lz.is_valid_agent_dir(self.agent_dir)):
+            self._reset_api_source_state(error_text="请先选择有效的 GenericAgent 目录。", status="invalid_dir")
             self.settings_api_notice.setText("请先选择有效的 GenericAgent 目录。")
             return
         if bool((target_ctx or {}).get("is_remote")):
             if bool(getattr(self, "_qt_api_remote_loading", False)):
                 self.settings_api_notice.setText("正在读取远端 mykey.py…")
+                self._set_api_source_status("loading")
+                self._refresh_api_source_actions()
                 return
             self._qt_api_remote_loading = True
-            token_getter = getattr(self, "_settings_target_generation", None)
-            target_token = token_getter() if callable(token_getter) else 0
+            context = capture_runtime_context(self, include_settings_target=True)
+            self._set_api_source_status("loading")
+            self._refresh_api_source_actions()
             self.settings_api_notice.setText("正在读取远端 mykey.py…")
             loading = QLabel("正在从远端设备拉取 API 配置，请稍候…")
             loading.setObjectName("mutedText")
@@ -474,8 +590,9 @@ class ApiEditorMixin:
                 py_path, parsed = self._load_mykey_source()
 
                 def done():
-                    current_token = token_getter() if callable(token_getter) else target_token
-                    if int(current_token or 0) != int(target_token or 0):
+                    # 旧逻辑等价检查：
+                    # if int(current_token or 0) != int(target_token or 0):
+                    if not runtime_context_matches(self, context, include_settings_target=True):
                         return
                     self._qt_api_remote_loading = False
                     self._clear_layout(self.settings_api_list_layout)
@@ -561,9 +678,15 @@ class ApiEditorMixin:
             model_box.setCurrentText(current_model)
             row3.addWidget(model_box, 1)
             fetch_btn = QPushButton("拉取模型")
-            fetch_btn.setEnabled(not state.get("model_fetching"))
             fetch_btn.setStyleSheet(self._action_button_style())
             fetch_btn.clicked.connect(lambda _=False, s=state: self._qt_api_fetch_models(s))
+            fetch_disabled_reason = self._api_model_fetch_disabled_reason(state)
+            self._apply_api_button_state(
+                fetch_btn,
+                not bool(fetch_disabled_reason),
+                enabled_tooltip="从当前 API 地址拉取可用模型列表。",
+                disabled_tooltip=fetch_disabled_reason,
+            )
             row3.addWidget(fetch_btn, 0)
             body.addLayout(row3)
 
@@ -793,6 +916,9 @@ class ApiEditorMixin:
             return
         if state.get("model_fetching"):
             return
+        context = capture_runtime_context(self, include_settings_target=True)
+        state["model_fetch_token"] = int(state.get("model_fetch_token", 0) or 0) + 1
+        fetch_token = int(state.get("model_fetch_token", 0) or 0)
         state["model_fetching"] = True
         state["model_status"] = "正在拉取模型列表…"
         self._render_api_cards()
@@ -802,6 +928,12 @@ class ApiEditorMixin:
                 models = lz._fetch_remote_models(state.get("format"), state.get("apibase"), state.get("apikey"))
 
                 def done_ok():
+                    if not runtime_context_matches(self, context, include_settings_target=True):
+                        return
+                    if int(state.get("model_fetch_token", 0) or 0) != fetch_token:
+                        return
+                    if state not in list(getattr(self, "_qt_api_state", []) or []):
+                        return
                     state["model_fetching"] = False
                     state["model_choices"] = models
                     if models and not (state.get("model") or "").strip():
@@ -814,6 +946,12 @@ class ApiEditorMixin:
                 err_text = str(e)
 
                 def done_err():
+                    if not runtime_context_matches(self, context, include_settings_target=True):
+                        return
+                    if int(state.get("model_fetch_token", 0) or 0) != fetch_token:
+                        return
+                    if state not in list(getattr(self, "_qt_api_state", []) or []):
+                        return
                     state["model_fetching"] = False
                     state["model_status"] = f"拉取失败：{err_text}"
                     self._render_api_cards()
@@ -904,7 +1042,7 @@ class ApiEditorMixin:
         editor = QTextEdit()
         editor.setPlainText(original)
         editor.setStyleSheet(
-            f"QTextEdit {{ background: {C['field_bg']}; color: {C['code_text']}; border: 1px solid {C['stroke_default']}; border-radius: {F['radius_md']}px; font-family: Consolas, 'Microsoft YaHei UI'; font-size: 13px; }}"
+            f"QTextEdit {{ background: {C['field_bg']}; color: {C['code_text']}; border: 1px solid {C['stroke_default']}; border-radius: {F['radius_md']}px; font-family: {F['font_family_mono']}; font-size: 13px; }}"
         )
         layout.addWidget(editor, 1)
 
@@ -919,6 +1057,9 @@ class ApiEditorMixin:
         btns.addWidget(save_btn, 0)
         restart_btn = QPushButton("保存并重启内核")
         restart_btn.setStyleSheet(self._action_button_style(primary=True))
+        restart_btn.setEnabled(not bool((target_ctx or {}).get("is_remote")))
+        if bool((target_ctx or {}).get("is_remote")):
+            restart_btn.setToolTip("远端目标下不会在本机重启聊天内核。")
         btns.addWidget(restart_btn, 0)
         layout.addLayout(btns)
 

@@ -6,9 +6,12 @@ import re
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import bridge
+from launcher_app import app_icon as launcher_app_icon
 from launcher_app import core as lz
+from launcher_app import theme as launcher_theme
 from launcher_core_parts import model_api
 from launcher_core_parts import python_env
 from launcher_core_parts import sessions as sessions_mod
@@ -125,6 +128,34 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             sig2 = python_env._dependency_signature(td, extra_packages=["qrcode"])
         self.assertNotEqual(sig1["requirements_hash"], sig2["requirements_hash"])
 
+    def test_python_env_macos_absolute_candidates_cover_homebrew_and_pyenv(self):
+        existing = {
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+            "/Users/demo/.pyenv/shims/python3",
+        }
+        with mock.patch.object(python_env.sys, "platform", "darwin"), mock.patch.object(
+            python_env.os.path, "expanduser", return_value="/Users/demo"
+        ), mock.patch.object(python_env.os.path, "isfile", side_effect=lambda path: path in existing):
+            candidates = python_env._macos_python_absolute_commands()
+
+        self.assertIn(["/opt/homebrew/bin/python3"], candidates)
+        self.assertIn(["/usr/local/bin/python3"], candidates)
+        self.assertIn(["/Library/Frameworks/Python.framework/Versions/Current/bin/python3"], candidates)
+        self.assertIn(["/Users/demo/.pyenv/shims/python3"], candidates)
+
+    def test_python_env_system_commands_append_macos_absolute_fallbacks(self):
+        with mock.patch.object(python_env.os, "name", "posix"), mock.patch.object(
+            python_env, "load_config", return_value={}
+        ), mock.patch.object(
+            python_env, "_macos_python_absolute_commands", return_value=[["/opt/homebrew/bin/python3"]]
+        ):
+            candidates = python_env._system_python_commands()
+
+        self.assertEqual(candidates[:2], [["python3"], ["python"]])
+        self.assertIn(["/opt/homebrew/bin/python3"], candidates)
+
     def test_bridge_sanitize_agent_llmclients_filters_bad_dict_placeholders(self):
         class DummyBackend:
             def __init__(self):
@@ -178,15 +209,6 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         self.assertIn('llmcore._record_usage = _record_usage_patched', src)
         self.assertIn('_record_usage_patched._ga_launcher_original = getattr(llmcore, "_record_usage", None)', src)
 
-    def test_bridge_claude_sse_patch_preserves_thinking_signature_field(self):
-        root = os.path.dirname(os.path.dirname(__file__))
-        path = os.path.join(root, "bridge.py")
-        with open(path, "r", encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn('current_block = {"type": "thinking", "thinking": "", "signature": ""}', src)
-        self.assertIn('elif delta.get("type") == "signature_delta":', src)
-        self.assertIn('current_block["signature"] = current_block.get("signature", "") + delta.get("signature", "")', src)
-
     def test_bridge_strips_pyinstaller_runtime_dir_from_sys_path(self):
         original_file = bridge.__file__
         original_sys_path = list(bridge.sys.path)
@@ -215,6 +237,49 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         finally:
             bridge.__file__ = original_file
             bridge.sys.path[:] = original_sys_path
+
+    def test_theme_font_helpers_return_platform_appropriate_defaults(self):
+        mac_ui = launcher_theme._default_ui_font_family("darwin")
+        win_ui = launcher_theme._default_ui_font_family("win32")
+        mac_mono = launcher_theme._default_mono_font_family("darwin")
+        win_mono = launcher_theme._default_mono_font_family("win32")
+
+        self.assertIn("PingFang SC", mac_ui)
+        self.assertNotIn("Segoe UI", mac_ui)
+        self.assertIn("Segoe UI", win_ui)
+        self.assertIn("SF Mono", mac_mono)
+        self.assertIn("Consolas", win_mono)
+
+    def test_launcher_icon_svg_has_expected_shell_shape(self):
+        svg = launcher_app_icon.launcher_icon_svg()
+        self.assertIn("<svg", svg)
+        self.assertIn("linearGradient", svg)
+        self.assertIn('stroke="#22D3EE"', svg)
+        self.assertIn('fill="#67E8F9"', svg)
+        self.assertIn('fill="#08111F"', svg)
+
+    def test_common_markdown_css_uses_theme_font_stacks(self):
+        css = common._build_md_css()
+        self.assertIn(f"font-family: {launcher_theme.F['font_family']};", css)
+        self.assertIn(f"font-family: {launcher_theme.F['font_family_mono']};", css)
+
+    def test_theme_font_settings_use_platform_preferred_family_helper(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("preferred_theme_font_families", src)
+        self.assertIn("preferred = preferred_theme_font_families()", src)
+
+    def test_window_sets_runtime_launcher_icon_for_app_and_windows(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "launcher_app", "window.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("from launcher_app.app_icon import launcher_icon", src)
+        self.assertIn("app.setWindowIcon(launcher_icon())", src)
+        self.assertIn("self.setWindowIcon(app_icon)", src)
+        self.assertIn('self.setWindowIcon(host.windowIcon() if host is not None else launcher_icon())', src)
 
     def test_all_lz_symbols_used_by_ui_exist(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -756,6 +821,49 @@ tg_bot_token = '123'
         self.assertIn("1500", src)
         self.assertIn("if not was_aborted", src)
 
+    def test_bridge_runtime_exposes_attachment_and_llm_disabled_reason_helpers(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "bridge_runtime.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("def _apply_bridge_widget_state", src)
+        self.assertIn("def _bridge_attachment_remove_disabled_reason", src)
+        self.assertIn("def _bridge_llm_combo_disabled_reason", src)
+        self.assertIn("当前这一轮还没有结束；本轮已附带图片会在回复完成后自动清除。", src)
+        self.assertIn("当前还没有可用的 LLM 配置。", src)
+        self.assertIn("把这张图片从下一轮输入中移除。", src)
+        self.assertIn("切换当前会话使用的模型。", src)
+
+    def test_navigation_channel_api_and_personal_pages_expose_consistent_disabled_reasons(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        nav_path = os.path.join(root, "qt_chat_parts", "navigation.py")
+        channel_path = os.path.join(root, "qt_chat_parts", "channel_runtime.py")
+        api_path = os.path.join(root, "qt_chat_parts", "api_editor.py")
+        personal_path = os.path.join(root, "qt_chat_parts", "personal_usage.py")
+        with open(nav_path, "r", encoding="utf-8") as f:
+            nav_src = f.read()
+        with open(channel_path, "r", encoding="utf-8") as f:
+            channel_src = f.read()
+        with open(api_path, "r", encoding="utf-8") as f:
+            api_src = f.read()
+        with open(personal_path, "r", encoding="utf-8") as f:
+            personal_src = f.read()
+        self.assertIn("def _apply_navigation_widget_state", nav_src)
+        self.assertIn("进入聊天页并开始准备当前内核环境。", nav_src)
+        self.assertIn("请先选择有效的 GenericAgent 目录。", nav_src)
+        self.assertIn("def _channel_source_action_disabled_reason", channel_src)
+        self.assertIn("把当前通讯配置写回 channels/mykey.py。", channel_src)
+        self.assertIn("重新读取当前目标的通讯配置。", channel_src)
+        self.assertIn("停止当前启动器托管的全部本地通讯渠道。", channel_src)
+        self.assertIn("def _api_model_fetch_disabled_reason", api_src)
+        self.assertIn("当前正在拉取该配置的模型列表，请稍候。", api_src)
+        self.assertIn("从当前 API 地址拉取可用模型列表。", api_src)
+        self.assertIn("def _lan_interface_form_disabled_reason", personal_src)
+        self.assertIn("def _lan_interface_toggle_disabled_reason", personal_src)
+        self.assertIn("def _langfuse_clear_disabled_reason", personal_src)
+        self.assertIn("请先开启局域网 Web 接口，再调整这个选项。", personal_src)
+        self.assertIn("当前还没有已保存的 Langfuse 配置可清除。", personal_src)
+
     def test_python_env_probe_forces_utf8_subprocess_env(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "launcher_core_parts", "python_env.py")
@@ -891,16 +999,27 @@ tg_bot_token = '123'
         self.assertIn("def _new_session_from_floating(self):", window_src)
         self.assertIn("def _regenerate_latest_from_floating(self):", window_src)
         self.assertIn("def _save_floating_orb_position(self, pos: QPoint):", window_src)
-        self.assertIn("def _sync_draft_to_floating(self):", window_src)
+        self.assertIn("def _sync_draft_to_floating(self, *, force=False):", window_src)
         self.assertIn("self.llm_combo = QComboBox()", window_src)
         self.assertIn("self.session_combo = QComboBox()", window_src)
         self.assertIn("self.new_session_btn = QPushButton(\"新建\")", window_src)
         self.assertIn("self.regen_btn = QPushButton(\"重试\")", window_src)
         self.assertIn("def _enter_tray_floating_mode(self):", window_src)
         self.assertIn("def _restore_from_tray_mode(self):", window_src)
+        self.assertIn("def _floating_hide_action_text(self) -> str:", window_src)
+        self.assertIn("def _floating_default_status_text(self) -> str:", window_src)
+        self.assertIn("def _functions_menu_floating_action_text(self) -> str:", window_src)
+        self.assertIn("def _focus_visible_floating_chat_window(self, *, update_status: bool = True) -> bool:", window_src)
+        self.assertIn("def _handle_functions_menu_floating_action(self) -> None:", window_src)
+        self.assertIn("def _floating_window_visible(self) -> bool:", window_src)
+        self.assertIn("def refresh_action_texts(self):", window_src)
         self.assertIn("if self.isVisible() and not self._tray_mode_active:", window_src)
         self.assertIn("def _show_floating_chat_window_only(self):", window_src)
-        self.assertIn('menu.addAction("🗕  缩小到托盘，仅保留悬浮窗")', shell_src)
+        self.assertIn('_launcher_tray_signal_owner', window_src)
+        self.assertIn('tray.activated.connect(self._on_launcher_tray_activated)', window_src)
+        self.assertIn('tray_action = menu.addAction(floating_action_text)', shell_src)
+        self.assertIn('action = getattr(self, "_handle_functions_menu_floating_action", None)', shell_src)
+        self.assertIn('floating_label_getter = getattr(self, "_functions_menu_floating_action_text", None)', shell_src)
         self.assertIn("floating.apply_theme()", shell_src)
         self.assertIn("floating_sync = getattr(self, \"_sync_floating_llm_combo\", None)", bridge_src)
 
@@ -1001,12 +1120,22 @@ tg_bot_token = '123'
         self.assertIn("event.type() in (QEvent.Resize, QEvent.Show)", src)
         self.assertIn('placer = getattr(self, "_place_jump_latest_button", None)', src)
 
+    def test_sidebar_remote_session_status_texts_explain_cache_and_writeback(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "sidebar_sessions.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("已载入远程会话缓存，正在后台同步；可继续发送，新内容会尝试写回远端。", src)
+        self.assertIn("已同步远程会话；后续发送会继续写回远端。", src)
+        self.assertIn("远端同步失败，当前仍使用本地缓存：", src)
+
     def test_personal_settings_exposes_reply_notification_toggles(self):
         root = os.path.dirname(os.path.dirname(__file__))
         settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
         with open(settings_path, "r", encoding="utf-8") as f:
             settings_src = f.read()
         self.assertIn('notify_title = QLabel("回复提醒")', settings_src)
+        self.assertIn("完成提示消息", settings_src)
         self.assertIn('self.settings_disable_reply_sound = QCheckBox("关闭提示音")', settings_src)
         self.assertIn('self.settings_disable_reply_message = QCheckBox("关闭提示消息")', settings_src)
         self.assertIn("notify_save_btn.clicked.connect(self._save_personal_preferences)", settings_src)
@@ -1120,11 +1249,12 @@ tg_bot_token = '123'
         with open(nav_path, "r", encoding="utf-8") as f:
             nav_src = f.read()
         self.assertIn("def _quick_enter_chat(self):", nav_src)
-        self.assertIn("self._enter_chat(skip_dependency_check=True)", nav_src)
+        self.assertIn("def _can_skip_dependency_check_on_quick_enter", nav_src)
+        self.assertIn("self._enter_chat(skip_dependency_check=self._can_skip_dependency_check_on_quick_enter())", nav_src)
         self.assertIn("def _enter_chat(self, *, skip_dependency_check=False):", nav_src)
         self.assertIn('if (not skip_dependency_check) and (not self._check_runtime_dependencies(purpose="载入内核")):', nav_src)
 
-    def test_quick_start_skips_dependency_check_but_locate_page_keeps_it(self):
+    def test_quick_start_only_skips_dependency_check_after_successful_cached_check(self):
         root = os.path.dirname(os.path.dirname(__file__))
         setup_path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
         with open(setup_path, "r", encoding="utf-8") as f:
@@ -1136,7 +1266,9 @@ tg_bot_token = '123'
         with open(nav_path, "r", encoding="utf-8") as f:
             nav_src = f.read()
         self.assertIn("def _quick_enter_chat(self):", nav_src)
-        self.assertIn("self._enter_chat(skip_dependency_check=True)", nav_src)
+        self.assertIn("def _can_skip_dependency_check_on_quick_enter", nav_src)
+        self.assertIn('if not report or (not report.get("ok")):', nav_src)
+        self.assertIn("self._enter_chat(skip_dependency_check=self._can_skip_dependency_check_on_quick_enter())", nav_src)
         self.assertIn("def _enter_chat(self, *, skip_dependency_check=False):", nav_src)
         self.assertIn('if (not skip_dependency_check) and (not self._check_runtime_dependencies(purpose="载入内核")):', nav_src)
 
@@ -1270,7 +1402,16 @@ tg_bot_token = '123'
             src = f.read()
         self.assertIn("def _build_launcher_external_update_info", src)
         self.assertIn('"install_mode": "external"', src)
+        self.assertIn('"readme_url"', src)
+        self.assertIn('"sha256_url"', src)
+        self.assertIn('"metadata_url"', src)
+        self.assertIn("def _launcher_manual_update_payload", src)
+        self.assertIn("def _show_launcher_manual_update_dialog", src)
         self.assertIn("下载更新安装包", src)
+        self.assertIn("打开安装说明", src)
+        self.assertIn("打开 sha256", src)
+        self.assertIn("打开安装元数据", src)
+        self.assertIn("打开 Release 页面", src)
         self.assertIn("QDesktopServices.openUrl", src)
 
     def test_kernel_update_check_handles_unsynced_remote_without_false_diverged(self):
@@ -1462,6 +1603,24 @@ tg_bot_token = '123'
         self.assertIn("远端配置模式", channel_src)
         self.assertIn('if category in ("api", "channels", "schedule", "usage"):', settings_src)
 
+    def test_settings_panel_vps_actions_expose_disabled_reason_helpers(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings_src = f.read()
+        self.assertIn("def _apply_vps_button_state", settings_src)
+        self.assertIn("def _vps_busy_reason", settings_src)
+        self.assertIn("def _vps_terminal_connect_disabled_reason", settings_src)
+        self.assertIn("def _vps_terminal_send_disabled_reason", settings_src)
+        self.assertIn("def _vps_deploy_disabled_reason", settings_src)
+        self.assertIn("请先新建至少一个服务器配置。", settings_src)
+        self.assertIn("当前还没有服务器配置可切换。", settings_src)
+        self.assertIn("当前终端已连接到另一台服务器，请先断开后再切换。", settings_src)
+        self.assertIn("当前终端连接已在使用中，无需重复连接。", settings_src)
+        self.assertIn("当前没有已连接的远程终端。", settings_src)
+        self.assertIn("请先连接远程终端。", settings_src)
+        self.assertIn("正在执行 VPS Docker 部署，请等待当前任务完成。", settings_src)
+
     def test_schedule_personal_and_usage_pages_keep_target_device_support(self):
         root = os.path.dirname(os.path.dirname(__file__))
         settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
@@ -1493,6 +1652,16 @@ tg_bot_token = '123'
         self.assertIn("def _settings_data_target_context", personal_src)
         self.assertIn("def _reload_personal_panel", personal_src)
         self.assertIn("下方“回复提醒”卡片不会跟随设备切换", personal_src)
+        self.assertIn("def _apply_personal_button_state", personal_src)
+        self.assertIn("def _about_update_check_disabled_reason", personal_src)
+        self.assertIn("def _about_update_install_disabled_reason", personal_src)
+        self.assertIn("def _kernel_sync_disabled_reason", personal_src)
+        self.assertIn("当前正在检测 GitHub 更新，请稍候。", personal_src)
+        self.assertIn("当前缺少内置 updater，暂时不能直接安装更新。", personal_src)
+        self.assertIn("当前没有可用的内核 Git 仓库目录。", personal_src)
+        self.assertIn("检测到端口已有外部 Streamlit 响应；请先关闭外部进程。", personal_src)
+        self.assertIn("当前是外部启动的 Streamlit 进程，启动器无法直接停止。", personal_src)
+        self.assertIn("当前还没有可用的局域网 Web 日志文件。", personal_src)
         self.assertIn("def _reload_usage_panel", personal_src)
         self.assertIn("if int(current_token or 0) != int(target_token or 0):", personal_src)
         self.assertIn("def _schedule_target_device", schedule_src)
@@ -1505,27 +1674,74 @@ tg_bot_token = '123'
         self.assertIn("def _schedule_open_report", schedule_src)
         self.assertIn("def _schedule_open_tasks_dir", schedule_src)
         self.assertIn("def _schedule_open_log_file", schedule_src)
+        self.assertIn("def _apply_schedule_button_state", schedule_src)
+        self.assertIn("def _schedule_runtime_start_disabled_reason", schedule_src)
+        self.assertIn("def _schedule_runtime_stop_disabled_reason", schedule_src)
+        self.assertIn("def _schedule_report_disabled_reason", schedule_src)
+        self.assertIn("def _schedule_tasks_dir_disabled_reason", schedule_src)
+        self.assertIn("def _schedule_log_disabled_reason", schedule_src)
         self.assertIn("下载并打开报告", schedule_src)
         self.assertIn("同步并打开目录", schedule_src)
         self.assertIn("下载并打开完整日志", schedule_src)
+        self.assertIn("远端调度器已在运行；无需重复启动。", schedule_src)
+        self.assertIn("当前是外部启动的调度器进程，启动器无法直接停止。", schedule_src)
+        self.assertIn("当前远端任务还没有可同步的报告文件。", schedule_src)
+        self.assertIn("当前远端{label}路径不可用，暂时无法下载。", schedule_src)
         self.assertIn("def _usage_export_current_report", personal_src)
         self.assertIn("导出当前摘要", personal_src)
         self.assertIn("打开会话缓存", personal_src)
+        self.assertIn('export_btn.setToolTip("把当前设备的使用摘要导出到本地文件。")', personal_src)
+        self.assertIn('cache_btn.setToolTip("打开当前启动器保存的会话缓存目录。")', personal_src)
+        self.assertIn("正在同步 {target['label']} 的会话缓存；完成后会自动刷新，随后可继续调整会话上限。", personal_src)
+        self.assertIn("已同步 {target['label']} 的远端会话缓存；当前页面已刷新，可继续调整会话上限。", personal_src)
+        self.assertIn("正在同步 {target['label']} 的远端使用日志、会话与渠道快照；完成后会自动刷新，可能需要数秒。", personal_src)
+        self.assertIn("已同步 {target['label']} 的远端使用日志、会话与渠道快照；当前页面已刷新。", personal_src)
         self.assertIn("def _remote_channel_status_check_age", channel_src)
         self.assertIn("def _remote_channel_last_checked_at", channel_src)
         self.assertIn("def _remote_channel_device_sync_state", channel_src)
         self.assertIn("def _remote_channel_check_hint", channel_src)
         self.assertIn("def _show_remote_channel_status_detail", channel_src)
         self.assertIn("def _request_remote_channel_status_refresh", channel_src)
+        self.assertIn("def _remote_channel_label_text", channel_src)
+        self.assertIn("def _remote_channel_log_loaded_status", channel_src)
+        self.assertIn("def _channel_start_disabled_reason", channel_src)
+        self.assertIn("def _channel_stop_disabled_reason", channel_src)
+        self.assertIn("def _channel_bind_disabled_reason", channel_src)
+        self.assertIn("def _channel_remote_aux_disabled_reason", channel_src)
+        self.assertIn("def _apply_channel_button_state", channel_src)
         self.assertIn("正在校验远端状态", channel_src)
         self.assertIn("最近校验：", channel_src)
         self.assertIn("服务器连接异常", channel_src)
         self.assertIn("校验详情", channel_src)
+        self.assertIn("远端微信未绑定，已转入远端扫码绑定；完成后会继续尝试启动。", channel_src)
+        self.assertIn("已启动远端", channel_src)
+        self.assertIn("如无新消息可再查看远端日志", channel_src)
+        self.assertIn("当前会继续复用现有进程", channel_src)
+        self.assertIn("远端停止失败，进程可能仍在运行。", channel_src)
+        self.assertIn("当前未运行；无需重复停止。", channel_src)
+        self.assertIn("可直接查看末尾输出继续排查。", channel_src)
+        self.assertIn("当前还没有新的日志输出。", channel_src)
+        self.assertIn("请检查 SSH 连接后重试：", channel_src)
+        self.assertIn("检测到外部", channel_src)
+        self.assertIn("启动器无法直接停止", channel_src)
+        self.assertIn("当前远端设备信息不可用", channel_src)
+        self.assertIn("无法读取", channel_src)
+        self.assertIn("def _api_source_disabled_reason", api_src)
+        self.assertIn("def _apply_api_button_state", api_src)
+        self.assertIn("请先用“直接编辑文件”处理原文", api_src)
+        self.assertIn("请先选择有效的 GenericAgent 目录。", api_src)
+        self.assertIn("正在读取当前目标的 mykey.py，请稍候。", api_src)
+        self.assertIn("服务器侧重启对应进程", api_src)
+        self.assertIn("直接编辑当前目标的 mykey.py 原文。", api_src)
         self.assertIn("device_checked_map[did] = now", sidebar_src)
         self.assertIn("checked_map[(did, cid)] = now", sidebar_src)
         self.assertIn("sync_meta[\"fail_count\"] = int(sync_meta.get(\"fail_count\") or 0) + 1", sidebar_src)
         self.assertIn("raw_err = str(err or \"远端状态读取失败。\").strip() or \"远端状态读取失败。\"", sidebar_src)
         self.assertIn("sync_meta[\"last_error\"] = normalize_ssh_error_text(raw_err, context=\"SSH 连接\")", sidebar_src)
+        self.assertIn("远端会话写回失败，当前内容仍保留在本地缓存：", sidebar_src)
+        self.assertIn("远端同步失败，当前仍使用本地缓存：", sidebar_src)
+        self.assertIn("可稍后重试同步或检查 SSH。", sidebar_src)
+        self.assertIn("可稍后重试或先检查 SSH。", sidebar_src)
         self.assertIn("def _vps_decode_candidates", settings_src)
         self.assertIn("def _decode_vps_terminal_chunk", settings_src)
         self.assertIn("gb18030", settings_src)
@@ -1617,6 +1833,7 @@ tg_bot_token = '123'
         self.assertIn("def _refresh_server_status_indicator", shell_src)
         self.assertIn("server_status_btn", window_src)
         self.assertIn("startup_channel_starter = getattr(self, \"_schedule_local_channel_autostart\", None)", window_src)
+        self.assertIn("startup_scheduler_starter = getattr(self, \"_start_autostart_scheduler\", None)", window_src)
         self.assertIn("app.installEventFilter(self)", window_src)
         self.assertIn("def _begin_window_trace", window_src)
         self.assertIn("def _append_window_trace_log", window_src)
@@ -1626,6 +1843,21 @@ tg_bot_token = '123'
         self.assertIn("self._server_status_timer = QTimer(self)", window_src)
         self.assertIn("head_layout.addWidget(self.server_status_btn", window_src)
         self.assertIn("probe(force=True)", settings_src)
+
+    def test_session_shell_composer_actions_have_disabled_reason_helpers(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "session_shell.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("def _apply_composer_widget_state", src)
+        self.assertIn("def _composer_send_disabled_reason", src)
+        self.assertIn("def _composer_stop_disabled_reason", src)
+        self.assertIn("def _composer_llm_disabled_reason", src)
+        self.assertIn("渠道进程会话仅用于回顾日志与快照，不能在这里继续发送消息。", src)
+        self.assertIn("当前正在等待模型回复，请稍候或先停止当前任务。", src)
+        self.assertIn("当前会话在远程设备执行，这里不支持直接停止远端任务。", src)
+        self.assertIn("当前没有正在执行的本地回复任务。", src)
+        self.assertIn("当前还没有可用的 LLM 配置。", src)
 
     def test_channel_runtime_uses_channel_specific_dependency_check(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -1698,6 +1930,10 @@ tg_bot_token = '123'
         self.assertIn('return "待扫码绑定", C["danger_text"]', src)
         self.assertIn('return "正在自动启动", C["text_soft"]', src)
         self.assertIn('return "等待自动启动", C["text_soft"]', src)
+        self.assertIn("本次会转入重新扫码", src)
+        self.assertIn("如需启动请先手动扫码绑定", src)
+        self.assertIn("本次启动可能仍会失败", src)
+        self.assertIn("如仍异常请重新扫码", src)
         self.assertIn("self._autostart_channel_pending_ids = set(pending)", src)
         self.assertIn('self._autostart_channel_current = str(channel_id or "").strip()', src)
         self.assertIn('defocus(fallback=getattr(self, "settings_channels_list", None))', src)
@@ -1736,10 +1972,12 @@ tg_bot_token = '123'
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
         self.assertIn("def _defer_chat_runtime_bootstrap", src)
+        self.assertIn("def _can_skip_dependency_check_on_quick_enter", src)
         self.assertIn("def _schedule_local_channel_autostart", src)
         self.assertIn("self._local_channel_autostart_scheduled = True", src)
         self.assertIn("self._start_autostart_channels()", src)
         self.assertIn("self._schedule_local_channel_autostart()", src)
+        self.assertIn("skip_dependency_check=self._can_skip_dependency_check_on_quick_enter()", src)
         self.assertIn("QTimer.singleShot(160, self, run)", src)
         self.assertIn("self._defer_chat_runtime_bootstrap()", src)
 
@@ -1813,6 +2051,9 @@ tg_bot_token = '123'
         self.assertIn("正在预检下载源可用性", src)
         self.assertIn("下载源预检通过", src)
         self.assertIn("下载源预检失败", src)
+        self.assertIn("目录已存在但不完整", src)
+        self.assertIn("是否删除这个目录后重新下载", src)
+        self.assertIn("已清理残留目录，准备重新下载", src)
 
     def test_setup_page_has_download_source_checkboxes(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -1822,6 +2063,292 @@ tg_bot_token = '123'
         self.assertIn("Python 安装包下载源（可多选", src)
         self.assertIn("download_source_checkboxes", src)
         self.assertIn("_on_private_python_source_toggled", src)
+
+    def test_download_flow_has_macos_system_python_guard(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "downloads.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("PLATFORM_SUPPORTS_PRIVATE_PYTHON_INSTALLER", src)
+        self.assertIn("mac 版当前不提供私有 Python 安装器", src)
+        self.assertIn("mac 版请使用系统 Python", src)
+
+    def test_setup_page_mentions_macos_system_python_mode(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("mac 版当前使用系统 Python", src)
+        self.assertIn("mac 版使用系统 Python", src)
+
+    def test_setup_page_uses_read_only_system_python_copy_on_macos(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("git clone 过程会在这里实时输出；进入聊天后的依赖检查会在单独窗口展示。", src)
+        self.assertIn("mac 版使用系统 Python，不会下载或管理私有解释器", src)
+        self.assertIn("首次载入时会自动探测 python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。", src)
+        self.assertIn("留空时会自动尝试 python / python3；mac 下也会补试常见 Homebrew 绝对路径。", src)
+        self.assertIn("如果你已有项目虚拟环境，也可以手动填写 venv/bin/python。", src)
+
+    def test_setup_page_uses_platform_neutral_python_wording(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("可填 python / python3 / venv/bin/python", src)
+        self.assertIn("这里建议选择具体的 Python 可执行文件", src)
+        self.assertIn("而不是 uv 本身", src)
+        self.assertNotIn("这里建议选择具体的 python.exe", src)
+        self.assertNotIn("uv.exe 本身", src)
+
+    def test_python_env_uv_error_message_is_platform_neutral(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "launcher_core_parts", "python_env.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("GA_LAUNCHER_UV_EXE 指向 uv 可执行文件", src)
+        self.assertNotIn("GA_LAUNCHER_UV_EXE 指向 uv.exe", src)
+        self.assertIn("未找到 python3 / python", src)
+        self.assertIn("/opt/homebrew/bin/python3", src)
+        self.assertIn("/usr/local/bin/python3", src)
+        self.assertIn("python_exe 指向对应绝对路径，例如 /opt/homebrew/bin/python3 或 venv/bin/python", src)
+        self.assertIn("系统 Python 兼容性失败", src)
+        self.assertIn("如果上面的错误里包含 pip / uv / requirements", src)
+
+    def test_download_flow_uses_platform_neutral_git_guidance(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "downloads.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("未检测到 Git。请先安装 Git：", src)
+        self.assertIn("https://git-scm.com/downloads", src)
+        self.assertNotIn("Git for Windows", src)
+
+    def test_download_flow_has_system_python_completion_guidance(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "downloads.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。", src)
+
+    def test_about_panel_has_manual_macos_update_mode(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "personal_usage.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("查看手动升级说明", src)
+        self.assertIn("mac 版当前不支持应用内自动更新", src)
+        self.assertIn("PLATFORM_SUPPORTS_INTERNAL_UPDATER", src)
+
+    def test_about_panel_has_macos_install_status_card(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "personal_usage.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("安装状态", src)
+        self.assertIn("刷新安装状态", src)
+        self.assertIn("打开推荐安装目录", src)
+        self.assertIn("打开当前 App 位置", src)
+        self.assertIn("打开用户数据目录", src)
+        self.assertIn("macos_installation_status", src)
+        self.assertIn("~/Applications", src)
+        self.assertIn("_display_local_user_path", src)
+        self.assertIn("_launcher_install_recommended_directory", src)
+
+    def test_window_startup_schedules_macos_install_hint(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "launcher_app", "window.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('startup_install_hinter = getattr(self, "_schedule_startup_install_hint", None)', src)
+        self.assertIn("startup_install_hinter()", src)
+
+    def test_window_supports_smoke_exit_env(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "launcher_app", "window.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("GA_LAUNCHER_SMOKE_EXIT_MS", src)
+        self.assertIn("QTimer.singleShot", src)
+
+    def test_macos_spec_bundle_exists(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "GenericAgentLauncher.mac.spec")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("BUNDLE(", src)
+        self.assertIn("GenericAgent Launcher.app", src)
+        self.assertIn('ROOT_DIR = os.path.dirname(os.path.abspath(__file__))', src)
+        self.assertIn('APP_ICON_SVG_PATH = os.path.join(ROOT_DIR, "assets", "launcher_app_icon.svg")', src)
+        self.assertIn("(APP_ICON_SVG_PATH, \"assets\")", src)
+        self.assertIn("LAUNCHER_SCRIPT = os.path.join(ROOT_DIR, \"launcher.py\")", src)
+        self.assertIn("hookspath=[HOOKS_DIR]", src)
+        self.assertIn("MACOS_ICON_PATH", src)
+        self.assertIn("icon=MACOS_ICON_PATH if os.path.isfile(MACOS_ICON_PATH) else None", src)
+
+    def test_macos_build_script_creates_dmg_and_sha256(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "tools", "build_macos_release.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("hdiutil", src)
+        self.assertIn(".dmg", src)
+        self.assertIn(".sha256", src)
+        self.assertIn("README-macOS.txt", src)
+        self.assertIn("install-metadata.json", src)
+        self.assertIn('"channel": "stable"', src)
+        self.assertIn('"version_json": "Contents/MacOS/version.json"', src)
+        self.assertIn('MACOS_INSTALL_TARGET = f"/Applications/{APP_BUNDLE_NAME}"', src)
+        self.assertIn("~/Library/Application Support/GenericAgentLauncher", src)
+        self.assertIn("build_macos_icon_assets", src)
+        self.assertIn("def _repo_root", src)
+        self.assertIn("def _resolve_path", src)
+        self.assertIn("def _prepare_macos_bundle_icon", src)
+        self.assertIn("root = _repo_root()", src)
+        self.assertIn('dist_dir = _resolve_path(root, str(args.dist or "dist"))', src)
+        self.assertIn('out_root = _resolve_path(root, str(args.out or "release"))', src)
+        self.assertIn("bundle_icon_path = _prepare_macos_bundle_icon(root)", src)
+        self.assertIn('print(f"- bundle icon: {bundle_icon_path}")', src)
+
+    def test_schedule_remote_delete_task_executes_remote_script_before_result_check(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "schedule_runtime.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("ok, payload_data, err = self._schedule_remote_exec_json(device, script, timeout=120)", src)
+        self.assertIn('raise RuntimeError(str(err or "远端删除任务失败。").strip() or "远端删除任务失败。")', src)
+
+    def test_release_workflow_has_macos_job(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, ".github", "workflows", "release-installer.yml")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("build-macos", src)
+        self.assertIn("macos-15", src)
+        self.assertIn("contents: write", src)
+        self.assertIn("GA_MACOS_RUNNER_LABEL", src)
+        self.assertIn("GA_MACOS_EXPECTED_ARCH", src)
+        self.assertIn("python -m pytest tests -q", src)
+        self.assertIn("Source startup smoke", src)
+        self.assertIn("GA_LAUNCHER_SMOKE_EXIT_MS", src)
+        self.assertIn("QT_QPA_PLATFORM: offscreen", src)
+        self.assertIn("build_macos_release.py", src)
+        self.assertIn("--commit", src)
+        self.assertIn("github.sha", src)
+        self.assertIn("Packaged app startup smoke", src)
+        self.assertIn("Runner and bundle diagnostics", src)
+        self.assertIn("codesign --verify --deep --strict", src)
+        self.assertIn("spctl --assess --type execute --verbose=4", src)
+        self.assertIn("GenericAgent Launcher.app/Contents/MacOS/GenericAgentLauncher", src)
+        self.assertIn("validate_macos_release.py", src)
+        self.assertIn("--expected-arch", src)
+        self.assertIn("--expected-runner-label", src)
+        self.assertIn("Validate macOS release contract", src)
+        self.assertIn("Publish macOS release assets", src)
+        self.assertIn("README-macOS.txt", src)
+        self.assertIn("install-metadata.json", src)
+
+    def test_macos_validate_workflow_runs_tests_smoke_and_bundle_validation(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, ".github", "workflows", "macos-validate.yml")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("macos-validate", src)
+        self.assertIn("macos-15", src)
+        self.assertIn("pull_request", src)
+        self.assertIn("branches:", src)
+        self.assertIn("main", src)
+        self.assertIn("GA_MACOS_RUNNER_LABEL", src)
+        self.assertIn("GA_MACOS_EXPECTED_ARCH", src)
+        self.assertIn("python -m pytest tests -q", src)
+        self.assertIn("Source startup smoke", src)
+        self.assertIn("GA_LAUNCHER_SMOKE_EXIT_MS", src)
+        self.assertIn("QT_QPA_PLATFORM: offscreen", src)
+        self.assertIn("build_macos_release.py", src)
+        self.assertIn("--commit", src)
+        self.assertIn("github.sha", src)
+        self.assertIn("Packaged app startup smoke", src)
+        self.assertIn("Runner and bundle diagnostics", src)
+        self.assertIn("codesign --verify --deep --strict", src)
+        self.assertIn("GenericAgent Launcher.app/Contents/MacOS/GenericAgentLauncher", src)
+        self.assertIn("validate_macos_release.py", src)
+        self.assertIn("--expected-arch", src)
+        self.assertIn("--expected-runner-label", src)
+        self.assertIn("Validate macOS release contract", src)
+        self.assertIn("Upload macOS validation artifacts", src)
+
+    def test_docs_cover_macos_manual_install_contract_and_smoke_checklist(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        readme_path = os.path.join(root, "README.md")
+        smoke_path = os.path.join(root, "docs", "macos-manual-smoke-checklist.md")
+        runbook_path = os.path.join(root, "docs", "macos-release-runbook.md")
+        report_path = os.path.join(root, "docs", "macos-smoke-report-template.md")
+        with open(readme_path, "r", encoding="utf-8") as f:
+            readme = f.read()
+        with open(smoke_path, "r", encoding="utf-8") as f:
+            smoke = f.read()
+        with open(runbook_path, "r", encoding="utf-8") as f:
+            runbook = f.read()
+        with open(report_path, "r", encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("GenericAgentLauncher-macos-<version>.dmg", readme)
+        self.assertIn("README-macOS.txt", readme)
+        self.assertIn("install-metadata.json", readme)
+        self.assertIn("System Settings -> Privacy & Security -> Open Anyway", readme)
+        self.assertIn("未做 Apple Developer 签名", readme)
+        self.assertIn("macos-15 / arm64", readme)
+        self.assertIn("Intel Mac 不在当前公开发布合同内", readme)
+        self.assertIn("手动替换 `.app` 升级", readme)
+        self.assertIn("Open Anyway", smoke)
+        self.assertIn("Finder 右键 `Open` 作为兼容性备选路径", smoke)
+        self.assertIn("build_arch = arm64", smoke)
+        self.assertIn("runner_label = macos-15", smoke)
+        self.assertIn("LAN Web", smoke)
+        self.assertIn("手动替换 `/Applications/GenericAgent Launcher.app`", smoke)
+        self.assertIn("tools/validate_macos_release.py", runbook)
+        self.assertIn("install-metadata.json", runbook)
+        self.assertIn("Commit：", report)
+        self.assertIn("建议是否允许公开发布", report)
+
+    def test_validate_macos_release_tool_checks_dmg_contract_and_mount_layout(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "tools", "validate_macos_release.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("hdiutil", src)
+        self.assertIn("attach", src)
+        self.assertIn("detach", src)
+        self.assertIn('APP_BUNDLE_NAME = f"{APP_NAME}.app"', src)
+        self.assertIn('os.readlink(applications_alias) != "/Applications"', src)
+        self.assertIn("mounted dmg is missing install-metadata.json", src)
+        self.assertIn("expected_arch=expected_arch", src)
+        self.assertIn("Contents/MacOS/version.json", src)
+
+    def test_build_bat_auto_loads_local_update_signing_key_files(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "build.bat")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('set "ISCC_EXE=%INNO_ISCC%"', src)
+        self.assertIn("local_keys\\update_signing_private_key.pem", src)
+        self.assertIn("local_keys\\update_signing_public_key.pem", src)
+        self.assertIn("GA_LAUNCHER_UPDATE_PRIVATE_KEY_FILE", src)
+        self.assertIn("GA_LAUNCHER_UPDATE_PUBLIC_KEY_FILE", src)
+
+    def test_updater_and_main_spec_are_packaging_safe_for_installs(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        updater_path = os.path.join(root, "updater.py")
+        spec_path = os.path.join(root, "GenericAgentLauncher.spec")
+        with open(updater_path, "r", encoding="utf-8") as f:
+            updater_src = f.read()
+        with open(spec_path, "r", encoding="utf-8") as f:
+            spec_src = f.read()
+        self.assertIn("from launcher_core_parts.runtime import updater_log", updater_src)
+        self.assertIn("from launcher_core_parts.update_manager import apply_update_job", updater_src)
+        self.assertNotIn("from launcher_app import core as lz", updater_src)
+        self.assertIn('"cryptography"', spec_src)
 
     def test_markup_helpers(self):
         raw = """

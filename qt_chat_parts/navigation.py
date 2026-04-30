@@ -7,8 +7,20 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from launcher_app import core as lz
 
+from .common import invalidate_runtime_bound_state
+
 
 class NavigationMixin:
+    def _apply_navigation_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
     def _schedule_local_channel_autostart(self, delay_ms=260):
         if not lz.is_valid_agent_dir(self.agent_dir):
             return
@@ -38,8 +50,17 @@ class NavigationMixin:
 
         QTimer.singleShot(160, self, run)
 
+    def _can_skip_dependency_check_on_quick_enter(self):
+        report = getattr(self, "_last_dependency_check", None) or {}
+        if not report or (not report.get("ok")):
+            return False
+        checker = getattr(self, "_dependency_check_cache_key", None)
+        if not callable(checker):
+            return False
+        return report.get("key") == checker(report.get("extra_packages") or [])
+
     def _quick_enter_chat(self):
-        self._enter_chat(skip_dependency_check=True)
+        self._enter_chat(skip_dependency_check=self._can_skip_dependency_check_on_quick_enter())
 
     def _set_agent_dir(self, path: str, *, persist: bool = True):
         raw = str(path or "").strip()
@@ -52,6 +73,22 @@ class NavigationMixin:
             stopper = getattr(self, "_stop_scheduler_process", None)
             if callable(stopper):
                 stopper(refresh=False)
+            lan_stopper = getattr(self, "_stop_lan_interface_process", None)
+            if callable(lan_stopper):
+                lan_stopper(refresh=False)
+            if hasattr(self, "_scheduler_last_exit_code"):
+                self._scheduler_last_exit_code = None
+            if hasattr(self, "_lan_interface_last_exit_code"):
+                self._lan_interface_last_exit_code = None
+            if hasattr(self, "_local_channel_autostart_scheduled"):
+                self._local_channel_autostart_scheduled = False
+            if hasattr(self, "_chat_runtime_bootstrap_pending"):
+                self._chat_runtime_bootstrap_pending = False
+            if hasattr(self, "_lan_interface_autostart_scheduled"):
+                self._lan_interface_autostart_scheduled = False
+            if hasattr(self, "_lan_interface_autostart_running"):
+                self._lan_interface_autostart_running = False
+            invalidate_runtime_bound_state(self, bump_runtime=True, bump_settings_target=True, clear_remote_sync_queues=True)
             self._last_dependency_check = None
             self._last_dependency_report = None
             self.current_session = None
@@ -82,6 +119,9 @@ class NavigationMixin:
             self._enforce_session_archive_limits(refresh=False)
             self._refresh_sessions()
             self._schedule_local_channel_autostart()
+            scheduler_starter = getattr(self, "_start_autostart_scheduler", None)
+            if callable(scheduler_starter):
+                scheduler_starter()
             lan_starter = getattr(self, "_schedule_lan_interface_autostart", None)
             if callable(lan_starter):
                 lan_starter()
@@ -93,7 +133,12 @@ class NavigationMixin:
         if hasattr(self, "recent_card"):
             self.recent_card.setVisible(valid)
         if hasattr(self, "enter_chat_btn"):
-            self.enter_chat_btn.setEnabled(valid)
+            self._apply_navigation_widget_state(
+                self.enter_chat_btn,
+                valid,
+                enabled_tooltip="进入聊天页并开始准备当前内核环境。",
+                disabled_tooltip="请先选择有效的 GenericAgent 目录。",
+            )
         if hasattr(self, "locate_path_edit"):
             self.locate_path_edit.setText(self.agent_dir or "")
         if hasattr(self, "locate_python_edit"):

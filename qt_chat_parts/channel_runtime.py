@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from launcher_app import core as lz
 from launcher_app.theme import C
 
-from .common import normalize_remote_agent_dir, normalize_ssh_error_text
+from .common import capture_runtime_context, normalize_remote_agent_dir, normalize_ssh_error_text, runtime_context_matches
 
 
 class ChannelRuntimeMixin:
@@ -91,18 +91,102 @@ class ChannelRuntimeMixin:
         except Exception:
             pass
 
+    def _channel_source_status(self) -> str:
+        return str(getattr(self, "_qt_channel_source_status", "") or "").strip().lower()
+
+    def _set_channel_source_status(self, status: str, *, py_path: str | None = None, error_text: str | None = None):
+        self._qt_channel_source_status = str(status or "").strip().lower()
+        if py_path is not None:
+            self._qt_channel_py_path = str(py_path or "")
+        if error_text is not None:
+            self._qt_channel_parse_error = str(error_text or "")
+
+    def _channel_source_allows_save(self) -> bool:
+        return self._channel_source_status() in {"ready", "parse_error"}
+
+    def _channel_source_action_disabled_reason(self, action: str, *, is_remote_target: bool = False) -> str:
+        label = str(action or "").strip()
+        if label == "保存":
+            return "" if self._channel_source_allows_save() else "当前状态不可保存通讯配置。"
+        if label == "停止全部":
+            return "远端目标下只支持卡片级远端启停，不支持本机“停止全部”。" if is_remote_target else ""
+        return ""
+
+    def _refresh_channel_source_actions(self):
+        target_ctx_getter = getattr(self, "_settings_target_context", None)
+        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+        is_remote_target = bool((target_ctx or {}).get("is_remote"))
+        save_btn = getattr(self, "settings_channels_save_btn", None)
+        refresh_btn = getattr(self, "settings_channels_refresh_btn", None)
+        stop_all_btn = getattr(self, "settings_channels_stop_all_btn", None)
+        if save_btn is not None:
+            disabled_reason = self._channel_source_action_disabled_reason("保存", is_remote_target=is_remote_target)
+            self._apply_channel_button_state(
+                save_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="把当前通讯配置写回 channels/mykey.py。",
+                disabled_tooltip=disabled_reason,
+            )
+        if refresh_btn is not None:
+            self._apply_channel_button_state(
+                refresh_btn,
+                True,
+                enabled_tooltip="重新读取当前目标的通讯配置。",
+            )
+        if stop_all_btn is not None:
+            disabled_reason = self._channel_source_action_disabled_reason("停止全部", is_remote_target=is_remote_target)
+            self._apply_channel_button_state(
+                stop_all_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="停止当前启动器托管的全部本地通讯渠道。",
+                disabled_tooltip=disabled_reason,
+            )
+
     def _apply_loaded_channels_source(self, py_path, parsed):
+        if bool((parsed or {}).get("load_failed")):
+            self._reset_channels_source_state(error_text=parsed.get("error") or "读取配置失败", status="load_failed")
+            notices = [str(py_path or "").strip()]
+            if self._qt_channel_parse_error:
+                notices.append(f"当前读取失败：{self._qt_channel_parse_error}。请先修复读取问题，当前页面不会覆盖现有配置。")
+            self.settings_channels_notice.setText("\n".join([line for line in notices if line]))
+            self._refresh_channel_source_actions()
+            return
         self._qt_channel_py_path = py_path
         self._qt_channel_parse_error = parsed.get("error") or ""
         self._qt_channel_configs = list(parsed.get("configs") or [])
         self._qt_channel_passthrough = list(parsed.get("passthrough") or [])
         self._qt_channel_extras = dict(parsed.get("extras") or {})
         self._qt_channel_states = {}
+        target_ctx_getter = getattr(self, "_settings_target_context", None)
+        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+        if not bool((target_ctx or {}).get("is_remote")):
+            try:
+                self._refresh_wechat_external_running()
+            except Exception:
+                pass
         notices = [py_path]
         if self._qt_channel_parse_error:
             notices.append(f"当前解析失败：{self._qt_channel_parse_error}。继续保存会覆盖成可识别格式。")
+        self._set_channel_source_status("parse_error" if self._qt_channel_parse_error else "ready")
         self.settings_channels_notice.setText("\n".join(notices))
         self._render_channel_cards()
+        refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception:
+                pass
+        self._refresh_channel_source_actions()
+
+    def _reset_channels_source_state(self, *, py_path="", error_text="", status="invalid_dir"):
+        self._qt_channel_py_path = str(py_path or "").strip()
+        self._qt_channel_parse_error = str(error_text or "").strip()
+        self._qt_channel_configs = []
+        self._qt_channel_passthrough = []
+        self._qt_channel_extras = {}
+        self._qt_channel_states = {}
+        self._set_channel_source_status(status, py_path=py_path, error_text=error_text)
+        self._refresh_channel_source_actions()
 
     def _channel_extra_packages(self, spec):
         if not isinstance(spec, dict):
@@ -160,59 +244,93 @@ class ChannelRuntimeMixin:
                     pass
 
     def _refresh_wechat_external_running(self, *, persist=False):
-        active = False
+        active = bool(self._find_local_wechat_process_pids()) or bool(self._wechat_singleton_locked())
         if self._channel_external_running("wechat") != active:
             self._channel_set_external_running("wechat", active, persist=persist)
-        return False
+        return active
 
     def _find_local_wechat_process_pids(self):
-        if os.name != "nt":
-            return []
         target = os.path.normcase(os.path.normpath(os.path.join(self.agent_dir, "frontends", "wechatapp.py")))
-        cmd = (
-            "$ErrorActionPreference='SilentlyContinue'; "
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.CommandLine -and $_.CommandLine -match 'wechatapp\\.py' } | "
-            "ForEach-Object { "
-            "  $line=[string]$_.CommandLine; "
-            "  \"$($_.ProcessId)`t$line\" "
-            "}"
-        )
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=8,
-                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        target_base = os.path.normcase(os.path.basename(target))
+        if os.name == "nt":
+            cmd = (
+                "$ErrorActionPreference='SilentlyContinue'; "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -and $_.CommandLine -match 'wechatapp\\.py' } | "
+                "ForEach-Object { "
+                "  $line=[string]$_.CommandLine; "
+                "  \"$($_.ProcessId)`t$line\" "
+                "}"
             )
-        except Exception:
-            return []
-        if r.returncode != 0:
-            return []
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", cmd],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8,
+                    creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                )
+            except Exception:
+                return []
+            if r.returncode != 0:
+                return []
+            raw_lines = str(r.stdout or "").splitlines()
+            line_splitter = lambda text: text.split("\t", 1)
+            normalize_cmd = lambda cmdline: os.path.normcase(cmdline.replace("/", "\\"))
+        else:
+            try:
+                r = subprocess.run(
+                    ["ps", "-eo", "pid=,args="],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8,
+                )
+            except Exception:
+                return []
+            if r.returncode != 0:
+                return []
+            raw_lines = str(r.stdout or "").splitlines()
+            line_splitter = lambda text: re.split(r"\s+", text, maxsplit=1)
+            normalize_cmd = lambda cmdline: os.path.normcase(cmdline.replace("\\", "/"))
         exact = []
         loose = []
-        for line in str(r.stdout or "").splitlines():
+        for line in raw_lines:
             text = str(line or "").strip()
             if not text:
                 continue
-            parts = text.split("\t", 1)
+            parts = line_splitter(text)
             pid_text = str(parts[0] if parts else "").strip()
             cmdline = str(parts[1] if len(parts) > 1 else "").strip()
             if not re.fullmatch(r"\d+", pid_text):
                 continue
             pid = int(pid_text)
-            norm_cmd = os.path.normcase(cmdline.replace("/", "\\"))
+            norm_cmd = normalize_cmd(cmdline)
             if target and (target in norm_cmd):
                 exact.append(pid)
                 continue
-            # 回退匹配：外部实例常用相对路径启动（frontends/wechatapp.py）
-            if re.search(r"(^|[\\\s\"'])frontends\\wechatapp\.py($|[\\\s\"'])", norm_cmd):
-                loose.append(pid)
-                continue
-            if re.search(r"(^|[\\\s\"'])wechatapp\.py($|[\\\s\"'])", norm_cmd):
+            if os.name == "nt":
+                # 回退匹配：外部实例常用相对路径启动（frontends/wechatapp.py）
+                if re.search(r"(^|[\\\s\"'])frontends\\wechatapp\.py($|[\\\s\"'])", norm_cmd):
+                    loose.append(pid)
+                    continue
+                if re.search(r"(^|[\\\s\"'])wechatapp\.py($|[\\\s\"'])", norm_cmd):
+                    loose.append(pid)
+                    continue
+            else:
+                if target_base and target_base in norm_cmd:
+                    exact.append(pid)
+                    continue
+                if re.search(r"(^|[/\s\"'])frontends/wechatapp\.py($|[/\s\"'])", norm_cmd):
+                    loose.append(pid)
+                    continue
+                if re.search(r"(^|[/\s\"'])wechatapp\.py($|[/\s\"'])", norm_cmd):
+                    loose.append(pid)
+                    continue
+            if "wechatapp.py" in norm_cmd:
                 loose.append(pid)
         # 去重并保持顺序
         seen = set()
@@ -240,8 +358,7 @@ class ChannelRuntimeMixin:
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 return r.returncode == 0
-            os.kill(p, signal.SIGTERM)
-            return True
+            return bool(lz.terminate_process_tree(p, terminate_timeout=0.8, kill_timeout=0.8))
         except Exception:
             return False
 
@@ -613,12 +730,15 @@ class ChannelRuntimeMixin:
             return
         info["health_watch_pid"] = watch_key
         start_pos = int(info.get("log_start_pos", 0) or 0)
+        runtime_context = capture_runtime_context(self)
 
         def worker():
             hit = False
             excerpt = ""
             for _ in range(45):
                 time.sleep(1.0)
+                if not runtime_context_matches(self, runtime_context):
+                    return
                 current = self._channel_procs.get(channel_id) or {}
                 current_proc = current.get("proc")
                 if current_proc is None or int(getattr(current_proc, "pid", 0) or 0) != watch_key:
@@ -634,6 +754,8 @@ class ChannelRuntimeMixin:
                 return
 
             def done():
+                if not runtime_context_matches(self, runtime_context):
+                    return
                 current = self._channel_procs.get(channel_id) or {}
                 current_proc = current.get("proc")
                 if current_proc is None or int(getattr(current_proc, "pid", 0) or 0) != watch_key:
@@ -990,6 +1112,7 @@ class ChannelRuntimeMixin:
 
     def _open_wechat_qr_dialog(self, show_errors=True, remote_device=None):
         remote_dev = dict(remote_device or {}) if isinstance(remote_device, dict) else {}
+        runtime_context = capture_runtime_context(self)
         try:
             if remote_dev:
                 ok, payload, err = self._remote_begin_wechat_qr_login(remote_dev, timeout=45)
@@ -1095,6 +1218,9 @@ class ChannelRuntimeMixin:
 
         def post_dialog_ui(callback, *, action_name="微信扫码窗口回调", allow_after_stop=False):
             def run():
+                if not runtime_context_matches(self, runtime_context):
+                    stop_event.set()
+                    return
                 if not bool(result.get("dialog_alive", False)):
                     return
                 if stop_event.is_set() and not allow_after_stop:
@@ -1113,6 +1239,9 @@ class ChannelRuntimeMixin:
             return st
 
         def auto_accept_by_token(token_payload, *, source="检测"):
+            if not runtime_context_matches(self, runtime_context):
+                stop_event.set()
+                return False
             if result["ok"] or bool(result.get("saving_remote")):
                 return False
             token, bot_id = extract_token_fields(token_payload)
@@ -1127,6 +1256,9 @@ class ChannelRuntimeMixin:
             return True
 
         def finish_accept(payload):
+            if not runtime_context_matches(self, runtime_context):
+                stop_event.set()
+                return False
             if result["ok"] or bool(result.get("saving_remote")):
                 return False
             bot_token, bot_id = extract_token_fields(payload)
@@ -1189,6 +1321,9 @@ class ChannelRuntimeMixin:
                 return
             while not stop_event.is_set():
                 time.sleep(2)
+                if not runtime_context_matches(self, runtime_context):
+                    stop_event.set()
+                    return
                 if stop_event.is_set():
                     return
                 if not bool(result.get("confirmed")):
@@ -1217,6 +1352,9 @@ class ChannelRuntimeMixin:
             last_status = ""
             while (not stop_event.is_set()) and remote_dev:
                 time.sleep(2)
+                if not runtime_context_matches(self, runtime_context):
+                    stop_event.set()
+                    return
                 if stop_event.is_set():
                     return
                 if result["ok"] or bool(result.get("saving_remote")):
@@ -1271,6 +1409,9 @@ class ChannelRuntimeMixin:
             last_status = ""
             while not stop_event.is_set():
                 time.sleep(2)
+                if not runtime_context_matches(self, runtime_context):
+                    stop_event.set()
+                    return
                 if stop_event.is_set():
                     return
                 try:
@@ -1698,6 +1839,16 @@ class ChannelRuntimeMixin:
             return True
         return False
 
+    def _remote_channel_label_text(self, channel_id):
+        spec = lz.COMM_CHANNEL_INDEX.get(channel_id) or {}
+        return str(spec.get("label", channel_id) or channel_id).strip() or str(channel_id or "渠道").strip() or "渠道"
+
+    def _remote_channel_log_loaded_status(self, title, tail):
+        label = str(title or "渠道").strip() or "渠道"
+        if str(tail or "").strip():
+            return f"已读取远端 {label} 日志；可直接查看末尾输出继续排查。"
+        return f"已读取远端 {label} 日志；当前还没有新的日志输出。"
+
     def _remote_channel_status(self, device_id, channel_id):
         data = self._remote_channel_cached_session(device_id, channel_id)
         channel_age, device_age = self._remote_channel_status_check_age(device_id, channel_id)
@@ -1775,6 +1926,8 @@ class ChannelRuntimeMixin:
             return self._remote_channel_status(did, channel_id)
         if self._channel_proc_alive(channel_id):
             return "运行中", C["accent"]
+        if self._channel_external_running(channel_id):
+            return "外部运行中", C["text_soft"]
         conflict = self._channel_conflict_message(channel_id)
         if conflict:
             return "冲突", C["danger_text"]
@@ -1788,6 +1941,90 @@ class ChannelRuntimeMixin:
         if self._channel_is_auto_start(channel_id):
             return self._local_channel_autostart_status(channel_id)
         return "未启动", C["muted"]
+
+    def _channel_missing_fields_text(self, channel_id, values):
+        missing = self._channel_missing_required(channel_id, values)
+        if not missing:
+            return ""
+        return "还缺少这些字段：" + "、".join([str(item).strip() for item in missing if str(item).strip()])
+
+    def _channel_start_disabled_reason(self, channel_id, values, *, target_ctx=None):
+        ctx = target_ctx if isinstance(target_ctx, dict) else {}
+        if not ctx:
+            _is_remote, _dev, ctx = self._channel_target_context()
+        is_remote = bool(ctx.get("is_remote"))
+        if is_remote:
+            remote_dev = dict(ctx.get("device") or {})
+            if not remote_dev:
+                return "当前远端设备信息不可用，请先检查设备配置。"
+            did = str(ctx.get("device_id") or "").strip()
+            if self._remote_channel_is_running(did, channel_id):
+                return f"远端 {self._remote_channel_label_text(channel_id)} 已在运行；无需重复启动。"
+            return ""
+        if not lz.is_valid_agent_dir(self.agent_dir):
+            return "请先选择有效的 GenericAgent 目录。"
+        if self._channel_proc_alive(channel_id):
+            return f"{self._remote_channel_label_text(channel_id)} 当前已由启动器托管运行；如需重启请先停止。"
+        if self._channel_external_running(channel_id):
+            return f"检测到外部 {self._remote_channel_label_text(channel_id)} 进程正在运行；请先关闭外部实例。"
+        conflict = self._channel_conflict_message(channel_id)
+        if conflict:
+            return conflict
+        missing_text = self._channel_missing_fields_text(channel_id, values)
+        if missing_text:
+            return missing_text
+        return ""
+
+    def _channel_stop_disabled_reason(self, channel_id, values, *, target_ctx=None):
+        ctx = target_ctx if isinstance(target_ctx, dict) else {}
+        if not ctx:
+            _is_remote, _dev, ctx = self._channel_target_context()
+        is_remote = bool(ctx.get("is_remote"))
+        if is_remote:
+            remote_dev = dict(ctx.get("device") or {})
+            if not remote_dev:
+                return "当前远端设备信息不可用，请先检查设备配置。"
+            did = str(ctx.get("device_id") or "").strip()
+            if not self._remote_channel_is_running(did, channel_id):
+                return f"当前未检测到远端 {self._remote_channel_label_text(channel_id)} 运行中进程。"
+            return ""
+        if self._channel_proc_alive(channel_id):
+            return ""
+        if self._channel_external_running(channel_id):
+            return f"当前是外部启动的 {self._remote_channel_label_text(channel_id)} 进程，启动器无法直接停止。"
+        return f"当前没有由启动器托管的 {self._remote_channel_label_text(channel_id)} 运行中进程。"
+
+    def _channel_bind_disabled_reason(self, channel_id, *, target_ctx=None):
+        ctx = target_ctx if isinstance(target_ctx, dict) else {}
+        if not ctx:
+            _is_remote, _dev, ctx = self._channel_target_context()
+        if not bool(ctx.get("is_remote")):
+            return ""
+        remote_dev = dict(ctx.get("device") or {})
+        if remote_dev:
+            return ""
+        return f"当前远端设备信息不可用，无法为 {self._remote_channel_label_text(channel_id)} 打开远端扫码。"
+
+    def _channel_remote_aux_disabled_reason(self, channel_id, *, target_ctx=None):
+        ctx = target_ctx if isinstance(target_ctx, dict) else {}
+        if not ctx:
+            _is_remote, _dev, ctx = self._channel_target_context()
+        if not bool(ctx.get("is_remote")):
+            return ""
+        remote_dev = dict(ctx.get("device") or {})
+        if remote_dev:
+            return ""
+        return f"当前远端设备信息不可用，无法读取 {self._remote_channel_label_text(channel_id)} 的远端状态或日志。"
+
+    def _apply_channel_button_state(self, button, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if button is None:
+            return
+        button.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            button.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
 
     def _defocus_settings_target_combo_if_idle(self):
         combo = getattr(self, "settings_target_combo", None)
@@ -1810,6 +2047,12 @@ class ChannelRuntimeMixin:
         target_ctx_getter = getattr(self, "_settings_target_context", None)
         target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
         is_remote_target = bool((target_ctx or {}).get("is_remote"))
+        self._refresh_channel_source_actions()
+        if not is_remote_target:
+            try:
+                self._refresh_wechat_external_running()
+            except Exception:
+                pass
         if is_remote_target:
             did = str((target_ctx or {}).get("device_id") or "").strip()
             notice = getattr(self, "settings_channels_notice", None)
@@ -1842,15 +2085,88 @@ class ChannelRuntimeMixin:
                     hint_widget.setVisible(True)
                 else:
                     hint_widget.setVisible(False)
+            start_btn = state.get("start_btn")
+            stop_btn = state.get("stop_btn")
+            log_btn = state.get("log_btn")
+            detail_btn = state.get("detail_btn")
+            if is_remote_target:
+                did = str((target_ctx or {}).get("device_id") or "").strip()
+                remote_dev = dict((target_ctx or {}).get("device") or {})
+                remote_actions_ready = bool(remote_dev)
+                remote_running = self._remote_channel_is_running(did, spec["id"])
+                self._apply_channel_button_state(
+                    start_btn,
+                    (not remote_running) and remote_actions_ready,
+                    enabled_tooltip=f"启动远端 {spec.get('label', spec['id'])} 渠道。",
+                    disabled_tooltip=self._channel_start_disabled_reason(spec["id"], values, target_ctx=target_ctx),
+                )
+                self._apply_channel_button_state(
+                    stop_btn,
+                    remote_running and remote_actions_ready,
+                    enabled_tooltip=f"停止远端 {spec.get('label', spec['id'])} 渠道。",
+                    disabled_tooltip=self._channel_stop_disabled_reason(spec["id"], values, target_ctx=target_ctx),
+                )
+                self._apply_channel_button_state(
+                    log_btn,
+                    remote_actions_ready,
+                    enabled_tooltip=f"查看远端 {spec.get('label', spec['id'])} 日志尾部。",
+                    disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
+                )
+                self._apply_channel_button_state(
+                    detail_btn,
+                    remote_actions_ready,
+                    enabled_tooltip=f"查看远端 {spec.get('label', spec['id'])} 的最近校验详情。",
+                    disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
+                )
+            else:
+                managed_running = self._channel_proc_alive(spec["id"])
+                external_running = self._channel_external_running(spec["id"])
+                conflict = self._channel_conflict_message(spec["id"])
+                missing = self._channel_missing_required(spec["id"], values)
+                can_start = (
+                    lz.is_valid_agent_dir(self.agent_dir)
+                    and (not managed_running)
+                    and (not external_running)
+                    and (not conflict)
+                    and (not missing)
+                )
+                self._apply_channel_button_state(
+                    start_btn,
+                    bool(can_start),
+                    enabled_tooltip=f"启动 {spec.get('label', spec['id'])} 渠道。",
+                    disabled_tooltip=self._channel_start_disabled_reason(spec["id"], values, target_ctx=target_ctx),
+                )
+                self._apply_channel_button_state(
+                    stop_btn,
+                    bool(managed_running),
+                    enabled_tooltip=f"停止 {spec.get('label', spec['id'])} 渠道。",
+                    disabled_tooltip=self._channel_stop_disabled_reason(spec["id"], values, target_ctx=target_ctx),
+                )
+                self._apply_channel_button_state(
+                    log_btn,
+                    True,
+                    enabled_tooltip=f"查看 {spec.get('label', spec['id'])} 日志尾部。",
+                )
             if spec["id"] == "wechat":
                 bind_btn = state.get("bind_btn")
                 if bind_btn is not None:
                     if is_remote_target:
                         bind_btn.setText("远端扫码")
+                        self._apply_channel_button_state(
+                            bind_btn,
+                            bool((target_ctx or {}).get("device")),
+                            enabled_tooltip="打开远端微信扫码绑定窗口。",
+                            disabled_tooltip=self._channel_bind_disabled_reason(spec["id"], target_ctx=target_ctx),
+                        )
                     else:
                         token_info = self._wx_token_info()
                         has_token = bool(str(token_info.get("bot_token", "") or "").strip())
                         bind_btn.setText("重新扫码" if has_token else "扫码登录")
+                        self._apply_channel_button_state(
+                            bind_btn,
+                            True,
+                            enabled_tooltip=("重新打开微信扫码绑定。" if has_token else "打开微信扫码绑定。"),
+                        )
 
     def _reload_channels_editor_state(self):
         if not hasattr(self, "settings_channels_notice"):
@@ -1859,11 +2175,14 @@ class ChannelRuntimeMixin:
         target_ctx_getter = getattr(self, "_settings_target_context", None)
         target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
         if (not bool((target_ctx or {}).get("is_remote"))) and (not lz.is_valid_agent_dir(self.agent_dir)):
+            self._reset_channels_source_state(error_text="请先选择有效的 GenericAgent 目录。", status="invalid_dir")
             self.settings_channels_notice.setText("请先选择有效的 GenericAgent 目录。")
             return
         if bool((target_ctx or {}).get("is_remote")):
             if bool(getattr(self, "_qt_channel_remote_loading", False)):
                 self.settings_channels_notice.setText("正在读取远端 mykey.py…")
+                self._set_channel_source_status("loading")
+                self._refresh_channel_source_actions()
                 return
             self._qt_channel_remote_loading = True
             self._defocus_settings_target_combo_if_idle()
@@ -1873,8 +2192,9 @@ class ChannelRuntimeMixin:
                     trace("channels_remote_load", duration_ms=3200, suppress_blank_dialogs=True)
                 except Exception:
                     pass
-            token_getter = getattr(self, "_settings_target_generation", None)
-            target_token = token_getter() if callable(token_getter) else 0
+            context = capture_runtime_context(self, include_settings_target=True)
+            self._set_channel_source_status("loading")
+            self._refresh_channel_source_actions()
             self.settings_channels_notice.setText("正在读取远端 mykey.py…")
             loading = QLabel("正在从远端设备拉取渠道配置，请稍候…")
             loading.setObjectName("mutedText")
@@ -1884,8 +2204,9 @@ class ChannelRuntimeMixin:
                 _root, py_path, parsed = self._load_channels_source()
 
                 def done():
-                    current_token = token_getter() if callable(token_getter) else target_token
-                    if int(current_token or 0) != int(target_token or 0):
+                    # 旧逻辑等价检查：
+                    # if int(current_token or 0) != int(target_token or 0):
+                    if not runtime_context_matches(self, context, include_settings_target=True):
                         return
                     self._qt_channel_remote_loading = False
                     self._clear_layout(self.settings_channels_list_layout)
@@ -1997,7 +2318,6 @@ class ChannelRuntimeMixin:
                             lambda: self._open_wechat_qr_dialog(),
                         )
                     )
-                bind_btn.setEnabled(remote_actions_ready)
                 controls.addWidget(bind_btn, 0)
                 state["bind_btn"] = bind_btn
             save_btn = QPushButton("保存")
@@ -2017,7 +2337,6 @@ class ChannelRuntimeMixin:
                     lambda: self._start_channel_process(cid),
                 )
             )
-            start_btn.setEnabled(remote_actions_ready)
             controls.addWidget(start_btn, 0)
             stop_btn = QPushButton("停止" if not is_remote_target else "远端停止")
             stop_btn.setStyleSheet(self._action_button_style())
@@ -2027,7 +2346,6 @@ class ChannelRuntimeMixin:
                     lambda: self._stop_channel_process(cid),
                 )
             )
-            stop_btn.setEnabled(remote_actions_ready)
             controls.addWidget(stop_btn, 0)
             log_btn = QPushButton("日志尾部" if not is_remote_target else "远端日志")
             log_btn.setStyleSheet(self._action_button_style())
@@ -2037,7 +2355,12 @@ class ChannelRuntimeMixin:
                     lambda: self._show_channel_log_tail(cid, title),
                 )
             )
-            log_btn.setEnabled(remote_actions_ready)
+            self._apply_channel_button_state(
+                log_btn,
+                remote_actions_ready,
+                enabled_tooltip=(f"查看远端 {spec['label']} 日志尾部。" if is_remote_target else f"查看 {spec['label']} 日志尾部。"),
+                disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
+            )
             controls.addWidget(log_btn, 0)
             if is_remote_target:
                 detail_btn = QPushButton("校验详情")
@@ -2048,16 +2371,26 @@ class ChannelRuntimeMixin:
                         lambda: self._show_remote_channel_status_detail(did, cid, title),
                     )
                 )
-                detail_btn.setEnabled(remote_actions_ready)
+                self._apply_channel_button_state(
+                    detail_btn,
+                    remote_actions_ready,
+                    enabled_tooltip=f"查看远端 {spec['label']} 的最近校验详情。",
+                    disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
+                )
                 controls.addWidget(detail_btn, 0)
+                state["detail_btn"] = detail_btn
             body.addLayout(controls)
 
             self._qt_channel_states[spec["id"]] = state
             state["auto"] = auto_box
             state["status_label"] = status
             state["status_hint_label"] = status_hint
+            state["start_btn"] = start_btn
+            state["stop_btn"] = stop_btn
+            state["log_btn"] = log_btn
             self.settings_channels_list_layout.addWidget(card)
         self.settings_channels_list_layout.addStretch(1)
+        self._refresh_channels_runtime_status_labels()
 
     def _qt_channels_save(self, silent=False, apply_running=True):
         if not self._qt_channel_py_path:
@@ -2420,9 +2753,10 @@ class ChannelRuntimeMixin:
         return True, "", payload
 
     def _start_remote_channel_process(self, channel_id, show_errors=True):
-        spec = lz.COMM_CHANNEL_INDEX.get(channel_id)
+        spec = lz.COMM_CHANNEL_INDEX.get(channel_id) or {}
         if not spec:
             return False
+        label = self._remote_channel_label_text(channel_id)
         _is_remote, dev, ctx = self._channel_target_context()
         if not bool(ctx.get("is_remote")):
             return False
@@ -2444,7 +2778,8 @@ class ChannelRuntimeMixin:
             if show_errors:
                 self._channel_warning("无法启动", conflict)
             return False
-        self._set_status(f"正在启动远端 {spec.get('label', channel_id)} 渠道…")
+        context = capture_runtime_context(self, include_settings_target=True)
+        self._set_status(f"正在启动远端 {label} 渠道…")
         holder = {"ok": False, "msg": "", "payload": {}}
 
         def worker():
@@ -2459,6 +2794,8 @@ class ChannelRuntimeMixin:
                 holder["payload"] = {}
 
             def done():
+                if not runtime_context_matches(self, context, include_settings_target=True):
+                    return
                 self._force_remote_channel_sync()
                 self._refresh_channels_runtime_status_labels()
                 self._reload_channels_editor_state()
@@ -2466,17 +2803,18 @@ class ChannelRuntimeMixin:
                 self._refresh_sessions()
                 if holder["ok"]:
                     if bool(holder["payload"].get("already_running")):
-                        self._set_status(f"远端 {spec.get('label', channel_id)} 已在运行。")
+                        self._set_status(f"远端 {label} 已在运行；当前会继续复用现有进程。")
                         if show_errors:
-                            self._channel_info("已在运行", f"远端 {spec.get('label', channel_id)} 已在运行，无需重复启动。")
+                            self._channel_info("已在运行", f"远端 {label} 已在运行，无需重复启动；当前会继续复用现有进程。")
                     else:
                         pid = int(holder["payload"].get("pid") or 0)
-                        self._set_status(f"已启动远端 {spec.get('label', channel_id)} 渠道（PID {pid if pid > 0 else '-'}）。")
+                        self._set_status(f"已启动远端 {label} 渠道（PID {pid if pid > 0 else '-'}）；如无新消息可再查看远端日志。")
                         if show_errors:
-                            self._channel_info("启动成功", f"远端 {spec.get('label', channel_id)} 已启动。")
+                            self._channel_info("启动成功", f"远端 {label} 已启动；如无响应可继续查看远端日志。")
                     return
-                msg = holder["msg"] or f"远端 {spec.get('label', channel_id)} 启动失败。"
+                msg = holder["msg"] or f"远端 {label} 启动失败。"
                 if channel_id == "wechat" and ("未绑定" in msg):
+                    self._set_status("远端微信未绑定，已转入远端扫码绑定；完成后会继续尝试启动。")
                     if self._open_wechat_qr_dialog(show_errors=show_errors, remote_device=dev):
                         self._start_remote_channel_process(channel_id, show_errors=show_errors)
                         return
@@ -2558,6 +2896,8 @@ class ChannelRuntimeMixin:
             return False, str(err or "远端停止失败。").strip() or "远端停止失败。", {}
         if not bool(payload.get("ok", False)):
             return False, str(payload.get("error") or "远端停止失败。").strip() or "远端停止失败。", payload
+        if bool(payload.get("was_running")) and (not bool(payload.get("stopped"))):
+            return False, "远端停止失败，进程可能仍在运行。", payload
         return True, "", payload
 
     def _stop_remote_channel_process(self, channel_id):
@@ -2567,9 +2907,10 @@ class ChannelRuntimeMixin:
         if not isinstance(dev, dict) or (not dev):
             self._channel_warning("无法停止", "当前远端设备信息不可用，请先检查设备配置。")
             return False
-        spec = lz.COMM_CHANNEL_INDEX.get(channel_id) or {}
+        label = self._remote_channel_label_text(channel_id)
+        context = capture_runtime_context(self, include_settings_target=True)
         holder = {"ok": False, "msg": "", "payload": {}}
-        self._set_status(f"正在停止远端 {spec.get('label', channel_id) or channel_id} 渠道…")
+        self._set_status(f"正在停止远端 {label} 渠道…")
 
         def worker():
             try:
@@ -2583,6 +2924,8 @@ class ChannelRuntimeMixin:
                 holder["payload"] = {}
 
             def done():
+                if not runtime_context_matches(self, context, include_settings_target=True):
+                    return
                 self._force_remote_channel_sync()
                 self._refresh_channels_runtime_status_labels()
                 self._reload_channels_editor_state()
@@ -2590,12 +2933,13 @@ class ChannelRuntimeMixin:
                 self._refresh_sessions()
                 if holder["ok"]:
                     if bool(holder["payload"].get("was_running")):
-                        self._channel_info("已停止", f"远端 {spec.get('label', channel_id) or channel_id} 已停止。")
+                        self._channel_info("已停止", f"远端 {label} 已停止。")
+                        self._set_status(f"远端 {label} 已停止；稍后会在状态校验中同步最新结果。")
                     else:
-                        self._channel_info("未运行", f"远端 {spec.get('label', channel_id) or channel_id} 当前未运行。")
-                    self._set_status(f"远端 {spec.get('label', channel_id) or channel_id} 停止命令已完成。")
+                        self._channel_info("未运行", f"远端 {label} 当前未运行，无需重复停止。")
+                        self._set_status(f"远端 {label} 当前未运行；无需重复停止。")
                     return
-                msg = holder["msg"] or f"远端 {spec.get('label', channel_id) or channel_id} 停止失败。"
+                msg = holder["msg"] or f"远端 {label} 停止失败。"
                 self._set_status(msg)
                 self._channel_warning("停止失败", msg)
 
@@ -2648,6 +2992,7 @@ class ChannelRuntimeMixin:
         if not isinstance(dev, dict) or (not dev):
             self._channel_warning("无法读取日志", "当前远端设备信息不可用，请先检查设备配置。")
             return False
+        context = capture_runtime_context(self, include_settings_target=True)
         holder = {"ok": False, "tail": "", "status": "", "err": ""}
         self._set_status(f"正在读取远端 {title} 日志…")
 
@@ -2665,13 +3010,18 @@ class ChannelRuntimeMixin:
                 holder["err"] = f"远端日志读取异常：{e}"
 
             def done():
-                if holder["ok"]:
-                    brief = f"状态：{holder['status']}" if holder["status"] else "远端日志尾部"
-                    self._channel_info(f"{title} 远端日志尾部", brief, detail=(holder["tail"] or "暂无日志。"))
-                    self._set_status(f"已读取远端 {title} 日志。")
+                if not runtime_context_matches(self, context, include_settings_target=True):
                     return
-                self._channel_warning("读取失败", holder["err"] or "读取远端日志失败。")
-                self._set_status(holder["err"] or "读取远端日志失败。")
+                if holder["ok"]:
+                    brief = f"状态：{holder['status']}；以下为远端日志末尾输出。" if holder["status"] else "以下为远端日志末尾输出。"
+                    self._channel_info(f"{title} 远端日志尾部", brief, detail=(holder["tail"] or "暂无日志。"))
+                    self._set_status(self._remote_channel_log_loaded_status(title, holder["tail"]))
+                    return
+                raw_err = str(holder["err"] or "读取远端日志失败。").strip() or "读取远端日志失败。"
+                label = str(title or "渠道").strip() or "渠道"
+                msg = f"读取远端 {label} 日志失败；请检查 SSH 连接后重试：{raw_err}"
+                self._channel_warning("读取失败", msg)
+                self._set_status(msg)
 
             self._channel_post_ui(done, action_name="远端日志回调")
 
@@ -2703,21 +3053,21 @@ class ChannelRuntimeMixin:
                 if token_ok is False and token_state == "session_timeout":
                     self._clear_wx_token_info()
                     token_info = {}
-                    self._set_status("检测到本地微信 token 已失效，已自动清除并准备重新扫码。")
+                    self._set_status("检测到本地微信 token 已失效，已自动清除；本次会转入重新扫码。")
                 elif token_ok is None and token_detail:
-                    self._set_status(f"本地微信 token 预检失败，继续按现有绑定尝试启动：{token_detail}")
+                    self._set_status(f"本地微信 token 预检失败；先继续按现有绑定尝试启动，如仍异常请重新扫码：{token_detail}")
             if not str(token_info.get("bot_token", "") or "").strip():
                 if not allow_interactive:
-                    self._set_status("本地微信未绑定，已跳过自动启动。")
+                    self._set_status("本地微信未绑定，自动启动已跳过；如需启动请先手动扫码绑定。")
                     return False
                 if not self._open_wechat_qr_dialog(show_errors=show_errors):
                     return False
             if self._wechat_singleton_locked():
                 killed, failed = self._terminate_external_wechat_instances()
                 if killed:
-                    self._set_status(f"已关闭 {killed} 个外部微信实例，准备由启动器拉起。")
+                    self._set_status(f"已关闭 {killed} 个外部微信实例；接下来将由启动器重新拉起。")
                 if failed:
-                    self._set_status("检测到外部微信实例，但自动关闭失败：" + ", ".join(failed))
+                    self._set_status("检测到外部微信实例，但自动关闭失败：" + ", ".join(failed) + "；本次启动可能仍会失败。")
                 # 等待端口释放
                 for _ in range(30):
                     if not self._wechat_singleton_locked():
@@ -2798,13 +3148,14 @@ class ChannelRuntimeMixin:
         }
         self._channel_set_external_running(channel_id, False)
         self._sync_channel_process_session(channel_id, final=False)
+        launch_context = capture_runtime_context(self)
         if channel_id == "wechat":
             self._start_wechat_health_watch(show_errors=show_errors)
         QTimer.singleShot(
             1200,
-            lambda cid=channel_id, se=show_errors: self._safe_channel_ui_call(
+            lambda cid=channel_id, se=show_errors, context=launch_context: self._safe_channel_ui_call(
                 "渠道启动后检查",
-                lambda: self._after_channel_launch_check(cid, show_errors=se),
+                lambda: self._after_channel_launch_check(cid, show_errors=se, context=context),
                 show_errors=False,
             ),
         )
@@ -2813,7 +3164,9 @@ class ChannelRuntimeMixin:
         self._refresh_sessions()
         return True
 
-    def _after_channel_launch_check(self, channel_id, show_errors=True):
+    def _after_channel_launch_check(self, channel_id, show_errors=True, context=None):
+        if context is not None and (not runtime_context_matches(self, context)):
+            return
         info = self._channel_procs.get(channel_id)
         if not info:
             return
@@ -2880,6 +3233,10 @@ class ChannelRuntimeMixin:
         return True
 
     def _stop_all_managed_channels(self, refresh=True):
+        self._autostart_channels_run_id = int(getattr(self, "_autostart_channels_run_id", 0) or 0) + 1
+        self._autostart_channels_running = False
+        self._autostart_channel_pending_ids = set()
+        self._autostart_channel_current = ""
         count = 0
         for channel_id in list(self._channel_procs.keys()):
             if self._stop_channel_process(channel_id):
@@ -2927,6 +3284,8 @@ class ChannelRuntimeMixin:
                 except Exception:
                     pass
             return
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
             holder = {
@@ -2940,18 +3299,18 @@ class ChannelRuntimeMixin:
                 token_info = self._wx_token_info()
                 token = str(token_info.get("bot_token", "") or "").strip()
                 if not token:
-                    holder["skip_reason"] = "本地微信未绑定，已跳过自动启动。"
+                    holder["skip_reason"] = "本地微信未绑定，自动启动已跳过；如需启动请先手动扫码绑定。"
                 else:
                     token_ok, token_state, token_detail = self._probe_local_wechat_token(token_info, timeout=6)
                     if token_ok is False and token_state == "session_timeout":
                         holder["clear_token"] = True
-                        holder["skip_reason"] = "检测到本地微信 token 已失效，已清除失效 token，自动启动已跳过。"
+                        holder["skip_reason"] = "检测到本地微信 token 已失效，已清除失效 token；自动启动已跳过，请重新扫码绑定。"
                     elif token_ok is None and token_detail:
-                        holder["token_warning"] = f"本地微信 token 预检异常，按现有绑定继续自动启动：{token_detail}"
+                        holder["token_warning"] = f"本地微信 token 预检异常；按现有绑定继续自动启动，如仍异常请重新扫码：{token_detail}"
             if not holder["skip_reason"]:
                 try:
                     holder["dep_result"] = lz._ensure_runtime_dependencies(
-                        self.agent_dir,
+                        agent_dir,
                         extra_packages=holder["extra_packages"],
                         progress=None,
                         force_sync=False,
@@ -2960,6 +3319,8 @@ class ChannelRuntimeMixin:
                     holder["dep_result"] = {"ok": False, "python": "", "error": str(e)}
 
             def done_ui():
+                if not runtime_context_matches(self, context):
+                    return
                 started = False
                 if holder["clear_token"]:
                     self._clear_wx_token_info()
@@ -3001,12 +3362,29 @@ class ChannelRuntimeMixin:
             return
         if bool(getattr(self, "_autostart_channels_running", False)):
             return
-        pending = [spec["id"] for spec in lz.COMM_CHANNEL_SPECS if self._channel_is_auto_start(spec["id"]) and not self._channel_proc_alive(spec["id"])]
+        try:
+            self._refresh_wechat_external_running()
+        except Exception:
+            pass
+        pending = []
+        for spec in lz.COMM_CHANNEL_SPECS:
+            cid = str(spec.get("id") or "").strip()
+            if not cid:
+                continue
+            if not self._channel_is_auto_start(cid):
+                continue
+            if self._channel_proc_alive(cid):
+                continue
+            if self._channel_external_running(cid):
+                continue
+            pending.append(cid)
         if not pending:
             self._autostart_channel_pending_ids = set()
             self._autostart_channel_current = ""
             self._refresh_channels_runtime_status_labels()
             return
+        run_id = int(getattr(self, "_autostart_channels_run_id", 0) or 0) + 1
+        self._autostart_channels_run_id = run_id
         self._autostart_channels_running = True
         self._autostart_channel_pending_ids = set(pending)
         self._autostart_channel_current = ""
@@ -3014,6 +3392,8 @@ class ChannelRuntimeMixin:
         self._refresh_channels_runtime_status_labels()
 
         def run_next():
+            if int(getattr(self, "_autostart_channels_run_id", 0) or 0) != run_id:
+                return
             if not queue:
                 self._autostart_channels_running = False
                 self._autostart_channel_pending_ids = set()
@@ -3025,6 +3405,8 @@ class ChannelRuntimeMixin:
             self._refresh_channels_runtime_status_labels()
 
             def after_one(_started=False, cid=channel_id):
+                if int(getattr(self, "_autostart_channels_run_id", 0) or 0) != run_id:
+                    return
                 pending_ids = getattr(self, "_autostart_channel_pending_ids", None)
                 if not isinstance(pending_ids, set):
                     pending_ids = set()

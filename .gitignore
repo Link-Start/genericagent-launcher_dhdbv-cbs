@@ -8,6 +8,7 @@ dist/
 temp/
 release/
 update_public_key.pem
+local_keys/
 temp_patch_extract/
 tools/InnoSetup/
 tmp_*.png

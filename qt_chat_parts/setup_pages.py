@@ -187,7 +187,7 @@ class SetupPagesMixin:
         py_row = QHBoxLayout()
         py_row.setSpacing(8)
         self.locate_python_edit = QLineEdit()
-        self.locate_python_edit.setPlaceholderText("留空则自动探测；可填 python.exe 路径，支持相对路径")
+        self.locate_python_edit.setPlaceholderText("留空则自动探测；可填 python / python3 / venv/bin/python，支持相对路径")
         self.locate_python_edit.setText(str(self.cfg.get("python_exe") or "").strip())
         self.locate_python_edit.returnPressed.connect(self._locate_enter_chat)
         py_row.addWidget(self.locate_python_edit, 1)
@@ -197,8 +197,8 @@ class SetupPagesMixin:
         py_row.addWidget(py_browse_btn, 0)
         card_box.addLayout(py_row)
         self.locate_python_hint_label = QLabel(
-            "💡  提示：这里建议选择具体的 python.exe。"
-            "如果你用 uv 管理多版本 Python，也请填写 uv 实际创建的解释器路径，而不是 uv.exe 本身。"
+            "💡  提示：这里建议选择具体的 Python 可执行文件。"
+            "如果你用 uv 管理多版本 Python，也请填写 uv 实际创建的解释器路径，而不是 uv 本身。"
         )
         self.locate_python_hint_label.setWordWrap(True)
         self.locate_python_hint_label.setObjectName("mutedText")
@@ -250,6 +250,8 @@ class SetupPagesMixin:
         dep_desc = QLabel(
             "从这个页面点击“载入内核”时，会检查系统 Python、基础依赖和 GenericAgent 可载入性。"
             "缺失时会自动补齐，并展示实时过程。欢迎页的“直接启动”不会先做这一步。"
+            "留空时会自动尝试 python / python3；mac 下也会补试常见 Homebrew 绝对路径。"
+            "如果你已有项目虚拟环境，也可以手动填写 venv/bin/python。"
         )
         dep_desc.setWordWrap(True)
         dep_desc.setObjectName("cardDesc")
@@ -451,6 +453,7 @@ class SetupPagesMixin:
 
         body_layout.addWidget(card)
 
+        supports_private_python = bool(getattr(lz, "PLATFORM_SUPPORTS_PRIVATE_PYTHON_INSTALLER", os.name == "nt"))
         deps = self._download_dependency_placeholder()
         deps_card = self._panel_card()
         deps_box = QVBoxLayout(deps_card)
@@ -459,12 +462,19 @@ class SetupPagesMixin:
         deps_title = QLabel("环境提示")
         deps_title.setObjectName("cardTitle")
         deps_box.addWidget(deps_title)
-        deps_desc = QLabel(
+        deps_desc_text = (
             "下面显示的是对你这台电脑当前环境的实时扫描结果，不是写死的版本要求。"
             "普通下载只依赖 Git；下载完成后，这个启动器会直接拉起 GenericAgent 的 agentmain，因此还需要系统 Python。"
             "当前不会强制限制 Python 版本，而是实际探测它能否载入 GenericAgent；只是经验上 3.11 / 3.12 更稳。"
-            "如果你不想动系统 Python，可以直接用下面的私有 3.12 虚拟环境安装，它会自己下载并管理一套私有解释器。"
         )
+        if supports_private_python:
+            deps_desc_text += "如果你不想动系统 Python，可以直接用下面的私有 3.12 虚拟环境安装，它会自己下载并管理一套私有解释器。"
+        else:
+            deps_desc_text += (
+                "mac 版当前使用系统 Python。下载完成后可直接进入聊天；首次载入时会自动探测 "
+                "python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。"
+            )
+        deps_desc = QLabel(deps_desc_text)
         deps_desc.setWordWrap(True)
         deps_desc.setObjectName("cardDesc")
         deps_box.addWidget(deps_desc)
@@ -514,7 +524,11 @@ class SetupPagesMixin:
         log_title.setObjectName("cardTitle")
         log_head.addWidget(log_title, 0)
         log_head.addStretch(1)
-        log_hint = QLabel("git clone、私有 Python 安装和 venv 构建都会在这里实时输出")
+        log_hint = QLabel(
+            "git clone、私有 Python 安装和 venv 构建都会在这里实时输出"
+            if supports_private_python
+            else "git clone 过程会在这里实时输出；进入聊天后的依赖检查会在单独窗口展示。"
+        )
         log_hint.setObjectName("mutedText")
         log_head.addWidget(log_hint, 0)
         log_box.addLayout(log_head)
@@ -536,32 +550,43 @@ class SetupPagesMixin:
         self.download_progress.setValue(0)
         self.download_progress.setFixedHeight(6)
         footer_box.addWidget(self.download_progress)
-        self.download_private_hint = QLabel("私有 3.12 环境会下载到当前 GenericAgent 目录内，只供启动器使用，不会改系统 PATH。")
+        private_hint = (
+            "私有 3.12 环境会下载到当前 GenericAgent 目录内，只供启动器使用，不会改系统 PATH。"
+            if supports_private_python
+            else "mac 版当前使用系统 Python，不提供私有 3.12 安装器。下载完成后可直接进入聊天；首次载入时会自动探测 python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。"
+        )
+        self.download_private_hint = QLabel(private_hint)
         self.download_private_hint.setWordWrap(True)
         self.download_private_hint.setObjectName("mutedText")
         footer_box.addWidget(self.download_private_hint)
 
-        self.download_sources_hint = QLabel("Python 安装包下载源（可多选；只会尝试你勾选的源）")
+        sources_hint = (
+            "Python 安装包下载源（可多选；只会尝试你勾选的源）"
+            if supports_private_python
+            else "mac 版使用系统 Python，不会下载或管理私有解释器；如果你已有项目虚拟环境，也可以在“载入内核”页手动指定它的 Python 可执行文件。"
+        )
+        self.download_sources_hint = QLabel(sources_hint)
         self.download_sources_hint.setWordWrap(True)
         self.download_sources_hint.setObjectName("mutedText")
         footer_box.addWidget(self.download_sources_hint)
 
         self.download_source_checkboxes = {}
-        for item in self._private_python_source_ui_options():
-            source_id = str(item.get("id") or "").strip()
-            source_label = str(item.get("label") or source_id).strip()
-            if not source_id:
-                continue
-            cb = QCheckBox(source_label)
-            cb.setObjectName("mutedText")
-            cb.toggled.connect(lambda _checked, sid=source_id: self._on_private_python_source_toggled(sid))
-            self.download_source_checkboxes[source_id] = cb
-            footer_box.addWidget(cb)
-        self._sync_private_python_source_checkboxes_from_cfg()
+        if supports_private_python:
+            for item in self._private_python_source_ui_options():
+                source_id = str(item.get("id") or "").strip()
+                source_label = str(item.get("label") or source_id).strip()
+                if not source_id:
+                    continue
+                cb = QCheckBox(source_label)
+                cb.setObjectName("mutedText")
+                cb.toggled.connect(lambda _checked, sid=source_id: self._on_private_python_source_toggled(sid))
+                self.download_source_checkboxes[source_id] = cb
+                footer_box.addWidget(cb)
+            self._sync_private_python_source_checkboxes_from_cfg()
 
-        self.download_private_only_checkbox = QCheckBox("仅配置虚拟环境，不下载原项目（要求目标目录已存在有效 GenericAgent）")
-        self.download_private_only_checkbox.setObjectName("mutedText")
-        footer_box.addWidget(self.download_private_only_checkbox)
+            self.download_private_only_checkbox = QCheckBox("仅配置虚拟环境，不下载原项目（要求目标目录已存在有效 GenericAgent）")
+            self.download_private_only_checkbox.setObjectName("mutedText")
+            footer_box.addWidget(self.download_private_only_checkbox)
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.download_btn = QPushButton("开始下载")
@@ -569,16 +594,17 @@ class SetupPagesMixin:
         self.download_btn.setFixedHeight(44)
         self.download_btn.clicked.connect(self._start_download_repo)
         actions.addWidget(self.download_btn, 1)
-        self.download_private_btn = QPushButton("下载并配置 3.12 虚拟环境")
-        self.download_private_btn.setStyleSheet(self._action_button_style())
-        self.download_private_btn.setFixedHeight(44)
-        self.download_private_btn.clicked.connect(
-            lambda: self._start_download_repo(
-                private_python=True,
-                private_only=bool(getattr(self, "download_private_only_checkbox", None) and self.download_private_only_checkbox.isChecked()),
+        if supports_private_python:
+            self.download_private_btn = QPushButton("下载并配置 3.12 虚拟环境")
+            self.download_private_btn.setStyleSheet(self._action_button_style())
+            self.download_private_btn.setFixedHeight(44)
+            self.download_private_btn.clicked.connect(
+                lambda: self._start_download_repo(
+                    private_python=True,
+                    private_only=bool(getattr(self, "download_private_only_checkbox", None) and self.download_private_only_checkbox.isChecked()),
+                )
             )
-        )
-        actions.addWidget(self.download_private_btn, 1)
+            actions.addWidget(self.download_private_btn, 1)
         footer_box.addLayout(actions)
         layout.addWidget(footer, 0)
         self._restyle_download_page_widgets()

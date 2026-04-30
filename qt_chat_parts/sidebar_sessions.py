@@ -28,7 +28,13 @@ from PySide6.QtWidgets import (
 from launcher_app import core as lz
 from launcher_app.theme import C, F
 
-from .common import _session_copy, normalize_remote_agent_dir, normalize_ssh_error_text
+from .common import (
+    _session_copy,
+    capture_runtime_context,
+    normalize_remote_agent_dir,
+    normalize_ssh_error_text,
+    runtime_context_matches,
+)
 
 
 class SidebarSessionsMixin:
@@ -527,8 +533,9 @@ class SidebarSessionsMixin:
         lz._normalize_token_usage_inplace(payload)
         return payload
 
-    def _sync_remote_device_launcher_sessions_blocking(self, *, force=False, device_id="", include_all_channels=False, include_usage=False):
-        if not lz.is_valid_agent_dir(self.agent_dir):
+    def _sync_remote_device_launcher_sessions_blocking(self, *, force=False, device_id="", include_all_channels=False, include_usage=False, agent_dir="", runtime_context=None):
+        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
+        if not lz.is_valid_agent_dir(root):
             return False
         if not force:
             mode = str(getattr(self, "_sidebar_view_mode", "roots") or "roots").strip().lower()
@@ -560,10 +567,12 @@ class SidebarSessionsMixin:
             synced_device_ids.add(did)
             active_ids = active_ids_by_device.setdefault(did, set())
             for row in rows:
+                if not runtime_context_matches(self, runtime_context):
+                    return False
                 remote_sid = self._normalize_remote_session_id(row.get("remote_session_id"), fallback=row.get("id"))
                 cache_sid = self._remote_cache_session_id(did, remote_sid)
                 active_ids.add(cache_sid)
-                old = lz.load_session(self.agent_dir, cache_sid) or {}
+                old = lz.load_session(root, cache_sid) or {}
                 payload = self._remote_session_cache_payload(dev, row, old)
                 same_payload = (
                     str(old.get("title") or "") == str(payload.get("title") or "")
@@ -583,9 +592,13 @@ class SidebarSessionsMixin:
                     except Exception:
                         same_payload = False
                 if not same_payload:
-                    lz.save_session(self.agent_dir, payload, touch=False)
+                    if not runtime_context_matches(self, runtime_context):
+                        return False
+                    lz.save_session(root, payload, touch=False)
                     changed = True
-        for meta in lz.list_sessions(self.agent_dir):
+        if not runtime_context_matches(self, runtime_context):
+            return False
+        for meta in lz.list_sessions(root):
             scope = str(meta.get("device_scope") or "").strip().lower()
             if scope != "remote":
                 continue
@@ -604,7 +617,9 @@ class SidebarSessionsMixin:
                 continue
             if sid in (active_ids_by_device.get(did) or set()):
                 continue
-            lz.delete_session(self.agent_dir, sid)
+            if not runtime_context_matches(self, runtime_context):
+                return False
+            lz.delete_session(root, sid)
             changed = True
         return changed
 
@@ -659,15 +674,26 @@ class SidebarSessionsMixin:
         self._remote_launcher_sync_running = True
         req_force = bool(force)
         req_refresh = bool(trigger_refresh)
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
             changed = False
             try:
-                changed = bool(self._sync_remote_device_launcher_sessions_blocking(force=req_force, device_id=req_device_id))
+                changed = bool(
+                    self._sync_remote_device_launcher_sessions_blocking(
+                        force=req_force,
+                        device_id=req_device_id,
+                        agent_dir=agent_dir,
+                        runtime_context=context,
+                    )
+                )
             except Exception:
                 changed = False
 
             def done():
+                if not runtime_context_matches(self, context):
+                    return
                 self._remote_launcher_sync_running = False
                 if changed and req_refresh and self._should_refresh_remote_sync_ui():
                     self._last_session_list_signature = None
@@ -689,13 +715,14 @@ class SidebarSessionsMixin:
 
         threading.Thread(target=worker, name="remote-launcher-sync", daemon=True).start()
 
-    def _save_remote_session_source(self, session):
+    def _save_remote_session_source(self, session, *, agent_dir="", runtime_context=None):
         data = session if isinstance(session, dict) else {}
         scope, did = self._session_device_scope_id(data)
         if scope != "remote":
             return True, ""
         if self._is_channel_process_session(data):
             return True, ""
+        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
         dev = self._remote_device_by_id(did)
         if not isinstance(dev, dict):
             return False, "远程设备配置不存在。"
@@ -742,7 +769,9 @@ class SidebarSessionsMixin:
         local_payload["id"] = cache_sid
         local_payload["remote_session_id"] = remote_sid
         local_payload["remote_updated_at"] = float(payload.get("updated_at", 0) or 0)
-        lz.save_session(self.agent_dir, local_payload, touch=False)
+        if not runtime_context_matches(self, runtime_context):
+            return False, ""
+        lz.save_session(root, local_payload, touch=False)
         return True, ""
 
     def _save_remote_session_source_async(self, session, *, on_error_status=True):
@@ -750,13 +779,17 @@ class SidebarSessionsMixin:
         scope, _did = self._session_device_scope_id(data)
         if scope != "remote":
             return
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
-            ok, err = self._save_remote_session_source(data)
+            ok, err = self._save_remote_session_source(data, agent_dir=agent_dir, runtime_context=context)
 
             def done():
+                if not runtime_context_matches(self, context):
+                    return
                 if not ok and on_error_status:
-                    self._set_status(f"远端会话同步失败：{err}")
+                    self._set_status(f"远端会话写回失败，当前内容仍保留在本地缓存：{err}；可稍后重试同步或检查 SSH。")
 
             self._sidebar_post_ui(done)
 
@@ -794,13 +827,14 @@ class SidebarSessionsMixin:
             except Exception:
                 pass
 
-    def _refresh_remote_session_cache(self, session):
+    def _refresh_remote_session_cache(self, session, *, agent_dir="", runtime_context=None):
         data = session if isinstance(session, dict) else {}
         scope, did = self._session_device_scope_id(data)
         if scope != "remote":
             return data, ""
         if self._is_channel_process_session(data):
             return data, ""
+        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
         dev = self._remote_device_by_id(did)
         if not isinstance(dev, dict):
             return data, "远程设备配置不存在。"
@@ -820,7 +854,9 @@ class SidebarSessionsMixin:
         local_payload["channel_label"] = str(payload.get("channel_label") or data.get("channel_label") or lz._usage_channel_label(channel_id)).strip() or lz._usage_channel_label(channel_id)
         local_payload["remote_updated_at"] = float(payload.get("updated_at", 0) or 0)
         lz._normalize_token_usage_inplace(local_payload)
-        lz.save_session(self.agent_dir, local_payload, touch=False)
+        if not runtime_context_matches(self, runtime_context):
+            return data, ""
+        lz.save_session(root, local_payload, touch=False)
         return local_payload, ""
 
     def _refresh_remote_session_cache_async(self, session):
@@ -838,12 +874,16 @@ class SidebarSessionsMixin:
         if sid in inflight:
             return
         inflight.add(sid)
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
-            fresh, err = self._refresh_remote_session_cache(data)
+            fresh, err = self._refresh_remote_session_cache(data, agent_dir=agent_dir, runtime_context=context)
 
             def done():
                 inflight.discard(sid)
+                if not runtime_context_matches(self, context):
+                    return
                 if isinstance(fresh, dict):
                     self._last_session_list_signature = None
                     current_sid = str((self.current_session or {}).get("id") or "").strip()
@@ -851,13 +891,13 @@ class SidebarSessionsMixin:
                         self.current_session = fresh
                         self._render_session(self.current_session)
                         self._refresh_composer_enabled()
-                        self._set_status("已同步远程会话。")
+                        self._set_status("已同步远程会话；后续发送会继续写回远端。")
                     self._refresh_sessions()
                     return
                 if err:
                     current_sid = str((self.current_session or {}).get("id") or "").strip()
                     if current_sid == sid:
-                        self._set_status(f"远端同步失败，已使用本地缓存：{err}")
+                        self._set_status(f"远端同步失败，当前仍使用本地缓存：{err}；可稍后重试或先检查 SSH。")
 
             self._sidebar_post_ui(done)
 
@@ -1025,8 +1065,9 @@ class SidebarSessionsMixin:
             except Exception:
                 pass
 
-    def _sync_remote_device_channel_process_sessions_blocking(self):
-        if not lz.is_valid_agent_dir(self.agent_dir):
+    def _sync_remote_device_channel_process_sessions_blocking(self, *, agent_dir="", runtime_context=None):
+        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
+        if not lz.is_valid_agent_dir(root):
             return False
         now = time.time()
         next_at = float(getattr(self, "_next_remote_channel_sync_at", 0) or 0)
@@ -1074,11 +1115,13 @@ class SidebarSessionsMixin:
             error_map[did] = sync_meta
             active_ids = active_ids_by_device.setdefault(did, set())
             for row in rows:
+                if not runtime_context_matches(self, runtime_context):
+                    return False
                 cid = lz._normalize_usage_channel_id(row.get("channel_id"), "launcher")
                 checked_map[(did, cid)] = now
                 sid = f"rdev_{did}_{cid}_proc"
                 active_ids.add(sid)
-                data = lz.load_session(self.agent_dir, sid) or {}
+                data = lz.load_session(root, sid) or {}
                 title = str(row.get("title") or "").strip() or f"{dname} · {lz._usage_channel_label(cid)} 进程"
                 bubble_text = str(row.get("bubble_text") or "").strip()
                 if not bubble_text:
@@ -1132,10 +1175,14 @@ class SidebarSessionsMixin:
                     and str(((list(data.get("bubbles") or [{}])[-1] or {}).get("text") or "")) == bubble_text
                 )
                 if not same_payload:
-                    lz.save_session(self.agent_dir, payload, touch=False)
+                    if not runtime_context_matches(self, runtime_context):
+                        return False
+                    lz.save_session(root, payload, touch=False)
                     changed = True
         prefix = "rdev_"
-        for meta in lz.list_sessions(self.agent_dir):
+        if not runtime_context_matches(self, runtime_context):
+            return False
+        for meta in lz.list_sessions(root):
             sid = str(meta.get("id") or "").strip()
             if not sid.startswith(prefix):
                 continue
@@ -1149,7 +1196,9 @@ class SidebarSessionsMixin:
             active_ids = active_ids_by_device.get(did) or set()
             if sid in active_ids:
                 continue
-            lz.delete_session(self.agent_dir, sid)
+            if not runtime_context_matches(self, runtime_context):
+                return False
+            lz.delete_session(root, sid)
             changed = True
         return changed
 
@@ -1165,15 +1214,24 @@ class SidebarSessionsMixin:
         if bool(getattr(self, "_remote_channel_sync_running", False)):
             return
         self._remote_channel_sync_running = True
+        context = capture_runtime_context(self)
+        agent_dir = str(context.get("agent_dir") or "").strip()
 
         def worker():
             changed = False
             try:
-                changed = bool(self._sync_remote_device_channel_process_sessions_blocking())
+                changed = bool(
+                    self._sync_remote_device_channel_process_sessions_blocking(
+                        agent_dir=agent_dir,
+                        runtime_context=context,
+                    )
+                )
             except Exception:
                 changed = False
 
             def done():
+                if not runtime_context_matches(self, context):
+                    return
                 self._remote_channel_sync_running = False
                 if changed and self._should_refresh_remote_sync_ui():
                     self._last_session_list_signature = None
@@ -1796,6 +1854,15 @@ class SidebarSessionsMixin:
         if failed:
             QMessageBox.warning(self, "远端删除失败", "\n".join(dict.fromkeys(failed)))
 
+    def _align_sidebar_to_session(self, session):
+        data = session if isinstance(session, dict) else {}
+        scope, did = self._session_device_scope_id(data)
+        self._sidebar_device_scope = scope
+        self._sidebar_device_id = did if scope == "remote" else "local"
+        self._sidebar_channel_id = lz._normalize_usage_channel_id(data.get("channel_id"), "launcher")
+        self._sidebar_view_mode = "sessions"
+        self._last_session_list_signature = None
+
     def _load_session_by_id(self, sid: str):
         if self._busy:
             QMessageBox.information(self, "忙碌中", "当前还在生成，请先等待结束或手动中断。")
@@ -1813,6 +1880,7 @@ class SidebarSessionsMixin:
             data["device_name"] = str((dev or {}).get("name") or data.get("device_name") or "远程设备").strip() or "远程设备"
         else:
             data["device_name"] = "本机"
+        self._align_sidebar_to_session(data)
         self._selected_session_id = sid
         self.current_session = data
         self._render_session(self.current_session)
@@ -1821,7 +1889,7 @@ class SidebarSessionsMixin:
             self._set_status("已载入渠道进程快照。该会话仅用于回顾，不能在这里继续发送消息。")
             return
         if self._session_device_scope_id(self.current_session)[0] == "remote":
-            self._set_status("已载入远程会话缓存，正在后台同步…")
+            self._set_status("已载入远程会话缓存，正在后台同步；可继续发送，新内容会尝试写回远端。")
             self._refresh_remote_session_cache_async(self.current_session)
             return
         self._bind_session_to_current_bridge(self.current_session)

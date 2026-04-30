@@ -5,7 +5,8 @@ import json
 import sys
 import traceback
 
-from launcher_app import core as lz
+from launcher_core_parts.runtime import updater_log
+from launcher_core_parts.update_manager import apply_update_job
 
 
 def _parse_args(argv):
@@ -21,10 +22,10 @@ def run(argv=None) -> int:
         sys.stderr.write("missing --job\n")
         return 2
     try:
-        result = lz.apply_update_job(job_path)
+        result = apply_update_job(job_path)
     except Exception as e:
-        lz.updater_log(f"[fatal] updater failed: {e}")
-        lz.updater_log(traceback.format_exc())
+        updater_log(f"[fatal] updater failed: {e}")
+        updater_log(traceback.format_exc())
         sys.stderr.write(str(e) + "\n")
         return 1
     sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")

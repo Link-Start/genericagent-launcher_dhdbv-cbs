@@ -21,6 +21,26 @@ from .common import _session_copy, normalize_remote_agent_dir, normalize_ssh_err
 
 
 class BridgeRuntimeMixin:
+    def _apply_bridge_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _bridge_attachment_remove_disabled_reason(self, *, active_mode=False):
+        if bool(active_mode):
+            return "当前这一轮还没有结束；本轮已附带图片会在回复完成后自动清除。"
+        return ""
+
+    def _bridge_llm_combo_disabled_reason(self):
+        if bool(getattr(self, "llms", None)):
+            return ""
+        return "当前还没有可用的 LLM 配置。"
+
     def _remote_parse_bridge_event_text(self, text):
         raw = str(text or "").strip()
         if not raw:
@@ -156,7 +176,13 @@ class BridgeRuntimeMixin:
 
             remove_btn = QPushButton("移除")
             remove_btn.setStyleSheet(self._action_button_style())
-            remove_btn.setEnabled(not active_mode)
+            disabled_reason = self._bridge_attachment_remove_disabled_reason(active_mode=active_mode)
+            self._apply_bridge_widget_state(
+                remove_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="把这张图片从下一轮输入中移除。",
+                disabled_tooltip=disabled_reason,
+            )
             if not active_mode:
                 remove_btn.clicked.connect(lambda _=False, i=idx: self._remove_pending_input_attachment(i))
             box.addWidget(remove_btn, 0)
@@ -346,15 +372,22 @@ class BridgeRuntimeMixin:
         self._play_reply_done_sound()
         if not self._reply_message_enabled():
             return
-        tray = self._ensure_reply_notify_tray()
-        if tray is None:
-            return
         msg = "AI 回复已完成"
         preview = str(final_text or "").strip().replace("\r", " ").replace("\n", " ")
         if preview:
             if len(preview) > 72:
                 preview = preview[:72].rstrip() + "…"
             msg = f"{msg}：{preview}"
+        tray = self._ensure_reply_notify_tray()
+        if tray is None:
+            if lz.IS_MACOS:
+                setter = getattr(self, "_set_status", None)
+                if callable(setter):
+                    try:
+                        setter(msg)
+                    except Exception:
+                        pass
+            return
         tray.showMessage("GenericAgent 启动器", msg, QSystemTrayIcon.Information, 1500)
 
     def _request_backend_state(self, session_id=None):
@@ -444,10 +477,15 @@ class BridgeRuntimeMixin:
                 current_idx = pos
         if current_idx >= 0:
             self.llm_combo.setCurrentIndex(current_idx)
-        self.llm_combo.setEnabled(bool(self.llms))
         if not self.llms:
             self.llm_combo.addItem("未配置 LLM", -1)
-            self.llm_combo.setEnabled(False)
+        disabled_reason = self._bridge_llm_combo_disabled_reason()
+        self._apply_bridge_widget_state(
+            getattr(self, "llm_combo", None),
+            not bool(disabled_reason),
+            enabled_tooltip="切换当前会话使用的模型。",
+            disabled_tooltip=disabled_reason,
+        )
         self._ignore_llm_change = False
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
         if callable(floating_sync):

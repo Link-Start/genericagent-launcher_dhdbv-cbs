@@ -127,10 +127,17 @@ class DependencyRuntimeMixin:
 
     def _dependency_check_desc_text(self, extra_packages=None):
         extras = [str(item or "").strip() for item in (extra_packages or []) if str(item or "").strip()]
-        text = (
-            "将检查系统 Python、基础依赖、GenericAgent requirements.txt，并验证 agentmain 是否可载入。"
-            "缺少依赖时会自动补齐。依赖安装器默认 auto（优先 uv，失败回退 pip）。"
-        )
+        if getattr(lz, "IS_MACOS", False):
+            text = (
+                "将检查系统 Python、基础依赖、GenericAgent requirements.txt，并验证 agentmain 是否可载入。"
+                "mac 版会优先尝试你手动指定的 python_exe、python3 和 python；如果你已有项目虚拟环境，也可以填写 venv/bin/python。"
+                "缺少依赖时会自动补齐。依赖安装器默认 auto（优先 uv，失败回退 pip）。"
+            )
+        else:
+            text = (
+                "将检查系统 Python、基础依赖、GenericAgent requirements.txt，并验证 agentmain 是否可载入。"
+                "缺少依赖时会自动补齐。依赖安装器默认 auto（优先 uv，失败回退 pip）。"
+            )
         if extras:
             text += "\n\n本次还会同步渠道额外依赖：" + "、".join(extras)
         return text

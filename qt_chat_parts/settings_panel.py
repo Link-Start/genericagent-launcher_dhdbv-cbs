@@ -41,9 +41,15 @@ from PySide6.QtWidgets import (
 )
 
 from launcher_app import core as lz
-from launcher_app.theme import C, F
+from launcher_app.theme import C, F, preferred_theme_font_families
 
-from .common import is_auto_remote_agent_dir, normalize_remote_agent_dir, normalize_ssh_error_text, remote_agent_dir_default
+from .common import (
+    invalidate_runtime_bound_state,
+    is_auto_remote_agent_dir,
+    normalize_remote_agent_dir,
+    normalize_ssh_error_text,
+    remote_agent_dir_default,
+)
 
 _SCROLLBAR_STYLE = """
 QScrollBar:vertical { width: 10px; background: transparent; border: none; margin: 2px; }
@@ -332,6 +338,11 @@ class _StablePopupComboBox(QComboBox):
 
 
 class SettingsPanelMixin:
+    _SETTINGS_LIVE_RELOAD_CATEGORIES = frozenset({"channels", "vps", "schedule", "personal", "usage", "about"})
+
+    def _settings_category_needs_live_reload(self, key: str) -> bool:
+        return str(key or "").strip().lower() in self._SETTINGS_LIVE_RELOAD_CATEGORIES
+
     def _normalize_qss_color(self, value: str) -> str:
         text = str(value or "").strip()
         if not text:
@@ -585,18 +596,22 @@ class SettingsPanelMixin:
         api_add_btn.setStyleSheet(self._action_button_style(primary=True))
         api_add_btn.clicked.connect(lambda: self._qt_api_add_channel("oai_chat"))
         api_toolbar.addWidget(api_add_btn, 0)
+        self.settings_api_add_btn = api_add_btn
         api_save_btn = QPushButton("仅保存")
         api_save_btn.setStyleSheet(self._action_button_style())
         api_save_btn.clicked.connect(lambda: self._qt_api_save(restart=False))
         api_toolbar.addWidget(api_save_btn, 0)
+        self.settings_api_save_btn = api_save_btn
         api_restart_btn = QPushButton("保存并重启内核")
         api_restart_btn.setStyleSheet(self._action_button_style())
         api_restart_btn.clicked.connect(lambda: self._qt_api_save(restart=True))
         api_toolbar.addWidget(api_restart_btn, 0)
+        self.settings_api_restart_btn = api_restart_btn
         api_raw_btn = QPushButton("直接编辑文件")
         api_raw_btn.setStyleSheet(self._action_button_style())
         api_raw_btn.clicked.connect(self._open_raw_mykey_editor)
         api_toolbar.addWidget(api_raw_btn, 0)
+        self.settings_api_raw_btn = api_raw_btn
         api_toolbar.addStretch(1)
         api_box.addLayout(api_toolbar)
         self.settings_api_notice = QLabel("")
@@ -635,14 +650,17 @@ class SettingsPanelMixin:
         channel_save_btn.setStyleSheet(self._action_button_style(primary=True))
         channel_save_btn.clicked.connect(lambda: self._qt_channels_save(silent=False))
         channel_toolbar.addWidget(channel_save_btn, 0)
+        self.settings_channels_save_btn = channel_save_btn
         channel_refresh_btn = QPushButton("刷新状态")
         channel_refresh_btn.setStyleSheet(self._action_button_style())
         channel_refresh_btn.clicked.connect(self._reload_channels_editor_state)
         channel_toolbar.addWidget(channel_refresh_btn, 0)
+        self.settings_channels_refresh_btn = channel_refresh_btn
         channel_stop_btn = QPushButton("停止全部")
         channel_stop_btn.setStyleSheet(self._action_button_style())
         channel_stop_btn.clicked.connect(self._stop_all_managed_channels)
         channel_toolbar.addWidget(channel_stop_btn, 0)
+        self.settings_channels_stop_all_btn = channel_stop_btn
         channel_toolbar.addStretch(1)
         channels_box.addLayout(channel_toolbar)
         self.settings_channels_notice = QLabel("")
@@ -842,7 +860,7 @@ class SettingsPanelMixin:
         self.settings_vps_terminal_output.setMaximumBlockCount(4000)
         self.settings_vps_terminal_output.setStyleSheet(
             "QPlainTextEdit {"
-            " font-family: Consolas, 'Cascadia Mono', 'Microsoft YaHei UI';"
+            f" font-family: {F['font_family_mono']};"
             " font-size: 12px;"
             " background: #0f172a;"
             " color: #e2e8f0;"
@@ -1239,7 +1257,7 @@ class SettingsPanelMixin:
         notify_title = QLabel("回复提醒")
         notify_title.setObjectName("cardTitle")
         notify_box.addWidget(notify_title)
-        notify_desc = QLabel("分别控制 AI 回复完成后的提示音和系统托盘提示消息。勾选后表示关闭该提醒。")
+        notify_desc = QLabel("分别控制 AI 回复完成后的提示音和完成提示消息。勾选后表示关闭该提醒。")
         notify_desc.setWordWrap(True)
         notify_desc.setObjectName("cardDesc")
         notify_box.addWidget(notify_desc)
@@ -1788,10 +1806,15 @@ class SettingsPanelMixin:
             self._sync_personal_target_combo(entries, target_index, signature, force=force)
             current_data = combo.itemData(target_index) if isinstance(combo.itemData(target_index), dict) else {}
             current = self._normalize_settings_target(current_data)
-            self._settings_target_scope = current["scope"]
-            self._settings_target_device_id = current["device_id"]
-            self._refresh_settings_target_notice()
-            self._refresh_settings_target_visibility()
+            changed = self._apply_settings_target_selection(
+                current,
+                persist=True,
+                reload_current=False,
+                request_probe=False,
+            )
+            if not changed:
+                self._refresh_settings_target_notice()
+                self._refresh_settings_target_visibility()
             return
         self._dismiss_combo_popup(combo)
         combo.blockSignals(True)
@@ -1802,49 +1825,43 @@ class SettingsPanelMixin:
         combo.blockSignals(False)
         data = combo.itemData(target_index) if isinstance(combo.itemData(target_index), dict) else {}
         current = self._normalize_settings_target(data)
-        self._settings_target_scope = current["scope"]
-        self._settings_target_device_id = current["device_id"]
         self._settings_target_combo_signature = signature
         self._sync_personal_target_combo(entries, target_index, signature, force=force)
-        self._refresh_settings_target_notice()
-        self._refresh_settings_target_visibility()
+        changed = self._apply_settings_target_selection(
+            current,
+            persist=True,
+            reload_current=False,
+            request_probe=False,
+        )
+        if not changed:
+            self._refresh_settings_target_notice()
+            self._refresh_settings_target_visibility()
 
-    def _on_settings_target_changed(self, index: int, combo=None):
-        combo = combo or getattr(self, "settings_target_combo", None)
-        if combo is None:
-            return
-        data = combo.itemData(index) if isinstance(combo.itemData(index), dict) else {}
-        target = self._normalize_settings_target(data)
+    def _apply_settings_target_selection(self, target, *, persist=True, reload_current=True, request_probe=True, defocus=False):
+        normalized = self._normalize_settings_target(target)
         if (
-            str(getattr(self, "_settings_target_scope", "local")) == target["scope"]
-            and str(getattr(self, "_settings_target_device_id", "local")) == target["device_id"]
+            str(getattr(self, "_settings_target_scope", "local")) == normalized["scope"]
+            and str(getattr(self, "_settings_target_device_id", "local")) == normalized["device_id"]
         ):
-            return
-        self._dismiss_combo_popup(combo)
-        try:
-            QTimer.singleShot(0, lambda c=combo: self._dismiss_combo_popup(c))
-        except Exception:
-            pass
-        self._settings_target_scope = target["scope"]
-        self._settings_target_device_id = target["device_id"]
-        self._bump_settings_target_generation()
-        self._qt_api_remote_loading = False
-        self._qt_channel_remote_loading = False
-        self._settings_personal_remote_sync_running = False
-        self._settings_usage_remote_sync_running = False
-        self._settings_personal_remote_sync_key = ""
-        self._settings_personal_remote_synced_key = ""
-        self._settings_usage_remote_sync_key = ""
-        self._settings_usage_remote_synced_key = ""
-        self._settings_schedule_remote_reload_token = 0
-        defocus = getattr(self, "_defocus_settings_target_combo", None)
-        if callable(defocus):
-            try:
-                defocus()
-            except Exception:
-                pass
-        self.cfg["settings_target"] = dict(target)
-        lz.save_config(self.cfg)
+            return False
+        self._settings_target_scope = normalized["scope"]
+        self._settings_target_device_id = normalized["device_id"]
+        # 等价于旧的逐字段失效逻辑：
+        # self._qt_api_remote_loading = False
+        # self._qt_channel_remote_loading = False
+        # self._settings_personal_remote_sync_running = False
+        # self._settings_usage_remote_sync_running = False
+        invalidate_runtime_bound_state(self, bump_settings_target=True, clear_remote_sync_queues=False)
+        if defocus:
+            defocus_fn = getattr(self, "_defocus_settings_target_combo", None)
+            if callable(defocus_fn):
+                try:
+                    defocus_fn()
+                except Exception:
+                    pass
+        if persist:
+            self.cfg["settings_target"] = dict(normalized)
+            lz.save_config(self.cfg)
         loaded = getattr(self, "_settings_loaded_categories", None)
         if isinstance(loaded, set):
             loaded.discard("api")
@@ -1854,15 +1871,31 @@ class SettingsPanelMixin:
             loaded.discard("schedule")
         self._refresh_settings_target_notice()
         self._refresh_settings_target_visibility()
-        current_category = str(getattr(self, "_current_settings_category", "") or "").strip().lower()
-        if self._settings_category_uses_target_switch(current_category) or current_category == "personal":
-            self._settings_reload(categories=[self._current_settings_category], force=True)
-        probe = getattr(self, "_request_server_connection_probe", None)
-        if callable(probe):
-            try:
-                probe(force=True)
-            except Exception:
-                pass
+        if reload_current:
+            current_category = str(getattr(self, "_current_settings_category", "") or "").strip().lower()
+            if self._settings_category_uses_target_switch(current_category) or current_category == "personal":
+                self._settings_reload(categories=[self._current_settings_category], force=True)
+        if request_probe:
+            probe = getattr(self, "_request_server_connection_probe", None)
+            if callable(probe):
+                try:
+                    probe(force=True)
+                except Exception:
+                    pass
+        return True
+
+    def _on_settings_target_changed(self, index: int, combo=None):
+        combo = combo or getattr(self, "settings_target_combo", None)
+        if combo is None:
+            return
+        data = combo.itemData(index) if isinstance(combo.itemData(index), dict) else {}
+        target = self._normalize_settings_target(data)
+        self._dismiss_combo_popup(combo)
+        try:
+            QTimer.singleShot(0, lambda c=combo: self._dismiss_combo_popup(c))
+        except Exception:
+            pass
+        self._apply_settings_target_selection(target, persist=True, reload_current=True, request_probe=True, defocus=True)
 
     def _settings_target_open_remote_client(self, device, *, timeout=10):
         payload = {}
@@ -2037,12 +2070,18 @@ class SettingsPanelMixin:
             else:
                 btn.setStyleSheet(self._sidebar_button_style(subtle=True))
         if reload:
-            self._settings_reload(categories=[key])
+            self._settings_reload(categories=[key], force=self._settings_category_needs_live_reload(key))
 
     def _load_mykey_source(self):
         ok, text, display_path, err = self._settings_target_read_mykey_text()
         if not ok:
-            return display_path, {"error": err or "读取配置失败", "configs": [], "extras": {}, "passthrough": []}
+            return display_path, {
+                "error": err or "读取配置失败",
+                "configs": [],
+                "extras": {},
+                "passthrough": [],
+                "load_failed": True,
+            }
         parsed = self._settings_parse_mykey_text(text)
         return display_path, parsed
 
@@ -2720,57 +2759,269 @@ class SettingsPanelMixin:
                 return True
         return False
 
+    def _apply_vps_button_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _vps_busy_reason(self):
+        if bool(getattr(self, "_vps_dep_install_running", False)):
+            return "正在安装 SSH 依赖，请等待当前任务完成。"
+        if bool(getattr(self, "_vps_connect_running", False)):
+            return "正在测试 VPS SSH 连接，请等待当前任务完成。"
+        if bool(getattr(self, "_vps_terminal_connecting", False)):
+            return "正在连接远程终端，请等待当前任务完成。"
+        if bool(getattr(self, "_vps_deploy_running", False)):
+            return "正在执行 VPS Docker 部署，请等待当前任务完成。"
+        return ""
+
+    def _vps_connection_incomplete_reason(self, payload=None):
+        item = self._normalize_vps_connection_cfg(payload or self._collect_vps_form_data())
+        host = str(item.get("host") or "").strip()
+        username = str(item.get("username") or "").strip()
+        if not host and not username:
+            return "请先填写服务器地址和用户名。"
+        if not host or not username:
+            return "服务器地址和用户名需要同时填写。"
+        return ""
+
+    def _vps_auth_missing_reason(self, payload=None):
+        item = self._normalize_vps_connection_cfg(payload or self._collect_vps_form_data())
+        key_rel = str(item.get("ssh_key_path") or "").strip()
+        password = str(item.get("password") or "").strip()
+        if not key_rel and not password:
+            return "请至少提供 SSH 私钥路径或密码。"
+        key_abs = lz._resolve_config_path(key_rel) if key_rel else ""
+        if key_rel and not os.path.isfile(key_abs):
+            return "SSH 私钥路径不存在，请检查后重试。"
+        return ""
+
+    def _vps_runtime_connection_disabled_reason(self, payload=None):
+        text = self._vps_connection_incomplete_reason(payload)
+        if text:
+            return text
+        return self._vps_auth_missing_reason(payload)
+
+    def _vps_terminal_connect_disabled_reason(self, *, payload=None, has_profiles=False):
+        busy_reason = self._vps_busy_reason()
+        if busy_reason:
+            return busy_reason
+        if not has_profiles:
+            return "请先新建至少一个服务器配置。"
+        if bool(getattr(self, "_vps_terminal_connected", False)):
+            current_id = str(self._current_vps_profile_id() or getattr(self, "_vps_form_profile_id", "") or "").strip()
+            connected_id = str(getattr(self, "_vps_terminal_profile_id", "") or "").strip()
+            if connected_id and current_id and connected_id != current_id:
+                return "当前终端已连接到另一台服务器，请先断开后再切换。"
+            return "当前终端连接已在使用中，无需重复连接。"
+        return self._vps_runtime_connection_disabled_reason(payload)
+
+    def _vps_terminal_disconnect_disabled_reason(self):
+        if bool(getattr(self, "_vps_terminal_connecting", False)):
+            return "终端正在连接中，请等待当前连接结果。"
+        if not bool(getattr(self, "_vps_terminal_connected", False)):
+            return "当前没有已连接的远程终端。"
+        return ""
+
+    def _vps_terminal_send_disabled_reason(self):
+        busy_reason = self._vps_busy_reason()
+        if busy_reason:
+            return busy_reason
+        if not bool(getattr(self, "_vps_terminal_connected", False)):
+            return "请先连接远程终端。"
+        if getattr(self, "_vps_terminal_channel", None) is None:
+            return "终端通道不可用，请重新连接。"
+        return ""
+
+    def _vps_deploy_validation_error(self, deploy_cfg=None):
+        payload = self._normalize_vps_deploy_cfg(deploy_cfg or self._collect_vps_deploy_form_data())
+        remote_dir = str(payload.get("remote_dir") or "").strip()
+        docker_image = str(payload.get("docker_image") or "").strip()
+        docker_container = str(payload.get("docker_container") or "").strip()
+        source = str(payload.get("source") or "upload").strip().lower()
+        local_rel = str(payload.get("local_agent_dir") or "").strip()
+        local_abs = lz._resolve_config_path(local_rel) if local_rel else ""
+        repo_url = str(payload.get("repo_url") or "").strip()
+        dep_install_mode = str(payload.get("dep_install_mode") or "offline").strip().lower()
+        if dep_install_mode == "online":
+            dep_install_mode = "global"
+        pip_mirror_url = str(payload.get("pip_mirror_url") or "").strip()
+        if not remote_dir:
+            return "请填写远端部署目录。"
+        image_error = self._validate_vps_docker_image_name(docker_image)
+        if image_error:
+            return image_error
+        if not docker_container:
+            return "请先填写容器名称。"
+        if source == "upload":
+            if not local_abs or not os.path.isdir(local_abs):
+                return "上传模式下，本地 agant 目录不存在。"
+        elif not repo_url:
+            return "拉取模式下，仓库地址不能为空。"
+        if dep_install_mode == "mirror":
+            if not pip_mirror_url:
+                return "自定义镜像策略要求填写 pip 镜像地址。"
+            parsed = urlparse(pip_mirror_url)
+            if parsed.scheme not in ("http", "https") or (not parsed.netloc):
+                return "pip 镜像地址格式无效，请填写 http(s) URL。"
+        return ""
+
+    def _vps_deploy_disabled_reason(self, *, payload=None, deploy_cfg=None, has_profiles=False):
+        busy_reason = self._vps_busy_reason()
+        if busy_reason:
+            return busy_reason
+        if not has_profiles:
+            return "请先新建至少一个服务器配置。"
+        connection_reason = self._vps_runtime_connection_disabled_reason(payload)
+        if connection_reason:
+            return connection_reason
+        return self._vps_deploy_validation_error(deploy_cfg)
+
+    def _vps_profile_action_disabled_reason(self, action: str, *, has_profiles=False):
+        kind = str(action or "").strip().lower()
+        busy_reason = self._vps_busy_reason()
+        if busy_reason:
+            return busy_reason
+        if kind == "new":
+            return ""
+        if kind == "combo":
+            return "" if has_profiles else "当前还没有服务器配置可切换。"
+        if kind in {"save", "install", "test", "connect", "deploy", "rename", "delete"}:
+            return "" if has_profiles else "请先新建至少一个服务器配置。"
+        return ""
+
     def _refresh_vps_action_buttons(self):
         connect_running = bool(getattr(self, "_vps_connect_running", False))
         dep_running = bool(getattr(self, "_vps_dep_install_running", False))
         terminal_connecting = bool(getattr(self, "_vps_terminal_connecting", False))
-        terminal_connected = bool(getattr(self, "_vps_terminal_connected", False))
         deploy_running = bool(getattr(self, "_vps_deploy_running", False))
-        busy = connect_running or dep_running or terminal_connecting or deploy_running
         profiles = self._vps_profiles()
         has_profiles = bool(profiles)
+        conn_payload = self._collect_vps_form_data()
+        deploy_cfg = self._collect_vps_deploy_form_data()
         save_btn = getattr(self, "settings_vps_save_btn", None)
         if save_btn is not None:
-            save_btn.setEnabled((not busy) and has_profiles)
+            disabled_reason = self._vps_profile_action_disabled_reason("save", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                save_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="保存当前服务器的连接与部署配置。",
+                disabled_tooltip=disabled_reason,
+            )
         install_btn = getattr(self, "settings_vps_install_dep_btn", None)
         if install_btn is not None:
-            install_btn.setEnabled((not busy) and has_profiles)
             install_btn.setText("安装中…" if dep_running else "安装 SSH 依赖")
+            disabled_reason = self._vps_profile_action_disabled_reason("install", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                install_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="为当前启动器解释器安装 SSH 依赖（paramiko）。",
+                disabled_tooltip=disabled_reason,
+            )
         test_btn = getattr(self, "settings_vps_test_btn", None)
         if test_btn is not None:
-            test_btn.setEnabled((not busy) and has_profiles)
             test_btn.setText("连接测试中…" if connect_running else "测试连接")
+            disabled_reason = self._vps_profile_action_disabled_reason("test", has_profiles=has_profiles)
+            if not disabled_reason:
+                disabled_reason = self._vps_runtime_connection_disabled_reason(conn_payload)
+            self._apply_vps_button_state(
+                test_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="使用当前配置测试 SSH 连接。",
+                disabled_tooltip=disabled_reason,
+            )
         connect_btn = getattr(self, "settings_vps_terminal_connect_btn", None)
         if connect_btn is not None:
-            connect_btn.setEnabled((not busy) and has_profiles and (not terminal_connected))
             connect_btn.setText("连接中…" if terminal_connecting else "连接终端")
+            disabled_reason = self._vps_terminal_connect_disabled_reason(payload=conn_payload, has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                connect_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="连接当前服务器的远程终端。",
+                disabled_tooltip=disabled_reason,
+            )
         disconnect_btn = getattr(self, "settings_vps_terminal_disconnect_btn", None)
         if disconnect_btn is not None:
-            disconnect_btn.setEnabled((not terminal_connecting) and terminal_connected)
+            disabled_reason = self._vps_terminal_disconnect_disabled_reason()
+            self._apply_vps_button_state(
+                disconnect_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="断开当前远程终端连接。",
+                disabled_tooltip=disabled_reason,
+            )
         send_btn = getattr(self, "settings_vps_terminal_send_btn", None)
         if send_btn is not None:
-            send_btn.setEnabled((not busy) and terminal_connected)
+            disabled_reason = self._vps_terminal_send_disabled_reason()
+            self._apply_vps_button_state(
+                send_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="把输入框中的命令发送到当前远程终端。",
+                disabled_tooltip=disabled_reason,
+            )
         input_edit = getattr(self, "settings_vps_terminal_input", None)
         if input_edit is not None:
-            input_edit.setEnabled((not busy) and terminal_connected)
+            disabled_reason = self._vps_terminal_send_disabled_reason()
+            self._apply_vps_button_state(
+                input_edit,
+                not bool(disabled_reason),
+                enabled_tooltip="当前终端已连接，可输入命令并回车执行。",
+                disabled_tooltip=disabled_reason,
+            )
         deploy_btn = getattr(self, "settings_vps_deploy_btn", None)
         if deploy_btn is not None:
-            deploy_btn.setEnabled((not busy) and has_profiles and (not terminal_connecting))
             deploy_btn.setText("部署中…" if deploy_running else "一键部署 Docker")
+            disabled_reason = self._vps_deploy_disabled_reason(
+                payload=conn_payload,
+                deploy_cfg=deploy_cfg,
+                has_profiles=has_profiles,
+            )
+            self._apply_vps_button_state(
+                deploy_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="把当前部署配置执行到目标服务器。",
+                disabled_tooltip=disabled_reason,
+            )
         profile_combo = getattr(self, "settings_vps_profile_combo", None)
         if profile_combo is not None:
-            profile_combo.setEnabled((not busy) and has_profiles)
-        for attr in ("settings_vps_profile_new_btn", "settings_vps_profile_rename_btn", "settings_vps_profile_delete_btn"):
-            btn = getattr(self, attr, None)
-            if btn is None:
-                continue
-            btn.setEnabled(not busy)
+            disabled_reason = self._vps_profile_action_disabled_reason("combo", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                profile_combo,
+                not bool(disabled_reason),
+                enabled_tooltip="切换当前服务器配置。",
+                disabled_tooltip=disabled_reason,
+            )
+        new_btn = getattr(self, "settings_vps_profile_new_btn", None)
+        if new_btn is not None:
+            disabled_reason = self._vps_profile_action_disabled_reason("new", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                new_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="新增一台服务器配置。",
+                disabled_tooltip=disabled_reason,
+            )
         rename_btn = getattr(self, "settings_vps_profile_rename_btn", None)
         delete_btn = getattr(self, "settings_vps_profile_delete_btn", None)
         if rename_btn is not None:
-            rename_btn.setEnabled((not busy) and has_profiles)
+            disabled_reason = self._vps_profile_action_disabled_reason("rename", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                rename_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="重命名当前服务器配置。",
+                disabled_tooltip=disabled_reason,
+            )
         if delete_btn is not None:
-            delete_btn.setEnabled((not busy) and has_profiles)
+            disabled_reason = self._vps_profile_action_disabled_reason("delete", has_profiles=has_profiles)
+            self._apply_vps_button_state(
+                delete_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="删除当前服务器配置。",
+                disabled_tooltip=disabled_reason,
+            )
 
     def _reload_vps_panel(self):
         if not hasattr(self, "settings_vps_notice"):
@@ -4784,15 +5035,7 @@ class SettingsPanelMixin:
             families = sorted({str(name).strip() for name in db.families() if str(name).strip()}, key=lambda x: x.lower())
         except Exception:
             families = []
-        preferred = [
-            "Segoe UI Variable Text",
-            "Segoe UI",
-            "Microsoft YaHei UI",
-            "Microsoft YaHei",
-            "PingFang SC",
-            "Noto Sans CJK SC",
-            "Source Han Sans SC",
-        ]
+        preferred = preferred_theme_font_families()
         merged = []
         seen = set()
         for name in preferred + families:

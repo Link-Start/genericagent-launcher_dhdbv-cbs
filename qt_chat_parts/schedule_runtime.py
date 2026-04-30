@@ -27,8 +27,61 @@ from PySide6.QtWidgets import (
 from launcher_app import core as lz
 from launcher_app.theme import C, F
 
+from .common import capture_runtime_context, runtime_context_matches
+
 
 class ScheduleRuntimeMixin:
+    def _apply_schedule_button_state(self, button, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if button is None:
+            return
+        button.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            button.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _schedule_runtime_start_disabled_reason(self, *, is_remote=False, runtime_code="", scheduler_pid=0):
+        if is_remote:
+            if str(runtime_code or "").strip().lower() == "running" or int(scheduler_pid or 0) > 0:
+                return "远端调度器已在运行；无需重复启动。"
+            return ""
+        if not lz.is_valid_agent_dir(self.agent_dir):
+            return "请先选择有效的 GenericAgent 目录。"
+        if self._scheduler_proc_alive():
+            return "调度器当前已由启动器托管运行；如需重启请先停止。"
+        if self._scheduler_external_running():
+            return "检测到外部调度器实例正在运行；请先关闭外部实例。"
+        return ""
+
+    def _schedule_runtime_stop_disabled_reason(self, *, is_remote=False, runtime_code="", scheduler_pid=0):
+        if is_remote:
+            if int(scheduler_pid or 0) <= 0 and str(runtime_code or "").strip().lower() != "running":
+                return "当前未检测到远端调度器运行中进程。"
+            return ""
+        if self._scheduler_proc_alive():
+            return ""
+        if self._scheduler_external_running():
+            return "当前是外部启动的调度器进程，启动器无法直接停止。"
+        return "当前没有由启动器托管的调度器进程。"
+
+    def _schedule_report_disabled_reason(self, state, *, is_remote=False):
+        item = state if isinstance(state, dict) else {}
+        if str(item.get("latest_report_path") or "").strip():
+            return ""
+        return "当前远端任务还没有可同步的报告文件。" if is_remote else "当前任务还没有生成可打开的报告文件。"
+
+    def _schedule_tasks_dir_disabled_reason(self, tasks_dir, *, is_remote=False):
+        if str(tasks_dir or "").strip():
+            return ""
+        return "当前远端任务目录路径不可用，暂时无法同步。" if is_remote else "当前任务目录路径不可用。"
+
+    def _schedule_log_disabled_reason(self, path, *, is_remote=False, title="日志"):
+        if str(path or "").strip():
+            return ""
+        label = str(title or "日志").strip() or "日志"
+        return f"当前远端{label}路径不可用，暂时无法下载。" if is_remote else f"当前还没有可打开的{label}路径。"
+
     def _schedule_time_label(self, ts):
         try:
             value = float(ts)
@@ -107,6 +160,29 @@ class ScheduleRuntimeMixin:
     def _schedule_last_data(self):
         data = getattr(self, "_schedule_last_data_snapshot", None)
         return data if isinstance(data, dict) else {}
+
+    def _schedule_reset_snapshot(self, *, is_remote=False, device_id="", label="", runtime_status="未运行", runtime_code="disabled", runtime_detail=""):
+        payload = {
+            "is_remote": bool(is_remote),
+            "scope": ("remote" if is_remote else "local"),
+            "device_id": (str(device_id or "").strip() if is_remote else "local"),
+            "label": str(label or ("远程设备" if is_remote else "本机")).strip() or ("远程设备" if is_remote else "本机"),
+            "paths": {},
+            "tasks": [],
+            "errors": [],
+            "enabled_count": 0,
+            "error_count": 0,
+            "runtime_status": str(runtime_status or "未运行").strip() or "未运行",
+            "runtime_code": str(runtime_code or "disabled").strip() or "disabled",
+            "runtime_detail": str(runtime_detail or "").strip(),
+            "scheduler_pid": 0,
+            "scheduler_lock_active": False,
+            "upstream_log_tail": "",
+            "launcher_log_tail": "",
+        }
+        self._schedule_last_data_snapshot = payload
+        self._schedule_task_state_rows_data = []
+        return payload
 
     def _schedule_target_context(self):
         getter = getattr(self, "_settings_target_context", None)
@@ -245,6 +321,7 @@ class ScheduleRuntimeMixin:
     def _schedule_run_remote_job(self, *, title: str, notice_text: str, worker, on_success=None):
         token = int(time.time() * 1000)
         self._schedule_remote_job_token = token
+        context = capture_runtime_context(self, include_settings_target=True)
         notice = getattr(self, "settings_schedule_notice", None)
         if notice is not None and notice_text:
             notice.setText(str(notice_text))
@@ -258,6 +335,8 @@ class ScheduleRuntimeMixin:
                 error = str(e)
 
             def apply():
+                if not runtime_context_matches(self, context, include_settings_target=True):
+                    return
                 if int(getattr(self, "_schedule_remote_job_token", 0) or 0) != token:
                     return
                 if error:
@@ -494,7 +573,7 @@ class ScheduleRuntimeMixin:
             "    runtime_code = 'running'\n"
             "    runtime_detail = f'启动器托管中 · PID {pid}'\n"
             "elif lock_active:\n"
-            "    runtime_status = '运行中'\n"
+            "    runtime_status = '外部运行中'\n"
             "    runtime_code = 'running'\n"
             "    runtime_detail = '检测到上游 scheduler 已在后台运行。'\n"
             "elif pid > 0:\n"
@@ -680,6 +759,7 @@ class ScheduleRuntimeMixin:
                 "print(json.dumps({'ok': True, 'deleted': deleted, 'path': path}, ensure_ascii=False))\n"
             ),
         )
+        ok, payload_data, err = self._schedule_remote_exec_json(device, script, timeout=120)
         if not ok:
             raise RuntimeError(str(err or "远端删除任务失败。").strip() or "远端删除任务失败。")
         return payload_data if isinstance(payload_data, dict) else {}
@@ -736,7 +816,7 @@ class ScheduleRuntimeMixin:
                 "    except Exception:\n"
                 "        pass\n"
                 "if lock_active:\n"
-                "    print(json.dumps({'ok': True, 'started': False, 'runtime_status': '运行中', 'runtime_code': 'running', 'runtime_detail': '检测到上游 scheduler 已在后台运行。', 'pid': 0, 'external': True}, ensure_ascii=False))\n"
+                "    print(json.dumps({'ok': True, 'started': False, 'runtime_status': '外部运行中', 'runtime_code': 'running', 'runtime_detail': '检测到上游 scheduler 已在后台运行。', 'pid': 0, 'external': True}, ensure_ascii=False))\n"
                 "    raise SystemExit(0)\n"
                 "if not os.path.isfile(scheduler_py):\n"
                 "    print(json.dumps({'ok': False, 'error': f'未找到上游调度器脚本：{scheduler_py}'}, ensure_ascii=False))\n"
@@ -1046,7 +1126,7 @@ class ScheduleRuntimeMixin:
                 "detail": f"启动器托管中 · PID {int(getattr(self._scheduler_proc, 'pid', 0) or 0)}",
             }
         if self._scheduler_external_running():
-            return {"text": "运行中", "code": "running", "detail": "检测到上游 scheduler 已在后台运行。"}
+            return {"text": "外部运行中", "code": "running", "detail": "检测到上游 scheduler 已在后台运行。"}
         exit_code = getattr(self, "_scheduler_last_exit_code", None)
         if enabled_count > 0:
             if exit_code is not None:
@@ -1064,8 +1144,12 @@ class ScheduleRuntimeMixin:
             return {"text": f"已退出 ({exit_code})", "code": "error", "detail": "上次启动后进程已退出。"}
         return {"text": "未启用", "code": "disabled", "detail": "当前没有启用的定时任务。"}
 
-    def _after_scheduler_launch_check(self, *, show_errors=True):
+    def _after_scheduler_launch_check(self, *, show_errors=True, context=None):
+        if context is not None and (not runtime_context_matches(self, context)):
+            return
         self._scheduler_cleanup_if_exited()
+        if context is not None and (not runtime_context_matches(self, context)):
+            return
         if self._scheduler_proc_alive() or self._scheduler_external_running():
             self._reload_schedule_panel()
             return
@@ -1145,7 +1229,8 @@ class ScheduleRuntimeMixin:
         self._scheduler_proc = proc
         self._scheduler_log_handle = log_handle
         self._scheduler_last_exit_code = None
-        QTimer.singleShot(1200, lambda se=show_errors: self._after_scheduler_launch_check(show_errors=se))
+        launch_context = capture_runtime_context(self)
+        QTimer.singleShot(1200, lambda se=show_errors, context=launch_context: self._after_scheduler_launch_check(show_errors=se, context=context))
         self._reload_schedule_panel()
         return True
 
@@ -1309,11 +1394,18 @@ class ScheduleRuntimeMixin:
         if target["is_remote"]:
             device = self._schedule_target_device()
             if not isinstance(device, dict):
+                self._schedule_reset_snapshot(
+                    is_remote=True,
+                    device_id=str(target.get("device_id") or "").strip(),
+                    label=str(target.get("label") or "远程设备"),
+                    runtime_status="未运行",
+                    runtime_code="disabled",
+                    runtime_detail="当前设置目标对应的远程设备不存在。",
+                )
                 self.settings_schedule_notice.setText("当前设置目标对应的远程设备不存在，请先检查 SSH 设备配置。")
                 return
-            token_getter = getattr(self, "_settings_target_generation", None)
-            target_generation = token_getter() if callable(token_getter) else 0
             token = int(time.time() * 1000)
+            context = capture_runtime_context(self, include_settings_target=True)
             self._settings_schedule_remote_reload_token = token
             self.settings_schedule_notice.setText(f"正在读取 {target['label']} 的定时任务与调度状态…")
 
@@ -1321,8 +1413,9 @@ class ScheduleRuntimeMixin:
                 ok, data, err = self._remote_schedule_snapshot(device)
 
                 def apply():
-                    current_generation = token_getter() if callable(token_getter) else target_generation
-                    if int(current_generation or 0) != int(target_generation or 0):
+                    # 旧逻辑等价检查：
+                    # if int(current_generation or 0) != int(target_generation or 0):
+                    if not runtime_context_matches(self, context, include_settings_target=True):
                         return
                     if int(getattr(self, "_settings_schedule_remote_reload_token", 0) or 0) != token:
                         return
@@ -1372,6 +1465,13 @@ class ScheduleRuntimeMixin:
             threading.Thread(target=worker, name=f"schedule-remote-reload-{target['device_id']}", daemon=True).start()
             return
         if not lz.is_valid_agent_dir(self.agent_dir):
+            self._schedule_reset_snapshot(
+                is_remote=False,
+                label="本机",
+                runtime_status="未运行",
+                runtime_code="disabled",
+                runtime_detail="请先选择有效的 GenericAgent 目录。",
+            )
             self.settings_schedule_notice.setText("请先选择有效的 GenericAgent 目录。")
             return
 
@@ -1434,18 +1534,30 @@ class ScheduleRuntimeMixin:
         start_btn = QPushButton("启动调度器")
         start_btn.setStyleSheet(self._action_button_style())
         start_btn.clicked.connect(lambda: self._start_scheduler_process(show_errors=True))
-        if is_remote:
-            start_btn.setEnabled(runtime_code != "running")
-        else:
-            start_btn.setEnabled((not self._scheduler_proc_alive()) and (not self._scheduler_external_running()))
+        self._apply_schedule_button_state(
+            start_btn,
+            (runtime_code != "running") if is_remote else ((not self._scheduler_proc_alive()) and (not self._scheduler_external_running())),
+            enabled_tooltip=("启动远端调度器。" if is_remote else "启动本机调度器。"),
+            disabled_tooltip=self._schedule_runtime_start_disabled_reason(
+                is_remote=is_remote,
+                runtime_code=runtime_code,
+                scheduler_pid=scheduler_pid,
+            ),
+        )
         controls.addWidget(start_btn, 0)
         stop_btn = QPushButton("停止调度器")
         stop_btn.setStyleSheet(self._action_button_style())
         stop_btn.clicked.connect(lambda: self._stop_scheduler_process(refresh=True))
-        if is_remote:
-            stop_btn.setEnabled(scheduler_pid > 0)
-        else:
-            stop_btn.setEnabled(self._scheduler_proc_alive())
+        self._apply_schedule_button_state(
+            stop_btn,
+            (scheduler_pid > 0) if is_remote else self._scheduler_proc_alive(),
+            enabled_tooltip=("停止远端调度器。" if is_remote else "停止由启动器托管的本机调度器。"),
+            disabled_tooltip=self._schedule_runtime_stop_disabled_reason(
+                is_remote=is_remote,
+                runtime_code=runtime_code,
+                scheduler_pid=scheduler_pid,
+            ),
+        )
         controls.addWidget(stop_btn, 0)
         runtime_box.addLayout(controls)
         self.settings_schedule_list_layout.addWidget(runtime_card)
@@ -1618,14 +1730,25 @@ class ScheduleRuntimeMixin:
             footer.addWidget(delete_btn, 0)
             report_btn = QPushButton("打开最新报告")
             report_btn.setStyleSheet(self._action_button_style())
-            report_btn.setEnabled(bool(state.get("latest_report_path")))
             if is_remote:
                 report_btn.setText("下载并打开报告")
+            self._apply_schedule_button_state(
+                report_btn,
+                bool(state.get("latest_report_path")),
+                enabled_tooltip=("下载远端最新报告到本地缓存后打开。" if is_remote else "打开当前任务的最新报告。"),
+                disabled_tooltip=self._schedule_report_disabled_reason(state, is_remote=is_remote),
+            )
             footer.addWidget(report_btn, 0)
             folder_btn = QPushButton("打开任务目录")
             folder_btn.setStyleSheet(self._action_button_style())
             if is_remote:
                 folder_btn.setText("同步并打开目录")
+            self._apply_schedule_button_state(
+                folder_btn,
+                bool(paths.get("tasks_dir")),
+                enabled_tooltip=("同步远端任务目录到本地缓存后打开。" if is_remote else "打开本地任务目录。"),
+                disabled_tooltip=self._schedule_tasks_dir_disabled_reason(paths.get("tasks_dir", ""), is_remote=is_remote),
+            )
             footer.addWidget(folder_btn, 0)
             footer.addStretch(1)
             body.addLayout(footer)
@@ -1705,7 +1828,12 @@ class ScheduleRuntimeMixin:
         upstream_actions.setSpacing(8)
         open_upstream_btn = QPushButton("下载并打开完整日志" if is_remote else "打开完整日志")
         open_upstream_btn.setStyleSheet(self._action_button_style())
-        open_upstream_btn.setEnabled(bool(paths.get("log_path")))
+        self._apply_schedule_button_state(
+            open_upstream_btn,
+            bool(paths.get("log_path")),
+            enabled_tooltip=("下载远端调度日志到本地缓存后打开。" if is_remote else "打开完整调度日志文件。"),
+            disabled_tooltip=self._schedule_log_disabled_reason(paths.get("log_path", ""), is_remote=is_remote, title="调度日志"),
+        )
         open_upstream_btn.clicked.connect(
             lambda _=False, p=paths.get("log_path", ""): self._schedule_open_log_file(
                 title="调度日志",
@@ -1739,7 +1867,12 @@ class ScheduleRuntimeMixin:
         )
         open_runtime_btn = QPushButton("下载并打开完整日志" if is_remote else "打开完整日志")
         open_runtime_btn.setStyleSheet(self._action_button_style())
-        open_runtime_btn.setEnabled(bool(runtime_path))
+        self._apply_schedule_button_state(
+            open_runtime_btn,
+            bool(runtime_path),
+            enabled_tooltip=("下载远端启动日志到本地缓存后打开。" if is_remote else "打开完整启动日志文件。"),
+            disabled_tooltip=self._schedule_log_disabled_reason(runtime_path, is_remote=is_remote, title="启动日志"),
+        )
         open_runtime_btn.clicked.connect(
             lambda _=False, p=runtime_path: self._schedule_open_log_file(
                 title="启动日志",

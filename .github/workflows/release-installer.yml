@@ -121,3 +121,144 @@ jobs:
             "release/$v/update/GenericAgentLauncher-app-$v.zip" `
             "$($installer.FullName)" `
             --clobber
+
+  build-macos:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      PYTHONUTF8: "1"
+      GA_MACOS_RUNNER_LABEL: "macos-15"
+      GA_MACOS_EXPECTED_ARCH: "arm64"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          v="${{ github.event.inputs.version }}"
+          if [ -z "$v" ]; then
+            ref="${{ github.ref_name }}"
+            if [[ "$ref" == v* ]]; then
+              v="${ref#v}"
+            else
+              v="$ref"
+            fi
+          fi
+          if [ -z "$v" ]; then
+            echo "Unable to resolve release version" >&2
+            exit 1
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller==6.17.0
+
+      - name: Run tests
+        shell: bash
+        run: |
+          python -m pytest tests -q
+
+      - name: Source startup smoke
+        shell: bash
+        env:
+          GA_LAUNCHER_SMOKE_EXIT_MS: "1200"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python launcher.py
+
+      - name: Build macOS app and dmg
+        shell: bash
+        run: |
+          python tools/build_macos_release.py \
+            --version "${{ steps.ver.outputs.value }}" \
+            --out release \
+            --commit "${{ github.sha }}"
+
+      - name: Packaged app startup smoke
+        shell: bash
+        env:
+          GA_LAUNCHER_SMOKE_EXIT_MS: "1200"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          v="${{ steps.ver.outputs.value }}"
+          app="release/$v/macos/GenericAgent Launcher.app/Contents/MacOS/GenericAgentLauncher"
+          if [ ! -e "$app" ]; then
+            echo "Packaged app executable not found: $app" >&2
+            exit 1
+          fi
+          "$app"
+
+      - name: Runner and bundle diagnostics
+        shell: bash
+        run: |
+          v="${{ steps.ver.outputs.value }}"
+          app="release/$v/macos/GenericAgent Launcher.app"
+          bin="$app/Contents/MacOS/GenericAgentLauncher"
+          echo "Runner label: $GA_MACOS_RUNNER_LABEL"
+          echo "Expected arch: $GA_MACOS_EXPECTED_ARCH"
+          uname -m
+          sw_vers
+          file "$bin"
+          lipo -info "$bin"
+          codesign -dv --verbose=4 "$app" || true
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute --verbose=4 "$app" || true
+
+      - name: Validate macOS release contract
+        shell: bash
+        run: |
+          python tools/validate_macos_release.py \
+            --version "${{ steps.ver.outputs.value }}" \
+            --out release \
+            --expected-commit "${{ github.sha }}" \
+            --expected-arch "$GA_MACOS_EXPECTED_ARCH" \
+            --expected-runner-label "$GA_MACOS_RUNNER_LABEL"
+
+      - name: Upload macOS build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-macos-${{ steps.ver.outputs.value }}
+          path: |
+            release/${{ steps.ver.outputs.value }}/macos/**
+
+      - name: Publish macOS release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.ver.outputs.value }}"
+          tag="v$v"
+          required=(
+            "release/$v/macos/GenericAgentLauncher-macos-$v.dmg"
+            "release/$v/macos/GenericAgentLauncher-macos-$v.sha256"
+            "release/$v/macos/README-macOS.txt"
+            "release/$v/macos/install-metadata.json"
+          )
+          for p in "${required[@]}"; do
+            if [ ! -e "$p" ]; then
+              echo "Missing release asset: $p" >&2
+              exit 1
+            fi
+          done
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "GenericAgent Launcher $tag" --notes "Automated release for $tag" || gh release view "$tag" >/dev/null 2>&1
+          fi
+          gh release upload "$tag" \
+            "release/$v/macos/GenericAgentLauncher-macos-$v.dmg" \
+            "release/$v/macos/GenericAgentLauncher-macos-$v.sha256" \
+            "release/$v/macos/README-macOS.txt" \
+            "release/$v/macos/install-metadata.json" \
+            --clobber

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from launcher_app import core as lz
-from launcher_app.theme import C
+from launcher_app.theme import C, F
 
 PRIVATE_PYTHON_VERSION = "3.12.10"
 
@@ -105,16 +105,136 @@ def normalize_ssh_error_text(detail: str, *, context: str = "SSH 连接") -> str
     return text or f"{context}失败。"
 
 
+def runtime_context_generation(host) -> int:
+    try:
+        return int(getattr(host, "_runtime_context_generation", 0) or 0)
+    except Exception:
+        return 0
+
+
+def bump_runtime_context_generation(host) -> int:
+    token = runtime_context_generation(host) + 1
+    try:
+        setattr(host, "_runtime_context_generation", token)
+    except Exception:
+        pass
+    return token
+
+
+def capture_runtime_context(host, *, include_settings_target: bool = False) -> dict:
+    raw_agent_dir = str(getattr(host, "agent_dir", "") or "").strip()
+    agent_dir = os.path.abspath(raw_agent_dir) if raw_agent_dir else ""
+    target_token = 0
+    if include_settings_target:
+        getter = getattr(host, "_settings_target_generation", None)
+        if callable(getter):
+            try:
+                target_token = int(getter() or 0)
+            except Exception:
+                target_token = 0
+    return {
+        "agent_dir": agent_dir,
+        "runtime_generation": runtime_context_generation(host),
+        "settings_target_generation": target_token,
+    }
+
+
+def runtime_context_matches(host, context, *, include_settings_target: bool = False) -> bool:
+    if bool(getattr(host, "_closing_in_progress", False) or getattr(host, "_force_exit_requested", False)):
+        return False
+    if not isinstance(context, dict):
+        return True
+    raw_agent_dir = str(getattr(host, "agent_dir", "") or "").strip()
+    current_agent_dir = os.path.abspath(raw_agent_dir) if raw_agent_dir else ""
+    expected_agent_dir = str(context.get("agent_dir") or "").strip()
+    if os.path.normcase(current_agent_dir) != os.path.normcase(expected_agent_dir):
+        return False
+    if runtime_context_generation(host) != int(context.get("runtime_generation", 0) or 0):
+        return False
+    if include_settings_target:
+        getter = getattr(host, "_settings_target_generation", None)
+        current_target_generation = 0
+        if callable(getter):
+            try:
+                current_target_generation = int(getter() or 0)
+            except Exception:
+                current_target_generation = 0
+        if current_target_generation != int(context.get("settings_target_generation", 0) or 0):
+            return False
+    return True
+
+
+def invalidate_runtime_bound_state(
+    host,
+    *,
+    bump_runtime: bool = False,
+    bump_settings_target: bool = False,
+    clear_remote_sync_queues: bool = False,
+) -> None:
+    if bump_runtime:
+        bump_runtime_context_generation(host)
+    if bump_settings_target:
+        bumper = getattr(host, "_bump_settings_target_generation", None)
+        if callable(bumper):
+            try:
+                bumper()
+            except Exception:
+                pass
+        else:
+            try:
+                token = int(getattr(host, "_settings_target_change_token", 0) or 0) + 1
+            except Exception:
+                token = 1
+            try:
+                setattr(host, "_settings_target_change_token", token)
+            except Exception:
+                pass
+    for attr, value in (
+        ("_qt_api_remote_loading", False),
+        ("_qt_channel_remote_loading", False),
+        ("_settings_personal_remote_sync_running", False),
+        ("_settings_usage_remote_sync_running", False),
+        ("_settings_personal_remote_sync_key", ""),
+        ("_settings_personal_remote_synced_key", ""),
+        ("_settings_usage_remote_sync_key", ""),
+        ("_settings_usage_remote_synced_key", ""),
+        ("_settings_schedule_remote_reload_token", 0),
+    ):
+        if hasattr(host, attr):
+            try:
+                setattr(host, attr, value)
+            except Exception:
+                pass
+    if not clear_remote_sync_queues:
+        return
+    for attr, value in (
+        ("_remote_channel_sync_running", False),
+        ("_remote_launcher_sync_running", False),
+        ("_remote_launcher_sync_pending_force", False),
+        ("_remote_launcher_sync_pending_device_id", ""),
+        ("_remote_launcher_sync_pending_refresh", False),
+        ("_next_remote_launcher_sync_at", 0.0),
+        ("_next_remote_channel_sync_at", 0.0),
+    ):
+        if hasattr(host, attr):
+            try:
+                setattr(host, attr, value)
+            except Exception:
+                pass
+
+
 def _build_md_css() -> str:
+    body_font = str(F.get("font_family") or "sans-serif")
+    mono_font = str(F.get("font_family_mono") or "monospace")
     return f"""
-body {{ color: {C['text']} !important; background: transparent !important; font-family: "Arial", "Microsoft YaHei UI", "Segoe UI", sans-serif; font-size: 13px; line-height: 1.6; font-weight: 400; }}
+body {{ color: {C['text']} !important; background: transparent !important; font-family: {body_font}; font-size: 13px; line-height: 1.6; font-weight: 400; }}
 div, p, li, span, strong, em, b, i {{ color: {C['text']} !important; background: transparent !important; }}
 h1 {{ color: {C['text']}; font-size: 20px; font-weight: 700; border-bottom: 1px solid {C['border']}; padding-bottom: 4px; margin-top: 16px; }}
 h2 {{ color: {C['text']}; font-size: 17px; font-weight: 700; border-bottom: 1px solid {C['border']}; padding-bottom: 3px; margin-top: 14px; }}
 h3 {{ color: {C['text']}; font-size: 15px; font-weight: 600; margin-top: 12px; }}
 h4, h5, h6 {{ color: {C['text_soft']}; font-size: 13px; font-weight: 600; margin-top: 10px; }}
-code {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 1px 4px; border-radius: 3px; font-family: Consolas, "Courier New", monospace; font-size: 12px; }}
-pre {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 12px; border-radius: 8px; overflow-x: auto; border: 1px solid {C['stroke_default']} !important; margin: 8px 0; white-space: pre; font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 12px; line-height: 1.45; }}
+code {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 1px 4px; border-radius: 3px; font-family: {mono_font}; font-size: 12px; }}
+pre {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 12px; border-radius: 8px; overflow-x: auto; border: 1px solid {C['stroke_default']} !important; margin: 8px 0; white-space: pre; font-family: {mono_font}; font-size: 12px; line-height: 1.45; }}
 pre code {{ background: transparent; padding: 0; border-radius: 0; white-space: pre; }}
 blockquote {{ border-left: 3px solid {C['accent']}; margin: 8px 0; padding: 6px 10px; color: {C['text_soft']} !important; background: {C['layer1']} !important; }}
 a {{ color: {C['accent']}; text-decoration: none; }}
@@ -621,7 +741,7 @@ class MessageRow(QWidget):
             self._token_label.setObjectName("msgTokenLabel")
             self._token_label.setStyleSheet(
                 f"QLabel#msgTokenLabel {{ color: {C['muted']}; font-size: 11px; "
-                f"font-family: Consolas, 'Cascadia Mono', 'Microsoft YaHei UI'; }}"
+                f"font-family: {F['font_family_mono']}; }}"
             )
             self._token_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self._token_label.hide()
