@@ -645,6 +645,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
             patched = {
                 "APP_DIR": version_dir,
+                "IS_WINDOWS": True,
                 "PROGRAMS_ROOT": install_root,
                 "DATA_ROOT": data_root,
                 "CONFIG_PATH": os.path.join(data_root, "config", "launcher_config.json"),
@@ -1440,7 +1441,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             _trigger_settings_remote_session_sync = PersonalUsageMixin._trigger_settings_remote_session_sync
 
             def __init__(self):
-                self.agent_dir = "C:\\demo"
+                self.agent_dir = "C:\\demo" if os.name == "nt" else os.path.join(os.sep, "tmp", "demo")
                 self._runtime_context_generation = 4
                 self._settings_target_change_token = 9
                 self.calls = []
@@ -1468,9 +1469,10 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
         launcher_call = next(payload for name, payload in dummy.calls if name == "launcher")
         channel_call = next(payload for name, payload in dummy.calls if name == "channel")
-        self.assertEqual(launcher_call["agent_dir"], "C:\\demo")
-        self.assertEqual(channel_call["agent_dir"], "C:\\demo")
-        self.assertEqual(launcher_call["runtime_context"]["agent_dir"], "C:\\demo")
+        expected_agent_dir = os.path.abspath(dummy.agent_dir)
+        self.assertEqual(launcher_call["agent_dir"], expected_agent_dir)
+        self.assertEqual(channel_call["agent_dir"], expected_agent_dir)
+        self.assertEqual(launcher_call["runtime_context"]["agent_dir"], expected_agent_dir)
         self.assertEqual(launcher_call["runtime_context"]["runtime_generation"], 4)
         self.assertEqual(launcher_call["runtime_context"]["settings_target_generation"], 9)
         self.assertIn(("done", {}), dummy.calls)
@@ -1490,6 +1492,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=False if os.name == "nt" else True,
         )
         try:
             child_line = str(proc.stdout.readline() if proc.stdout is not None else "").strip()
@@ -1591,14 +1594,17 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             bootstrap_exe = os.path.join(td, "LauncherBootstrap.exe")
             app_dir = os.path.join(td, "GenericAgentLauncher")
-            app_exe = os.path.join(app_dir, "GenericAgentLauncher.exe")
+            main_exe_name = "GenericAgentLauncher.exe"
+            app_exe = os.path.join(app_dir, main_exe_name)
             os.makedirs(app_dir, exist_ok=True)
             with open(bootstrap_exe, "wb") as f:
                 f.write(b"bootstrap")
             with open(app_exe, "wb") as f:
                 f.write(b"main")
 
-            with mock.patch.object(launcher_bootstrap, "load_version_state", return_value={}), mock.patch.object(
+            with mock.patch.object(launcher_bootstrap, "MAIN_EXE_NAME", main_exe_name), mock.patch.object(
+                launcher_bootstrap, "load_version_state", return_value={}
+            ), mock.patch.object(
                 launcher_bootstrap, "resolved_versions_dir", return_value=os.path.join(td, "missing_versions")
             ), mock.patch.object(launcher_bootstrap.sys, "frozen", True, create=True), mock.patch.object(
                 launcher_bootstrap.sys, "executable", bootstrap_exe
@@ -5798,13 +5804,16 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             versions_dir = os.path.join(td, "app", "versions")
             os.makedirs(os.path.join(versions_dir, "1.9.9"), exist_ok=True)
             os.makedirs(os.path.join(versions_dir, "1.10.0"), exist_ok=True)
-            older_exe = os.path.join(versions_dir, "1.9.9", "GenericAgentLauncher.exe")
-            newer_exe = os.path.join(versions_dir, "1.10.0", "GenericAgentLauncher.exe")
+            main_exe_name = "GenericAgentLauncher.exe"
+            older_exe = os.path.join(versions_dir, "1.9.9", main_exe_name)
+            newer_exe = os.path.join(versions_dir, "1.10.0", main_exe_name)
             for path in (older_exe, newer_exe):
                 with open(path, "wb") as f:
                     f.write(b"main")
 
-            with mock.patch.object(launcher_bootstrap, "load_version_state", return_value={}), mock.patch.object(
+            with mock.patch.object(launcher_bootstrap, "MAIN_EXE_NAME", main_exe_name), mock.patch.object(
+                launcher_bootstrap, "load_version_state", return_value={}
+            ), mock.patch.object(
                 launcher_bootstrap, "resolved_versions_dir", return_value=versions_dir
             ), mock.patch.object(launcher_bootstrap, "set_current_version") as set_current:
                 picked = launcher_bootstrap._pick_target_executable()
