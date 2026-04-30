@@ -3,7 +3,17 @@ import os
 
 from PyInstaller.utils.hooks import collect_data_files
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _resolve_root_dir():
+    spec_path = globals().get("__file__") or globals().get("SPEC")
+    if spec_path:
+        return os.path.dirname(os.path.abspath(spec_path))
+
+    fallback_spec_path = os.path.abspath(os.path.join(os.getcwd(), "GenericAgentLauncher.mac.spec"))
+    return os.path.dirname(fallback_spec_path)
+
+
+ROOT_DIR = _resolve_root_dir()
 LAUNCHER_SCRIPT = os.path.join(ROOT_DIR, "launcher.py")
 BRIDGE_PATH = os.path.join(ROOT_DIR, "bridge.py")
 HOOKS_DIR = os.path.join(ROOT_DIR, "hooks")

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import types
 import os
 import re
+import sys
 import tempfile
 import time
 import unittest
@@ -2180,13 +2182,51 @@ tg_bot_token = '123'
             src = f.read()
         self.assertIn("BUNDLE(", src)
         self.assertIn("GenericAgent Launcher.app", src)
-        self.assertIn('ROOT_DIR = os.path.dirname(os.path.abspath(__file__))', src)
         self.assertIn('APP_ICON_SVG_PATH = os.path.join(ROOT_DIR, "assets", "launcher_app_icon.svg")', src)
         self.assertIn("(APP_ICON_SVG_PATH, \"assets\")", src)
         self.assertIn("LAUNCHER_SCRIPT = os.path.join(ROOT_DIR, \"launcher.py\")", src)
         self.assertIn("hookspath=[HOOKS_DIR]", src)
         self.assertIn("MACOS_ICON_PATH", src)
         self.assertIn("icon=MACOS_ICON_PATH if os.path.isfile(MACOS_ICON_PATH) else None", src)
+
+        def _collect_data_files(_package, subdir=None):
+            return [(f"stub:{subdir}", subdir or ".")]
+
+        class _AnalysisResult:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.pure = ["pure"]
+                self.scripts = ["script"]
+                self.binaries = ["binary"]
+                self.datas = ["data"]
+
+        pyinstaller_hooks_module = types.ModuleType("PyInstaller.utils.hooks")
+        pyinstaller_hooks_module.collect_data_files = _collect_data_files
+        namespace_base = {
+            "__builtins__": __builtins__,
+            "Analysis": _AnalysisResult,
+            "PYZ": lambda *args, **kwargs: ("PYZ", args, kwargs),
+            "EXE": lambda *args, **kwargs: ("EXE", args, kwargs),
+            "COLLECT": lambda *args, **kwargs: ("COLLECT", args, kwargs),
+            "BUNDLE": lambda *args, **kwargs: ("BUNDLE", args, kwargs),
+        }
+
+        with mock.patch.dict(sys.modules, {"PyInstaller.utils.hooks": pyinstaller_hooks_module}):
+            namespace = dict(namespace_base, __file__=path)
+            exec(compile(src, path, "exec"), namespace)
+            self.assertEqual(namespace["ROOT_DIR"], root)
+            self.assertEqual(namespace["LAUNCHER_SCRIPT"], os.path.join(root, "launcher.py"))
+            self.assertEqual(namespace["HOOKS_DIR"], os.path.join(root, "hooks"))
+
+            namespace = dict(namespace_base, SPEC=path)
+            exec(compile(src, path, "exec"), namespace)
+            self.assertEqual(namespace["ROOT_DIR"], root)
+
+            with mock.patch("os.getcwd", return_value=root):
+                namespace = dict(namespace_base)
+                exec(compile(src, path, "exec"), namespace)
+            self.assertEqual(namespace["ROOT_DIR"], root)
 
     def test_macos_build_script_creates_dmg_and_sha256(self):
         root = os.path.dirname(os.path.dirname(__file__))
