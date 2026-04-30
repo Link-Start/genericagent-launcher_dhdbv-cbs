@@ -228,6 +228,14 @@ def _write_bundle_info_plist_versions(app_path: str, version: str) -> str:
     return info_plist
 
 
+def _ad_hoc_codesign_bundle(app_path: str) -> str:
+    bundle_path = os.path.abspath(str(app_path or "").strip())
+    if not os.path.isdir(bundle_path):
+        raise SystemExit(f"app bundle not found for codesign: {bundle_path}")
+    _run(["codesign", "--force", "--deep", "--sign", "-", bundle_path])
+    return bundle_path
+
+
 def _prepare_macos_bundle_icon(root: str) -> str:
     resolved_root = os.path.abspath(str(root or os.getcwd()))
     return macos_icon_assets.build_icns(
@@ -264,6 +272,7 @@ def main() -> int:
     version_json = os.path.join(app_path, "Contents", "MacOS", "version.json")
     _write_json(version_json, version_meta)
     _write_bundle_info_plist_versions(app_path, version)
+    _ad_hoc_codesign_bundle(app_path)
 
     macos_dir = os.path.join(out_root, version, "macos")
     os.makedirs(macos_dir, exist_ok=True)

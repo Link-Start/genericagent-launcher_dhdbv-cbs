@@ -138,6 +138,23 @@ class BuildMacOSReleaseTests(unittest.TestCase):
             self.assertEqual(payload["CFBundleShortVersionString"], "2.3.4")
             self.assertEqual(payload["CFBundleVersion"], "2.3.4")
 
+    def test_ad_hoc_codesign_bundle_reapplies_signature_after_bundle_mutation(self):
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = os.path.join(td, "GenericAgent Launcher.app")
+            os.makedirs(app_dir, exist_ok=True)
+            with mock.patch.object(self.mod, "_run", return_value=mock.Mock()) as run:
+                signed = self.mod._ad_hoc_codesign_bundle(app_dir)
+            expected = os.path.abspath(app_dir)
+            self.assertEqual(signed, expected)
+            run.assert_called_once_with(["codesign", "--force", "--deep", "--sign", "-", expected])
+
+    def test_ad_hoc_codesign_bundle_requires_existing_app_bundle(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "Missing.app")
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod._ad_hoc_codesign_bundle(missing)
+        self.assertIn("app bundle not found for codesign", str(ctx.exception))
+
     def test_resolve_path_anchors_relative_paths_to_repo_root(self):
         with tempfile.TemporaryDirectory() as td:
             root = os.path.join(td, "repo")
