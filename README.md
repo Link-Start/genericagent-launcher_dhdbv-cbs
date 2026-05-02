@@ -263,6 +263,12 @@ tools/build_macos_release.py       macOS release bundle 生成脚本
 - 使用交流和方向讨论更适合提 `Discussions`
 - 想直接提交代码，请先看 [Contributing](CONTRIBUTING.md)
 
+## 社区友链
+
+本项目目前也在这个社区持续推广和交流：
+
+- [LINUX DO](https://linux.do)
+
 ## 致谢
 
 感谢 [GenericAgent 原作者 lsdefine](https://github.com/lsdefine/GenericAgent)。
