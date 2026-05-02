@@ -24,7 +24,6 @@ from qt_chat_parts import channel_runtime
 from qt_chat_parts import personal_usage
 from qt_chat_parts import schedule_runtime
 from qt_chat_parts import settings_panel
-from qt_chat_parts import session_shell
 from qt_chat_parts import sidebar_sessions
 from qt_chat_parts.downloads import DownloadMixin
 from qt_chat_parts.navigation import NavigationMixin
@@ -2235,30 +2234,56 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
             self.assertEqual(picked, "")
 
-    def test_navigation_quick_enter_only_skips_dependency_check_with_fresh_cache(self):
+    def test_navigation_quick_enter_always_skips_dependency_check(self):
         class DummyNav(NavigationMixin):
             def __init__(self):
                 self.calls = []
-                self._last_dependency_check = {}
-
-            def _dependency_check_cache_key(self, extra_packages=None):
-                extras = tuple(extra_packages or [])
-                return ("demo", extras)
 
             def _enter_chat(self, *, skip_dependency_check=False):
                 self.calls.append(bool(skip_dependency_check))
 
         dummy = DummyNav()
         dummy._quick_enter_chat()
-        self.assertEqual(dummy.calls[-1], False)
-
-        dummy._last_dependency_check = {"ok": True, "extra_packages": [], "key": ("stale", ())}
-        dummy._quick_enter_chat()
-        self.assertEqual(dummy.calls[-1], False)
-
-        dummy._last_dependency_check = {"ok": True, "extra_packages": [], "key": ("demo", ())}
-        dummy._quick_enter_chat()
         self.assertEqual(dummy.calls[-1], True)
+
+    def test_navigation_regular_enter_still_checks_dependencies(self):
+        class DummyNav(NavigationMixin):
+            _enter_chat = NavigationMixin._enter_chat
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.current_session = None
+                self.calls = []
+
+            def _check_runtime_dependencies(self, purpose=""):
+                self.calls.append(("check_dependencies", purpose))
+                return False
+
+            def _show_chat_page(self):
+                self.calls.append("show_chat")
+
+            def _refresh_sessions(self):
+                self.calls.append("refresh_sessions")
+
+            def _render_session(self, session):
+                self.calls.append(("render_session", session))
+
+            def _reset_chat_area(self, text):
+                self.calls.append(("reset_chat_area", text))
+
+            def _defer_chat_runtime_bootstrap(self):
+                self.calls.append("bootstrap")
+
+            def _show_locate(self):
+                self.calls.append("show_locate")
+
+        dummy = DummyNav()
+        with mock.patch.object(lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            lz, "_ensure_mykey_file", return_value={"ok": True, "created": False}
+        ):
+            dummy._enter_chat()
+
+        self.assertEqual(dummy.calls, [("check_dependencies", "载入内核")])
 
     def test_refresh_welcome_state_sets_enter_chat_button_tooltip(self):
         class DummyButton:
@@ -4670,7 +4695,7 @@ native_oai_config2 = {
         self.assertEqual(failed_dummy.settings_channels_save_btn.tooltip, "当前状态不可保存通讯配置。")
         self.assertEqual(failed_dummy.settings_channels_refresh_btn.tooltip, "重新读取当前目标的通讯配置。")
 
-    def test_show_settings_category_forces_live_reload_for_dynamic_pages(self):
+    def test_show_settings_category_reloads_dynamic_or_target_pages_and_skips_cached_local_pages(self):
         class DummyStack:
             def __init__(self):
                 self.current = None
@@ -4686,10 +4711,30 @@ native_oai_config2 = {
                 self.styles.append(style)
 
         class DummySettings(SettingsPanelMixin):
+            _show_settings_category = SettingsPanelMixin._show_settings_category
+            _settings_category_needs_live_reload = SettingsPanelMixin._settings_category_needs_live_reload
+            _settings_category_refreshes_target_combo = SettingsPanelMixin._settings_category_refreshes_target_combo
+            _settings_should_reload_on_switch = SettingsPanelMixin._settings_should_reload_on_switch
+            _settings_category_scope_mode = SettingsPanelMixin._settings_category_scope_mode
+            _settings_category_uses_target_switch = SettingsPanelMixin._settings_category_uses_target_switch
+
             def __init__(self):
                 self.settings_stack = DummyStack()
-                self._settings_pages = {"channels": {"widget": object()}, "vps": {"widget": object()}, "api": {"widget": object()}}
-                self._settings_nav_buttons = {"channels": DummyButton(), "vps": DummyButton(), "api": DummyButton()}
+                self._settings_pages = {
+                    "channels": {"widget": object()},
+                    "vps": {"widget": object()},
+                    "api": {"widget": object()},
+                    "theme": {"widget": object()},
+                    "about": {"widget": object()},
+                }
+                self._settings_nav_buttons = {
+                    "channels": DummyButton(),
+                    "vps": DummyButton(),
+                    "api": DummyButton(),
+                    "theme": DummyButton(),
+                    "about": DummyButton(),
+                }
+                self._settings_loaded_categories = {"vps", "theme", "about"}
                 self.calls = []
 
             def _refresh_settings_target_visibility(self, key):
@@ -4705,17 +4750,167 @@ native_oai_config2 = {
             def _settings_reload(self, *, categories=None, force=False):
                 self.calls.append(("reload", list(categories or []), bool(force)))
 
+            def _refresh_settings_status_label(self, key=None):
+                self.calls.append(("status", key))
+
         dummy = DummySettings()
-        dummy._show_settings_category("channels", reload=True)
-        self.assertIn(("reload", ["channels"], True), dummy.calls)
+        with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
+            dummy._show_settings_category("channels", reload=True)
+        self.assertIn(("reload", ["channels"], False), dummy.calls)
 
         dummy.calls.clear()
-        dummy._show_settings_category("vps", reload=True)
-        self.assertIn(("reload", ["vps"], True), dummy.calls)
-
-        dummy.calls.clear()
-        dummy._show_settings_category("api", reload=True)
+        with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
+            dummy._show_settings_category("api", reload=True)
         self.assertIn(("reload", ["api"], False), dummy.calls)
+
+        dummy.calls.clear()
+        with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
+            dummy._show_settings_category("vps", reload=True)
+        self.assertNotIn(("reload", ["vps"], False), dummy.calls)
+        self.assertIn(("status", "vps"), dummy.calls)
+
+        dummy.calls.clear()
+        with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
+            dummy._show_settings_category("theme", reload=True)
+        self.assertNotIn(("reload", ["theme"], False), dummy.calls)
+        self.assertIn(("status", "theme"), dummy.calls)
+
+    def test_settings_reload_skips_target_combo_refresh_for_local_only_categories(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, value):
+                self.text = str(value or "")
+
+        class DummySettings(SettingsPanelMixin):
+            _settings_reload = SettingsPanelMixin._settings_reload
+            _refresh_settings_status_label = SettingsPanelMixin._refresh_settings_status_label
+            _settings_category_refreshes_target_combo = SettingsPanelMixin._settings_category_refreshes_target_combo
+            _settings_category_scope_mode = SettingsPanelMixin._settings_category_scope_mode
+            _settings_category_uses_target_switch = SettingsPanelMixin._settings_category_uses_target_switch
+
+            def __init__(self):
+                self.cfg = {}
+                self.agent_dir = ""
+                self._current_settings_category = "theme"
+                self._settings_loaded_categories = set()
+                self.settings_status_label = DummyLabel()
+                self.calls = []
+
+            def _normalize_settings_target(self, raw):
+                data = dict(raw or {})
+                scope = str(data.get("scope") or "local").strip().lower()
+                if scope != "remote":
+                    scope = "local"
+                device_id = str(data.get("device_id") or "local").strip() or "local"
+                if scope == "local":
+                    device_id = "local"
+                return {"scope": scope, "device_id": device_id}
+
+            def _settings_target_context(self):
+                return {"is_remote": False, "label": "本机目录"}
+
+            def _refresh_settings_target_combo(self, *, force=False):
+                self.calls.append(("refresh_target_combo", bool(force)))
+
+            def _reload_api_editor_state(self):
+                self.calls.append("reload_api")
+
+            def _reload_channels_editor_state(self):
+                self.calls.append("reload_channels")
+
+            def _reload_vps_panel(self):
+                self.calls.append("reload_vps")
+
+            def _reload_schedule_panel(self):
+                self.calls.append("reload_schedule")
+
+            def _reload_personal_panel(self):
+                self.calls.append("reload_personal")
+
+            def _reload_theme_panel(self):
+                self.calls.append("reload_theme")
+
+            def _reload_usage_panel(self):
+                self.calls.append("reload_usage")
+
+            def _reload_about_panel(self):
+                self.calls.append("reload_about")
+
+        dummy = DummySettings()
+        dummy._settings_reload(categories=["theme"], force=False)
+
+        self.assertNotIn(("refresh_target_combo", False), dummy.calls)
+        self.assertIn("reload_theme", dummy.calls)
+        self.assertEqual(dummy.settings_status_label.text, "当前页为启动器本机设置，不需要切换目标设备。")
+
+        dummy.calls.clear()
+        dummy._current_settings_category = "api"
+        dummy._settings_reload(categories=["api"], force=False)
+        self.assertIn(("refresh_target_combo", False), dummy.calls)
+
+    def test_complete_orb_drag_release_skips_snap_and_save_for_clicks(self):
+        class DummyOrb:
+            _complete_orb_drag_release = launcher_window.FloatingOrbWindow._complete_orb_drag_release
+
+            def __init__(self, moved):
+                self.calls = []
+                self._drag_moved = bool(moved)
+                self._orb_pressed = True
+                self._host = types.SimpleNamespace(
+                    _save_floating_orb_position=lambda pos: self.calls.append(("save", pos.x(), pos.y()))
+                )
+
+            def _snap_to_edge(self):
+                self.calls.append("snap")
+
+            def pos(self):
+                return launcher_window.QPoint(40, 60)
+
+            def update(self):
+                self.calls.append("update")
+
+            def toggle_panel(self):
+                self.calls.append("toggle")
+
+        dummy = DummyOrb(moved=False)
+        was_click = dummy._complete_orb_drag_release(toggle_on_click=True, refresh_orb=True)
+
+        self.assertTrue(was_click)
+        self.assertEqual(dummy.calls, ["update", "toggle"])
+        self.assertFalse(dummy._orb_pressed)
+
+    def test_complete_orb_drag_release_persists_only_after_real_drag(self):
+        class DummyOrb:
+            _complete_orb_drag_release = launcher_window.FloatingOrbWindow._complete_orb_drag_release
+
+            def __init__(self, moved):
+                self.calls = []
+                self._drag_moved = bool(moved)
+                self._orb_pressed = True
+                self._host = types.SimpleNamespace(
+                    _save_floating_orb_position=lambda pos: self.calls.append(("save", pos.x(), pos.y()))
+                )
+
+            def _snap_to_edge(self):
+                self.calls.append("snap")
+
+            def pos(self):
+                return launcher_window.QPoint(40, 60)
+
+            def update(self):
+                self.calls.append("update")
+
+            def toggle_panel(self):
+                self.calls.append("toggle")
+
+        dummy = DummyOrb(moved=True)
+        was_click = dummy._complete_orb_drag_release(toggle_on_click=True, refresh_orb=True)
+
+        self.assertFalse(was_click)
+        self.assertEqual(dummy.calls, ["snap", ("save", 40, 60), "update"])
+        self.assertFalse(dummy._orb_pressed)
 
     def test_vps_disabled_reason_helpers_cover_connection_and_deploy_prerequisites(self):
         class DummySettings(SettingsPanelMixin):

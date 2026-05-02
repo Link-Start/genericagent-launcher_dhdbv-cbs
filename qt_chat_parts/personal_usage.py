@@ -3692,9 +3692,39 @@ class PersonalUsageMixin:
         if not lz.is_valid_agent_dir(self.agent_dir):
             self.settings_usage_notice.setText("请先选择有效的 GenericAgent 目录。")
             return
+        context = capture_runtime_context(self, include_settings_target=True)
+        self._settings_usage_local_loading = True
+        self.settings_usage_notice.setText(f"正在整理 {target['label']} 的使用日志、渠道分布与最近活动…")
+        loading = QLabel("正在后台整理当前设备的使用统计，页面准备好后会自动刷新。")
+        loading.setWordWrap(True)
+        loading.setObjectName("mutedText")
+        self.settings_usage_list_layout.addWidget(loading)
 
-        stats = self._collect_usage_stats(lookback_days=7, device_scope=target["scope"], device_id=target["device_id"])
-        langfuse = self._load_langfuse_status()
+        def worker():
+            stats = self._collect_usage_stats(lookback_days=7, device_scope=target["scope"], device_id=target["device_id"])
+            langfuse = self._load_langfuse_status()
+
+            def done():
+                if not runtime_context_matches(self, context, include_settings_target=True):
+                    if getattr(self, "_settings_usage_local_loading_context", None) == context:
+                        self._settings_usage_local_loading = False
+                        self._settings_usage_local_loading_context = None
+                    return
+                self._settings_usage_local_loading = False
+                self._settings_usage_local_loading_context = None
+                self._clear_layout(self.settings_usage_list_layout)
+                self._render_usage_panel_content(stats, target, langfuse)
+
+            poster = getattr(self, "_api_on_ui_thread", None)
+            if callable(poster):
+                poster(done)
+            else:
+                QTimer.singleShot(0, done)
+
+        self._settings_usage_local_loading_context = context
+        threading.Thread(target=worker, name="settings-usage-local-load", daemon=True).start()
+
+    def _render_usage_panel_content(self, stats, target, langfuse):
         self.settings_usage_notice.setText(
             f"当前展示目标：{target['label']}。本页优先展示该设备的 usage 摘要、渠道分布和最近活动；旧会话或不返回 usage 的渠道，仍可能只能显示估算。"
         )

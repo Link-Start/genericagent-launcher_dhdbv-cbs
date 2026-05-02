@@ -2043,7 +2043,15 @@ class ChannelRuntimeMixin:
             except Exception:
                 pass
 
-    def _refresh_channels_runtime_status_labels(self):
+    def _refresh_channels_runtime_status_labels(self, *, force=False):
+        if not force:
+            visible_checker = getattr(self, "_settings_category_is_visible", None)
+            if callable(visible_checker):
+                try:
+                    if not bool(visible_checker("channels")):
+                        return
+                except Exception:
+                    pass
         target_ctx_getter = getattr(self, "_settings_target_context", None)
         target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
         is_remote_target = bool((target_ctx or {}).get("is_remote"))

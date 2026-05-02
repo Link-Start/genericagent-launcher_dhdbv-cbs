@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 1.2.3)"
-        required: true
+        description: "Optional release version; if provided it must match release/VERSION"
+        required: false
         type: string
   push:
     tags:
@@ -26,13 +26,22 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = "${{ github.event.inputs.version }}"
-          if (-not $v) {
+          $v = ""
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $v = "${{ github.event.inputs.version }}"
+          } elseif ("${{ github.ref }}" -like "refs/tags/*") {
             $ref = "${{ github.ref_name }}"
             if ($ref.StartsWith("v")) { $v = $ref.Substring(1) } else { $v = $ref }
           }
-          if (-not $v) { throw "Unable to resolve release version" }
-          "value=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($v) {
+            $resolved = python tools/resolve_release_version.py --expected "$v" --expected-label "release trigger version"
+          } else {
+            $resolved = python tools/resolve_release_version.py
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Unable to resolve release version" }
+          $resolved = "$resolved".Trim()
+          if (-not $resolved) { throw "Unable to resolve release version" }
+          "value=$resolved" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -138,8 +147,10 @@ jobs:
         id: ver
         shell: bash
         run: |
-          v="${{ github.event.inputs.version }}"
-          if [ -z "$v" ]; then
+          v=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             ref="${{ github.ref_name }}"
             if [[ "$ref" == v* ]]; then
               v="${ref#v}"
@@ -147,11 +158,21 @@ jobs:
               v="$ref"
             fi
           fi
-          if [ -z "$v" ]; then
+          if [ -n "$v" ]; then
+            resolved="$(python tools/resolve_release_version.py --expected "$v" --expected-label "release trigger version")"
+          else
+            resolved="$(python tools/resolve_release_version.py)"
+          fi
+          if [ $? -ne 0 ]; then
             echo "Unable to resolve release version" >&2
             exit 1
           fi
-          echo "value=$v" >> "$GITHUB_OUTPUT"
+          resolved="$(printf '%s' "$resolved" | tr -d '\r\n')"
+          if [ -z "$resolved" ]; then
+            echo "Unable to resolve release version" >&2
+            exit 1
+          fi
+          echo "value=$resolved" >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5

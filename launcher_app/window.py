@@ -879,12 +879,7 @@ class FloatingOrbWindow(QWidget):
                 return True
             if et == QEvent.MouseButtonRelease and self._drag_active and event.button() == Qt.LeftButton:
                 self._drag_active = False
-                self._snap_to_edge()
-                saver = getattr(self._host, "_save_floating_orb_position", None)
-                if callable(saver):
-                    saver(self.pos())
-                if watched is self.ball_btn and not self._drag_moved:
-                    self.toggle_panel()
+                self._complete_orb_drag_release(toggle_on_click=(watched is self.ball_btn))
                 return True
         return super().eventFilter(watched, event)
 
@@ -941,21 +936,27 @@ class FloatingOrbWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if not self._expanded and self._drag_active and event.button() == Qt.LeftButton:
             self._drag_active = False
-            was_click = not self._drag_moved
-            self._orb_pressed = False
-            self._snap_to_edge()
-            saver = getattr(self._host, "_save_floating_orb_position", None)
-            if callable(saver):
-                saver(self.pos())
-            self.update()
-            if was_click:
-                self.toggle_panel()
+            self._complete_orb_drag_release(toggle_on_click=True, refresh_orb=True)
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
+
+    def _complete_orb_drag_release(self, *, toggle_on_click: bool = False, refresh_orb: bool = False):
+        was_click = not self._drag_moved
+        self._orb_pressed = False
+        if self._drag_moved:
+            self._snap_to_edge()
+            saver = getattr(self._host, "_save_floating_orb_position", None)
+            if callable(saver):
+                saver(self.pos())
+        if refresh_orb:
+            self.update()
+        if toggle_on_click and was_click:
+            self.toggle_panel()
+        return was_click
 
     def _snap_to_edge(self):
         rect = self._available_geometry()
@@ -2314,6 +2315,11 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         refresher = getattr(win, "refresh_action_texts", None)
         if callable(refresher):
             refresher()
+        visible_getter = getattr(win, "isVisible", None)
+        visible = True if not callable(visible_getter) else bool(visible_getter())
+        if not visible:
+            self._refresh_launcher_tray_menu()
+            return
         disabled = self._is_channel_process_session()
         status = str(getattr(self, "status_label", None).text() if getattr(self, "status_label", None) is not None else "").strip()
         if not status:
@@ -2336,8 +2342,9 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 read_only=disabled,
             )
             self._sync_floating_llm_combo()
-            self._sync_floating_session_list()
-            self._sync_draft_to_floating()
+            if not self._busy:
+                self._sync_floating_session_list()
+                self._sync_draft_to_floating()
         else:
             win.sync_view(
                 title=self._floating_chat_title(),

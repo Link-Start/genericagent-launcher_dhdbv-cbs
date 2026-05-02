@@ -51,13 +51,7 @@ class NavigationMixin:
         QTimer.singleShot(160, self, run)
 
     def _can_skip_dependency_check_on_quick_enter(self):
-        report = getattr(self, "_last_dependency_check", None) or {}
-        if not report or (not report.get("ok")):
-            return False
-        checker = getattr(self, "_dependency_check_cache_key", None)
-        if not callable(checker):
-            return False
-        return report.get("key") == checker(report.get("extra_packages") or [])
+        return True
 
     def _quick_enter_chat(self):
         self._enter_chat(skip_dependency_check=self._can_skip_dependency_check_on_quick_enter())

@@ -641,6 +641,28 @@ class SidebarSessionsMixin:
         except Exception:
             pass
 
+    def _queue_session_refresh(self, *, delay_ms: int = 60, invalidate_signature: bool = True):
+        if invalidate_signature:
+            self._last_session_list_signature = None
+        if bool(getattr(self, "_session_refresh_queued", False)):
+            return
+        self._session_refresh_queued = True
+
+        def run():
+            self._session_refresh_queued = False
+            if bool(getattr(self, "_closing_in_progress", False)):
+                return
+            self._refresh_sessions()
+
+        delay = max(0, int(delay_ms or 0))
+        try:
+            QTimer.singleShot(delay, self, run)
+        except Exception:
+            try:
+                QTimer.singleShot(delay, run)
+            except Exception:
+                self._session_refresh_queued = False
+
     def _should_refresh_remote_sync_ui(self):
         mode = str(getattr(self, "_sidebar_view_mode", "roots") or "roots").strip().lower()
         if mode == "remote_devices":
@@ -696,8 +718,7 @@ class SidebarSessionsMixin:
                     return
                 self._remote_launcher_sync_running = False
                 if changed and req_refresh and self._should_refresh_remote_sync_ui():
-                    self._last_session_list_signature = None
-                    self._refresh_sessions()
+                    self._queue_session_refresh()
                 pending_force = bool(getattr(self, "_remote_launcher_sync_pending_force", False))
                 pending_device_id = str(getattr(self, "_remote_launcher_sync_pending_device_id", "") or "").strip()
                 pending_refresh = bool(getattr(self, "_remote_launcher_sync_pending_refresh", False))
@@ -1258,8 +1279,7 @@ class SidebarSessionsMixin:
                     return
                 self._remote_channel_sync_running = False
                 if changed and self._should_refresh_remote_sync_ui():
-                    self._last_session_list_signature = None
-                    self._refresh_sessions()
+                    self._queue_session_refresh()
                 if changed:
                     refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
                     if callable(refresher):

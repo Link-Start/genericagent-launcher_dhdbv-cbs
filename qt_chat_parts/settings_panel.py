@@ -338,10 +338,65 @@ class _StablePopupComboBox(QComboBox):
 
 
 class SettingsPanelMixin:
-    _SETTINGS_LIVE_RELOAD_CATEGORIES = frozenset({"channels", "vps", "schedule", "personal", "usage", "about"})
+    _SETTINGS_LIVE_RELOAD_CATEGORIES = frozenset({"channels", "schedule", "personal", "usage"})
+    _SETTINGS_LIVE_RELOAD_MIN_INTERVAL_SECONDS = 4.0
+    _SETTINGS_SWITCH_RELOAD_DELAY_MS = 24
 
     def _settings_category_needs_live_reload(self, key: str) -> bool:
         return str(key or "").strip().lower() in self._SETTINGS_LIVE_RELOAD_CATEGORIES
+
+    def _settings_category_refreshes_target_combo(self, key: str) -> bool:
+        category = str(key or "").strip().lower()
+        return category == "personal" or self._settings_category_uses_target_switch(category)
+
+    def _mark_settings_category_reloaded(self, key: str) -> None:
+        category = str(key or "").strip().lower()
+        if not self._settings_category_needs_live_reload(category):
+            return
+        stamps = getattr(self, "_settings_live_reload_stamps", None)
+        if not isinstance(stamps, dict):
+            stamps = {}
+            self._settings_live_reload_stamps = stamps
+        stamps[category] = float(time.time())
+
+    def _settings_category_allows_live_reload(self, key: str) -> bool:
+        category = str(key or "").strip().lower()
+        if not self._settings_category_needs_live_reload(category):
+            return False
+        if category in {"channels", "schedule"}:
+            target_ctx_getter = getattr(self, "_settings_target_context", None)
+            target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+            return bool((target_ctx or {}).get("is_remote"))
+        if category in {"personal", "usage"}:
+            target_getter = getattr(self, "_settings_data_target_context", None)
+            target = target_getter() if callable(target_getter) else {"is_remote": False}
+            return bool((target or {}).get("is_remote"))
+        return True
+
+    def _settings_category_should_force_live_reload(self, key: str) -> bool:
+        category = str(key or "").strip().lower()
+        if not self._settings_category_needs_live_reload(category):
+            return False
+        if not self._settings_category_allows_live_reload(category):
+            return False
+        loaded = getattr(self, "_settings_loaded_categories", None)
+        if not isinstance(loaded, set) or category not in loaded:
+            return False
+        stamps = getattr(self, "_settings_live_reload_stamps", None)
+        if not isinstance(stamps, dict):
+            return False
+        last = float(stamps.get(category, 0.0) or 0.0)
+        min_interval = float(getattr(self, "_SETTINGS_LIVE_RELOAD_MIN_INTERVAL_SECONDS", 1.2) or 1.2)
+        return (float(time.time()) - last) >= max(0.0, min_interval)
+
+    def _settings_should_reload_on_switch(self, key: str) -> bool:
+        category = str(key or "").strip().lower()
+        if self._settings_category_should_force_live_reload(category):
+            return True
+        loaded = getattr(self, "_settings_loaded_categories", None)
+        if not isinstance(loaded, set):
+            return True
+        return category not in loaded
 
     def _normalize_qss_color(self, value: str) -> str:
         text = str(value or "").strip()
@@ -551,7 +606,7 @@ class SettingsPanelMixin:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
-            scroll.setStyleSheet(f"QScrollArea {{ border: none; background: transparent; }}" + _SCROLLBAR_STYLE)
+            scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }" + _SCROLLBAR_STYLE)
             inner = QWidget()
             scroll.setWidget(inner)
             inner_layout = QVBoxLayout(inner)
@@ -1669,7 +1724,137 @@ class SettingsPanelMixin:
         if section is None:
             return
         category = str(key or getattr(self, "_current_settings_category", "api") or "api").strip().lower()
-        section.setVisible(self._settings_category_uses_target_switch(category))
+        visible = bool(self._settings_category_uses_target_switch(category))
+        if bool(getattr(self, "_settings_target_section_visible", True)) == visible:
+            return
+        self._settings_target_section_visible = visible
+        section.setVisible(visible)
+
+    def _settings_page_is_visible(self) -> bool:
+        pages = getattr(self, "pages", None)
+        settings_page = getattr(self, "_settings_page", None)
+        if pages is None or settings_page is None:
+            return False
+        try:
+            return pages.currentWidget() is settings_page
+        except Exception:
+            return False
+
+    def _settings_category_is_visible(self, key: str) -> bool:
+        category = str(key or "").strip().lower()
+        if not category or not self._settings_page_is_visible():
+            return False
+        if str(getattr(self, "_current_settings_category", "") or "").strip().lower() != category:
+            return False
+        stack = getattr(self, "settings_stack", None)
+        pages = getattr(self, "_settings_pages", None) or {}
+        page_info = pages.get(category) if isinstance(pages, dict) else None
+        widget = page_info.get("widget") if isinstance(page_info, dict) else None
+        if stack is None or widget is None:
+            return True
+        try:
+            return stack.currentWidget() is widget
+        except Exception:
+            return True
+
+    def _refresh_settings_category_runtime_state(self, key: str) -> None:
+        category = str(key or "").strip().lower()
+        if category == "channels":
+            refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
+            if callable(refresher):
+                try:
+                    refresher(force=True)
+                except Exception:
+                    pass
+
+    def _apply_settings_nav_selection(self, key: str) -> None:
+        category = str(key or "").strip().lower()
+        buttons = getattr(self, "_settings_nav_buttons", None) or {}
+        if not isinstance(buttons, dict):
+            return
+        previous = str(getattr(self, "_active_settings_nav_key", "") or "").strip().lower()
+        if previous == category:
+            return
+        if previous:
+            prev_btn = buttons.get(previous)
+            if prev_btn is not None:
+                try:
+                    prev_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
+                except Exception:
+                    pass
+        btn = buttons.get(category)
+        if btn is not None:
+            try:
+                btn.setStyleSheet(self._sidebar_button_style(selected=True))
+            except Exception:
+                pass
+        self._active_settings_nav_key = category
+
+    def _settings_switch_generation(self) -> int:
+        try:
+            return int(getattr(self, "_settings_switch_token", 0) or 0)
+        except Exception:
+            return 0
+
+    def _bump_settings_switch_generation(self) -> int:
+        token = self._settings_switch_generation() + 1
+        self._settings_switch_token = token
+        return token
+
+    def _schedule_settings_category_activation(self, key: str, *, reload_required: bool, force_reload: bool) -> None:
+        category = str(key or "").strip().lower()
+        token = self._bump_settings_switch_generation()
+        delay_ms = max(0, int(getattr(self, "_SETTINGS_SWITCH_RELOAD_DELAY_MS", 24) or 24))
+
+        def run():
+            if int(getattr(self, "_settings_switch_token", 0) or 0) != token:
+                return
+            if str(getattr(self, "_current_settings_category", "") or "").strip().lower() != category:
+                return
+            if reload_required:
+                self._settings_reload(categories=[category], force=force_reload)
+            else:
+                self._refresh_settings_status_label(category)
+                self._refresh_settings_category_runtime_state(category)
+
+        try:
+            QTimer.singleShot(delay_ms, self, run)
+        except Exception:
+            try:
+                QTimer.singleShot(delay_ms, run)
+            except Exception:
+                run()
+
+    def _refresh_settings_status_label(self, key: str | None = None):
+        label = getattr(self, "settings_status_label", None)
+        if label is None:
+            return
+        if not hasattr(self, "_settings_target_scope"):
+            target_cfg = self._normalize_settings_target(self.cfg.get("settings_target"))
+            self._settings_target_scope = target_cfg["scope"]
+            self._settings_target_device_id = target_cfg["device_id"]
+        current_key = str(key or getattr(self, "_current_settings_category", "api") or "api").strip().lower()
+        scope_mode = self._settings_category_scope_mode(current_key)
+        if current_key != "personal" and scope_mode != "target":
+            self.settings_status_label.setText("当前页为启动器本机设置，不需要切换目标设备。")
+            return
+        target_ctx = self._settings_target_context()
+        local_valid = lz.is_valid_agent_dir(self.agent_dir)
+        if current_key == "personal":
+            label.setText(
+                "个性设置页包含本机设置；只有“会话上限”卡片内的目标设备会跟随切换，回复提醒始终是启动器本机设置。"
+                if local_valid or bool(target_ctx.get("is_remote")) else
+                "还没有可用的 GenericAgent 目录，先在上面选择目录；会话上限目标可在卡片内单独选择。"
+            )
+        elif scope_mode == "target":
+            valid = local_valid or bool(target_ctx.get("is_remote"))
+            label.setText(
+                f"当前页支持多设备切换。设置目标：{target_ctx.get('label')}。"
+                if valid else
+                "还没有可用的 GenericAgent 目录，先在上面选择目录。"
+            )
+        else:
+            label.setText("当前页为启动器本机设置，不需要切换目标设备。")
 
     def _settings_target_generation(self) -> int:
         try:
@@ -2061,16 +2246,27 @@ class SettingsPanelMixin:
         page_info = (getattr(self, "_settings_pages", None) or {}).get(key)
         if not page_info:
             return
-        self._current_settings_category = key
-        self.settings_stack.setCurrentWidget(page_info["widget"])
-        self._refresh_settings_target_visibility(key)
-        for nav_key, btn in (getattr(self, "_settings_nav_buttons", None) or {}).items():
-            if nav_key == key:
-                btn.setStyleSheet(self._sidebar_button_style(selected=True))
-            else:
-                btn.setStyleSheet(self._sidebar_button_style(subtle=True))
+        category = str(key or "").strip().lower()
+        self._current_settings_category = category
+        stack = self.settings_stack
+        target_widget = page_info["widget"]
+        current_widget = None
+        try:
+            current_widget = stack.currentWidget()
+        except Exception:
+            current_widget = None
+        if current_widget is not target_widget:
+            stack.setCurrentWidget(target_widget)
+        self._refresh_settings_target_visibility(category)
+        self._apply_settings_nav_selection(category)
         if reload:
-            self._settings_reload(categories=[key], force=self._settings_category_needs_live_reload(key))
+            should_reload = self._settings_should_reload_on_switch(category)
+            force_reload = self._settings_category_should_force_live_reload(category)
+            self._schedule_settings_category_activation(
+                category,
+                reload_required=should_reload,
+                force_reload=force_reload,
+            )
 
     def _load_mykey_source(self):
         ok, text, display_path, err = self._settings_target_read_mykey_text()
@@ -2086,33 +2282,11 @@ class SettingsPanelMixin:
         return display_path, parsed
 
     def _settings_reload(self, *, categories=None, force=False):
-        if not hasattr(self, "settings_status_label"):
-            return
-        if not hasattr(self, "_settings_target_scope"):
-            target_cfg = self._normalize_settings_target(self.cfg.get("settings_target"))
-            self._settings_target_scope = target_cfg["scope"]
-            self._settings_target_device_id = target_cfg["device_id"]
-        self._refresh_settings_target_combo()
         current_key = str(getattr(self, "_current_settings_category", "api") or "api").strip().lower()
-        target_ctx = self._settings_target_context()
-        local_valid = lz.is_valid_agent_dir(self.agent_dir)
-        scope_mode = self._settings_category_scope_mode(current_key)
-        if current_key == "personal":
-            self.settings_status_label.setText(
-                "个性设置页包含本机设置；只有“会话上限”卡片内的目标设备会跟随切换，回复提醒始终是启动器本机设置。"
-                if local_valid or bool(target_ctx.get("is_remote")) else
-                "还没有可用的 GenericAgent 目录，先在上面选择目录；会话上限目标可在卡片内单独选择。"
-            )
-        elif scope_mode == "target":
-            valid = local_valid or bool(target_ctx.get("is_remote"))
-            self.settings_status_label.setText(
-                f"当前页支持多设备切换。设置目标：{target_ctx.get('label')}。"
-                if valid else
-                "还没有可用的 GenericAgent 目录，先在上面选择目录。"
-            )
-        else:
-            self.settings_status_label.setText("当前页为启动器本机设置，不需要切换目标设备。")
         requested = list(categories) if categories is not None else [str(getattr(self, "_current_settings_category", "api") or "api")]
+        if any(self._settings_category_refreshes_target_combo(key) for key in requested if str(key or "").strip()):
+            self._refresh_settings_target_combo(force=force)
+        self._refresh_settings_status_label(current_key)
         if not requested:
             return
         loaded = getattr(self, "_settings_loaded_categories", None)
@@ -2138,6 +2312,7 @@ class SettingsPanelMixin:
                 continue
             fn()
             loaded.add(text)
+            self._mark_settings_category_reloaded(text)
 
     def _dismiss_combo_popup(self, combo):
         if combo is None:

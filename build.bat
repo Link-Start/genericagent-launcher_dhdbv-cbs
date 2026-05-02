@@ -4,8 +4,21 @@ pushd "%~dp0"
 echo Building GenericAgent Launcher (installer architecture)...
 echo.
 
-set VERSION=%1
-if "%VERSION%"=="" set VERSION=0.0.0-local
+set "VERSION=%~1"
+set "RESOLVED_VERSION="
+if "%VERSION%"=="" (
+    for /f "usebackq delims=" %%I in (`python tools\resolve_release_version.py`) do set "RESOLVED_VERSION=%%I"
+) else (
+    for /f "usebackq delims=" %%I in (`python tools\resolve_release_version.py --expected "%VERSION%" --expected-label "build argument"`) do set "RESOLVED_VERSION=%%I"
+)
+if not defined RESOLVED_VERSION (
+    echo [ERROR] Failed to resolve release version from release\VERSION
+    pause
+    popd
+    exit /b 1
+)
+set "VERSION=%RESOLVED_VERSION%"
+echo [INFO] Canonical release version: %VERSION%
 
 python -c "import sys; print('Python:', sys.executable); print('Version:', sys.version)"
 if errorlevel 1 (

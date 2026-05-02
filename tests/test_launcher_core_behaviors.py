@@ -1379,7 +1379,7 @@ tg_bot_token = '123'
         self.assertIn("def _enter_chat(self, *, skip_dependency_check=False):", nav_src)
         self.assertIn('if (not skip_dependency_check) and (not self._check_runtime_dependencies(purpose="载入内核")):', nav_src)
 
-    def test_quick_start_only_skips_dependency_check_after_successful_cached_check(self):
+    def test_quick_start_always_skips_dependency_check(self):
         root = os.path.dirname(os.path.dirname(__file__))
         setup_path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
         with open(setup_path, "r", encoding="utf-8") as f:
@@ -1392,7 +1392,7 @@ tg_bot_token = '123'
             nav_src = f.read()
         self.assertIn("def _quick_enter_chat(self):", nav_src)
         self.assertIn("def _can_skip_dependency_check_on_quick_enter", nav_src)
-        self.assertIn('if not report or (not report.get("ok")):', nav_src)
+        self.assertIn("return True", nav_src)
         self.assertIn("self._enter_chat(skip_dependency_check=self._can_skip_dependency_check_on_quick_enter())", nav_src)
         self.assertIn("def _enter_chat(self, *, skip_dependency_check=False):", nav_src)
         self.assertIn('if (not skip_dependency_check) and (not self._check_runtime_dependencies(purpose="载入内核")):', nav_src)
@@ -1402,7 +1402,39 @@ tg_bot_token = '123'
         path = os.path.join(root, "GenericAgentLauncher.spec")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertIn("hookspath=['hooks']", src)
+        self.assertIn('HOOKS_DIR = os.path.join(ROOT_DIR, "hooks")', src)
+        self.assertIn("hookspath=[HOOKS_DIR]", src)
+
+    def test_windows_specs_embed_launcher_icon(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        paths = [
+            os.path.join(root, "GenericAgentLauncher.spec"),
+            os.path.join(root, "LauncherBootstrap.spec"),
+            os.path.join(root, "Updater.spec"),
+        ]
+        for path in paths:
+            with open(path, "r", encoding="utf-8") as f:
+                src = f.read()
+            self.assertIn('WINDOWS_ICON_PATH = os.path.join(ROOT_DIR, "assets", "launcher_app_icon.ico")', src)
+            self.assertIn("icon=WINDOWS_ICON_PATH if os.path.isfile(WINDOWS_ICON_PATH) else None", src)
+
+    def test_installer_shortcuts_set_explicit_bootstrap_icon_location(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "installer", "GenericAgentLauncher.iss")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("SetupIconFile=..\\assets\\launcher_app_icon.ico", src)
+        self.assertIn('Source: "..\\assets\\launcher_app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion', src)
+        self.assertIn('Name: "{autoprograms}\\GenericAgent Launcher"; Filename: "{app}\\LauncherBootstrap.exe"; WorkingDir: "{app}"; IconFilename: "{app}\\launcher_app_icon.ico"; IconIndex: 0', src)
+        self.assertIn('Name: "{autodesktop}\\GenericAgent Launcher"; Filename: "{app}\\LauncherBootstrap.exe"; WorkingDir: "{app}"; IconFilename: "{app}\\launcher_app_icon.ico"; IconIndex: 0; Check: WizardIsTaskSelected(\'desktopicon\') or ExistingDesktopShortcutExists()', src)
+        self.assertIn('Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce', src)
+        self.assertIn("function ExistingDesktopShortcutExists(): Boolean;", src)
+        self.assertIn("Check: WizardIsTaskSelected('desktopicon') or ExistingDesktopShortcutExists()", src)
+        self.assertIn("procedure SHChangeNotify(wEventId: Integer; uFlags: Integer; dwItem1: Integer; dwItem2: Integer);", src)
+        self.assertIn("procedure RefreshShellIcons();", src)
+        self.assertIn("if not Exec(Ie4uinitPath, '-ClearIconCache', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then", src)
+        self.assertIn("if not Exec(Ie4uinitPath, '-show', '', SW_HIDE, ewNoWait, ResultCode) then", src)
+        self.assertIn("RefreshShellIcons();", src)
 
     def test_claude_template_defaults_follow_upstream_model_names(self):
         self.assertEqual(lz.TEMPLATE_INDEX["anthropic"]["defaults"]["model"], "claude-opus-4-7[1m]")
@@ -1617,6 +1649,8 @@ tg_bot_token = '123'
         self.assertIn("Missing secret: UPDATE_SIGNING_PRIVATE_KEY_PEM", src)
         self.assertIn("Missing secret: UPDATE_SIGNING_PUBLIC_KEY_PEM", src)
         self.assertIn("gh release create $tag", src)
+        self.assertIn("tools/resolve_release_version.py", src)
+        self.assertIn("release/VERSION", src)
 
     def test_setup_page_and_navigation_expose_visual_dependency_check(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -1714,7 +1748,8 @@ tg_bot_token = '123'
         self.assertIn("def _settings_target_write_mykey_text", settings_src)
         self.assertIn("def _settings_category_scope_mode", settings_src)
         self.assertIn("def _refresh_settings_target_visibility", settings_src)
-        self.assertIn('section.setVisible(self._settings_category_uses_target_switch(category))', settings_src)
+        self.assertIn("visible = bool(self._settings_category_uses_target_switch(category))", settings_src)
+        self.assertIn("self._settings_target_section_visible = visible", settings_src)
         self.assertIn('self.settings_status_label.setText("当前页为启动器本机设置，不需要切换目标设备。")', settings_src)
         self.assertIn('f"当前页支持多设备切换。设置目标：{target_ctx.get(\'label\')}。"', settings_src)
         self.assertIn("只有“会话上限”卡片内的目标设备会跟随切换", settings_src)
@@ -1737,6 +1772,9 @@ tg_bot_token = '123'
         self.assertIn("def _defocus_settings_target_combo", settings_src)
         self.assertIn("self._settings_target_combo_signature", settings_src)
         self.assertIn("if (not force) and current_signature == signature and combo.count() == len(entries):", settings_src)
+        self.assertIn("_SETTINGS_SWITCH_RELOAD_DELAY_MS = 24", settings_src)
+        self.assertIn("if current_widget is not target_widget:", settings_src)
+        self.assertIn("QTimer.singleShot(delay_ms, self, run)", settings_src)
         self.assertIn("self._qt_api_remote_loading = False", settings_src)
         self.assertIn("self._qt_channel_remote_loading = False", settings_src)
         self.assertIn("self._settings_personal_remote_sync_running = False", settings_src)
@@ -2653,6 +2691,9 @@ tg_bot_token = '123'
         path = os.path.join(root, "build.bat")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
+        self.assertIn("tools\\resolve_release_version.py", src)
+        self.assertIn("release\\VERSION", src)
+        self.assertIn("Canonical release version", src)
         self.assertIn('set "ISCC_EXE=%INNO_ISCC%"', src)
         self.assertIn("local_keys\\update_signing_private_key.pem", src)
         self.assertIn("local_keys\\update_signing_public_key.pem", src)

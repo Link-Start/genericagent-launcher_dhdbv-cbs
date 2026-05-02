@@ -20,7 +20,8 @@
 ### 1. 选择版本号
 
 - 版本号沿用 `x.y.z`
-- tag 形式固定为 `vx.y.z`
+- 先修改仓库内唯一版本真源：`release/VERSION`
+- tag 形式固定为 `vx.y.z`，并且必须和 `release/VERSION` 一致
 
 ### 2. 本地预检查
 
@@ -41,7 +42,8 @@ python -m pytest tests -q
 两种方式都可以：
 
 - 推送 tag：`v<version>`
-- GitHub Actions `workflow_dispatch`，输入 `version`
+- GitHub Actions `workflow_dispatch`，可留空直接使用 `release/VERSION`
+- 如果 `workflow_dispatch` 手动输入 `version`，该值也必须和 `release/VERSION` 一致
 
 ### 4. CI 期望结果
 

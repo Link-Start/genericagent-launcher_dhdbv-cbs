@@ -11,24 +11,34 @@ from launcher_core_parts.update_manager import apply_update_job
 
 def _parse_args(argv):
     parser = argparse.ArgumentParser(prog="Updater", description="GenericAgent Launcher external updater")
-    parser.add_argument("--job", required=True, help="Path to update job json")
+    parser.add_argument("--job", help="Path to update job json")
     return parser.parse_args(argv)
+
+
+def _safe_stream_write(stream, text: str) -> None:
+    writer = getattr(stream, "write", None)
+    if writer is None:
+        return
+    try:
+        writer(text)
+    except Exception:
+        return
 
 
 def run(argv=None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     job_path = str(args.job or "").strip()
     if not job_path:
-        sys.stderr.write("missing --job\n")
+        _safe_stream_write(sys.stderr, "missing --job\n")
         return 2
     try:
         result = apply_update_job(job_path)
     except Exception as e:
         updater_log(f"[fatal] updater failed: {e}")
         updater_log(traceback.format_exc())
-        sys.stderr.write(str(e) + "\n")
+        _safe_stream_write(sys.stderr, str(e) + "\n")
         return 1
-    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    _safe_stream_write(sys.stdout, json.dumps(result, ensure_ascii=False) + "\n")
     return 0 if bool(result.get("ok", False)) else 3
 
 

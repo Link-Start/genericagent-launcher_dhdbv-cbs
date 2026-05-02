@@ -149,8 +149,16 @@ python launcher.py
 Windows：
 
 ```bash
-build.bat 0.1.8
+build.bat
 ```
+
+发布前先更新仓库内唯一版本真源：
+
+```text
+release/VERSION
+```
+
+本地 Windows 发包默认直接读取这个文件，不再从 tag、旧 `release/` 目录或临时输入推断版本号。如果你显式传入版本参数，传入值也必须和 `release/VERSION` 一致。
 
 正式发布不再允许 unsigned 兜底；如果没有配置更新签名密钥，`build.bat` 会直接失败，而不是继续产出空的 `manifest.sig`。
 
@@ -180,7 +188,7 @@ python tools/generate_update_signing_keypair.py
 macOS：
 
 ```bash
-python tools/build_macos_release.py --version 0.1.8 --out release
+python tools/build_macos_release.py --version "$(python tools/resolve_release_version.py)" --out release
 ```
 
 macOS 打包脚本需要在 macOS 上执行，会生成：
@@ -382,6 +390,8 @@ build.bat                          Windows 打包脚本
 GenericAgentLauncher.spec          Windows PyInstaller 打包配置
 GenericAgentLauncher.mac.spec      macOS PyInstaller 打包配置
 installer/                         Inno Setup 安装脚本
+release/VERSION                    当前发布版本真源
+tools/resolve_release_version.py   发布版本解析与一致性校验脚本
 tools/build_release_bundle.py      Windows 发布包与内部更新资产生成脚本
 tools/build_macos_release.py       macOS release bundle 生成脚本
 requirements.txt                   启动器依赖

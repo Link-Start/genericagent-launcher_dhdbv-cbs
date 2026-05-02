@@ -1463,11 +1463,8 @@ class BridgeRuntimeMixin:
         self._current_stream_text = cumulative_text or ""
         self._refresh_token_label()
         self._update_stream_row_tokens(live=True)
-        refresher = getattr(self, "_refresh_floating_chat_window", None)
-        if callable(refresher):
-            refresher()
         if not self._stream_flush_timer.isActive():
-            self._stream_flush_timer.start(70)
+            self._stream_flush_timer.start(90)
 
     def _flush_stream_render(self):
         if self._stream_row is None:
@@ -1483,6 +1480,9 @@ class BridgeRuntimeMixin:
             sync_view()
         else:
             self._scroll_to_bottom()
+        refresher = getattr(self, "_refresh_floating_chat_window", None)
+        if callable(refresher):
+            refresher()
 
     def _format_interrupted_text(self, final_text=None):
         text = (final_text or "").strip()
