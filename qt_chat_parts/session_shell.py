@@ -44,20 +44,55 @@ class SessionShellMixin:
             return "当前还没有可用的 LLM 配置。"
         return ""
 
-    def _bind_session_to_current_bridge(self, session):
+    def _composer_reasoning_effort_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅支持查看日志，不能切换思考强度。"
+        if not bool(getattr(self, "llms", None)):
+            return "当前还没有可用的 LLM 配置。"
+        return ""
+
+    def _bind_session_to_current_bridge(self, session, *, preserve_session_state=False):
         if not isinstance(session, dict):
             return
-        session["process_pid"] = getattr(self.bridge_proc, "pid", None)
-        session["llm_idx"] = int(self._current_llm_index() or 0)
         snapshot = dict(session.get("snapshot") or {})
+        current_llm_idx = int(self._current_llm_index() or 0)
+        session["process_pid"] = getattr(self.bridge_proc, "pid", None)
+        if preserve_session_state:
+            try:
+                session_llm_idx = int(session.get("llm_idx", snapshot.get("llm_idx", current_llm_idx)) or 0)
+            except Exception:
+                session_llm_idx = current_llm_idx
+        else:
+            session_llm_idx = current_llm_idx
+            session["llm_idx"] = session_llm_idx
         snapshot["version"] = int(snapshot.get("version", 1) or 1)
         snapshot["kind"] = str(snapshot.get("kind") or "turn_complete").strip() or "turn_complete"
         snapshot["captured_at"] = float(snapshot.get("captured_at", session.get("updated_at", time.time())) or time.time())
         snapshot["turns"] = int(snapshot.get("turns", ((session.get("token_usage") or {}).get("turns", 0) or 0)) or 0)
-        snapshot["llm_idx"] = int(session.get("llm_idx", 0) or 0)
+        snapshot["llm_idx"] = int(session_llm_idx or 0)
         snapshot["process_pid"] = int(session.get("process_pid", 0) or 0)
         snapshot["has_backend_history"] = bool(session.get("backend_history"))
         snapshot["has_agent_history"] = bool(session.get("agent_history"))
+        if "reasoning_effort" in session:
+            reasoning_effort = str(session.get("reasoning_effort") or "").strip().lower()
+            if reasoning_effort:
+                snapshot["reasoning_effort"] = reasoning_effort
+                snapshot["reasoning_effort_source"] = "override"
+            else:
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+        elif preserve_session_state or str(snapshot.get("reasoning_effort_source") or "").strip().lower() in {"override", "runtime"}:
+            preserved_reasoning = str(snapshot.get("reasoning_effort") or "").strip().lower()
+            if preserved_reasoning:
+                snapshot["reasoning_effort"] = preserved_reasoning
+                source = str(snapshot.get("reasoning_effort_source") or "").strip().lower()
+                snapshot["reasoning_effort_source"] = source if source in {"override", "runtime"} else "runtime"
+            else:
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+        else:
+            snapshot.pop("reasoning_effort", None)
+            snapshot.pop("reasoning_effort_source", None)
         session["snapshot"] = snapshot
 
     def _ensure_session_usage_metadata(self, session):
@@ -104,6 +139,19 @@ class SessionShellMixin:
             snapshot["process_pid"] = int(session.get("process_pid", 0) or 0)
             snapshot["has_backend_history"] = bool(session.get("backend_history"))
             snapshot["has_agent_history"] = bool(session.get("agent_history"))
+            if "reasoning_effort" in session:
+                reasoning_effort = str(session.get("reasoning_effort") or "").strip().lower()
+                if reasoning_effort:
+                    snapshot["reasoning_effort"] = reasoning_effort
+                    snapshot["reasoning_effort_source"] = "override"
+                else:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
+            else:
+                source = str(snapshot.get("reasoning_effort_source") or "").strip().lower()
+                if source not in {"override", "runtime"}:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
             session["snapshot"] = snapshot
         self._ensure_session_usage_metadata(session)
         lz.save_session(self.agent_dir, session)
@@ -292,9 +340,11 @@ class SessionShellMixin:
         send_btn = getattr(self, "send_btn", None)
         stop_btn = getattr(self, "stop_btn", None)
         llm_combo = getattr(self, "llm_combo", None)
+        reasoning_effort_combo = getattr(self, "reasoning_effort_combo", None)
         send_disabled_reason = self._composer_send_disabled_reason(disabled=disabled)
         stop_disabled_reason = self._composer_stop_disabled_reason(disabled=disabled, remote=remote)
         llm_disabled_reason = self._composer_llm_disabled_reason(disabled=disabled)
+        reasoning_disabled_reason = self._composer_reasoning_effort_disabled_reason(disabled=disabled)
         if input_box is not None:
             input_box.setReadOnly(disabled)
             input_box.setPlaceholderText(
@@ -331,9 +381,19 @@ class SessionShellMixin:
                 enabled_tooltip="切换当前会话使用的模型。",
                 disabled_tooltip=llm_disabled_reason,
             )
+        if reasoning_effort_combo is not None:
+            self._apply_composer_widget_state(
+                reasoning_effort_combo,
+                not bool(reasoning_disabled_reason),
+                enabled_tooltip="切换当前会话使用的思考强度。",
+                disabled_tooltip=reasoning_disabled_reason,
+            )
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
         if callable(floating_sync):
             floating_sync()
+        floating_reasoning_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+        if callable(floating_reasoning_sync):
+            floating_reasoning_sync()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
             refresher()

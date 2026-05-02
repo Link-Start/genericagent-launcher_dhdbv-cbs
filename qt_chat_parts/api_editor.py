@@ -232,6 +232,7 @@ class ApiEditorMixin:
         kind = cfg.get("kind") or "native_oai"
         format_key = self._api_infer_format_key(kind, data)
         tpl_key = self._api_infer_template_key(kind, data)
+        stored_name = str(data.get("name") or "").strip()
         valid_tpl_keys = {k for k, _ in self._api_template_choices(format_key)}
         if tpl_key not in valid_tpl_keys:
             tpl_key = "custom-claude" if kind == "native_claude" else "custom-oai"
@@ -249,6 +250,9 @@ class ApiEditorMixin:
         raw_extra.pop("api_mode", None)
         return {
             "var": cfg["var"],
+            "name": stored_name,
+            "persisted_name": stored_name,
+            "auto_name_locked": False,
             "format": format_key,
             "tpl_key": tpl_key,
             "apibase": data.get("apibase", ""),
@@ -366,9 +370,39 @@ class ApiEditorMixin:
                 return host
         return f"{lz.TEMPLATE_INDEX.get(state.get('tpl_key'), {}).get('label', 'api')}-{idx + 1}"
 
+    def _api_effective_name(self, state, idx):
+        custom_name = str((state or {}).get("name") or "").strip()
+        if custom_name:
+            return custom_name
+        if bool((state or {}).get("auto_name_locked")):
+            persisted_name = str((state or {}).get("persisted_name") or "").strip()
+            if persisted_name:
+                return persisted_name
+        return self._api_base_name(state, idx) or f"api-{idx + 1}"
+
+    def _api_unique_name(self, base_name, used_names, *, fallback):
+        root_name = str(base_name or "").strip() or str(fallback or "").strip()
+        name = root_name or "api"
+        candidate = name
+        serial = 2
+        while candidate in used_names:
+            candidate = f"{name}-{serial}"
+            serial += 1
+        return candidate
+
+    def _api_persisted_name(self, state, idx, used_names):
+        return self._api_unique_name(self._api_effective_name(state, idx), used_names, fallback=f"api-{idx + 1}")
+
+    def _api_auto_generated_name(self, state, idx, used_names):
+        return self._api_unique_name(self._api_base_name(state, idx), used_names, fallback=f"api-{idx + 1}")
+
     def _api_build_save_configs(self):
-        configs = []
-        used_names = set()
+        visible_configs = []
+        used_names = {
+            str(((cfg.get("data") or {}).get("name")) or "").strip()
+            for cfg in (getattr(self, "_qt_api_hidden_configs", []) or [])
+            if str(((cfg.get("data") or {}).get("name")) or "").strip()
+        }
         for idx, state in enumerate(self._qt_api_state):
             fmt = self._api_format_meta(state.get("format"))
             tpl = lz.TEMPLATE_INDEX.get(state.get("tpl_key"), {})
@@ -413,16 +447,61 @@ class ApiEditorMixin:
                     data.pop("user_agent", None)
             else:
                 data.pop("user_agent", None)
-            base_name = self._api_base_name(state, idx) or f"api-{idx + 1}"
-            name = base_name
-            serial = 2
-            while name in used_names:
-                name = f"{base_name}-{serial}"
-                serial += 1
+            name = self._api_persisted_name(state, idx, used_names)
             used_names.add(name)
+            state["persisted_name"] = name
+            state["auto_name_locked"] = not bool(str(state.get("name") or "").strip())
             data["name"] = name
-            configs.append({"var": state["var"], "kind": kind, "data": data})
-        return configs + list(self._qt_api_hidden_configs)
+            visible_configs.append({"var": state["var"], "kind": kind, "data": data})
+        ordered = []
+        visible_iter = iter(visible_configs)
+        hidden_configs = list(getattr(self, "_qt_api_hidden_configs", []) or [])
+        used_hidden_slots = set()
+        for slot in list(getattr(self, "_qt_api_order_slots", []) or []):
+            if slot == "visible":
+                next_visible = next(visible_iter, None)
+                if next_visible is not None:
+                    ordered.append(next_visible)
+                continue
+            if isinstance(slot, tuple) and len(slot) == 2 and slot[0] == "hidden":
+                try:
+                    hidden_idx = int(slot[1])
+                except Exception:
+                    continue
+                if 0 <= hidden_idx < len(hidden_configs):
+                    ordered.append(hidden_configs[hidden_idx])
+                    used_hidden_slots.add(hidden_idx)
+        ordered.extend(list(visible_iter))
+        for hidden_idx, hidden_cfg in enumerate(hidden_configs):
+            if hidden_idx in used_hidden_slots:
+                continue
+            ordered.append(hidden_cfg)
+        return ordered
+
+    def _qt_api_move_disabled_reason(self, idx, delta):
+        total = len(getattr(self, "_qt_api_state", []) or [])
+        if total <= 1:
+            return "当前只有一张 API 卡片，无需调整顺序。"
+        if not (0 <= idx < total):
+            return "当前卡片不存在。"
+        target_idx = idx + int(delta or 0)
+        if target_idx < 0:
+            return "已经在最上方。"
+        if target_idx >= total:
+            return "已经在最下方。"
+        return ""
+
+    def _qt_api_move(self, idx, delta):
+        reason = self._qt_api_move_disabled_reason(idx, delta)
+        if reason:
+            return False
+        target_idx = idx + int(delta or 0)
+        self._qt_api_state[idx], self._qt_api_state[target_idx] = (
+            self._qt_api_state[target_idx],
+            self._qt_api_state[idx],
+        )
+        self._render_api_cards()
+        return True
 
     def _api_source_status(self) -> str:
         return str(getattr(self, "_qt_api_source_status", "") or "").strip().lower()
@@ -523,16 +602,30 @@ class ApiEditorMixin:
             return
         self._qt_api_py_path = py_path
         self._qt_api_parse_error = parsed.get("error") or ""
-        self._qt_api_hidden_configs = [
-            {"var": c["var"], "kind": c["kind"], "data": dict(c["data"])}
-            for c in parsed["configs"]
-            if c["kind"] not in ("native_claude", "native_oai")
-        ]
-        self._qt_api_state = [
-            self._api_make_simple_state(c)
-            for c in parsed["configs"]
-            if c["kind"] in ("native_claude", "native_oai")
-        ]
+        self._qt_api_hidden_configs = []
+        self._qt_api_state = []
+        self._qt_api_order_slots = []
+        for config in list(parsed.get("configs") or []):
+            kind = str(config.get("kind") or "").strip()
+            if kind in ("native_claude", "native_oai"):
+                self._qt_api_state.append(self._api_make_simple_state(config))
+                self._qt_api_order_slots.append("visible")
+                continue
+            hidden_idx = len(self._qt_api_hidden_configs)
+            self._qt_api_hidden_configs.append({"var": config["var"], "kind": kind, "data": dict(config["data"])})
+            self._qt_api_order_slots.append(("hidden", hidden_idx))
+        auto_names = set()
+        for idx, state in enumerate(self._qt_api_state):
+            stored_name = str((state or {}).get("persisted_name") or (state or {}).get("name") or "").strip()
+            state["persisted_name"] = stored_name
+            auto_name = self._api_auto_generated_name(state, idx, auto_names)
+            if stored_name == auto_name:
+                state["name"] = ""
+                state["auto_name_locked"] = True
+            else:
+                state["name"] = stored_name
+                state["auto_name_locked"] = False
+            auto_names.add(stored_name or auto_name)
         if not self._qt_api_state:
             self._qt_api_add_channel("oai_chat", render=False)
         self._qt_api_extras = dict(parsed.get("extras") or {})
@@ -554,6 +647,7 @@ class ApiEditorMixin:
         self._qt_api_parse_error = str(error_text or "")
         self._qt_api_hidden_configs = []
         self._qt_api_state = []
+        self._qt_api_order_slots = []
         self._qt_api_extras = {}
         self._qt_api_passthrough = []
         self._set_api_source_status(status, py_path="", error_text=error_text)
@@ -629,6 +723,28 @@ class ApiEditorMixin:
             meta.setObjectName("mutedText")
             head.addWidget(meta, 0)
             head.addStretch(1)
+            move_up_btn = QPushButton("上移")
+            move_up_btn.setStyleSheet(self._action_button_style())
+            move_up_btn.clicked.connect(lambda _=False, i=idx: self._qt_api_move(i, -1))
+            move_up_reason = self._qt_api_move_disabled_reason(idx, -1)
+            self._apply_api_button_state(
+                move_up_btn,
+                not bool(move_up_reason),
+                enabled_tooltip="把这张 API 卡片上移一位。",
+                disabled_tooltip=move_up_reason,
+            )
+            head.addWidget(move_up_btn, 0)
+            move_down_btn = QPushButton("下移")
+            move_down_btn.setStyleSheet(self._action_button_style())
+            move_down_btn.clicked.connect(lambda _=False, i=idx: self._qt_api_move(i, 1))
+            move_down_reason = self._qt_api_move_disabled_reason(idx, 1)
+            self._apply_api_button_state(
+                move_down_btn,
+                not bool(move_down_reason),
+                enabled_tooltip="把这张 API 卡片下移一位。",
+                disabled_tooltip=move_down_reason,
+            )
+            head.addWidget(move_down_btn, 0)
             delete_btn = QPushButton("删除")
             delete_btn.setStyleSheet(self._action_button_style())
             delete_btn.clicked.connect(lambda _=False, i=idx: self._qt_api_delete(i))
@@ -637,6 +753,11 @@ class ApiEditorMixin:
 
             row1 = QHBoxLayout()
             row1.setSpacing(10)
+            row1.addWidget(QLabel("名称"), 0)
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("可选：留空则自动用域名或模板名生成")
+            name_edit.setText(str(state.get("name") or ""))
+            row1.addWidget(name_edit, 1)
             row1.addWidget(QLabel("协议"), 0)
             format_box = QComboBox()
             format_box.addItems(self._api_format_options())
@@ -733,10 +854,14 @@ class ApiEditorMixin:
             summary.setObjectName("mutedText")
             body.addWidget(summary)
 
-            def sync_summary(s=state, label=summary):
+            def sync_summary(s=state, label=summary, state_idx=idx):
                 fmt = self._api_format_meta(s.get("format"))
                 defaults = dict(lz.TEMPLATE_INDEX.get(s.get("tpl_key"), {}).get("defaults") or {})
                 model = (s.get("model") or defaults.get("model") or "请手动填写模型名").strip()
+                card_name = self._api_effective_name(s, state_idx)
+                name_note = f"当前卡片名：{card_name}"
+                if not str(s.get("name") or "").strip():
+                    name_note += "（留空时自动生成）"
                 notes = []
                 if defaults.get("fake_cc_system_prompt"):
                     notes.append("自动带 Claude Code 兼容参数")
@@ -749,7 +874,7 @@ class ApiEditorMixin:
                 if str(self._api_advanced_value(s, "user_agent") or "").strip():
                     notes.append("已自定义 user_agent")
                 label.setText(
-                    f"{fmt.get('hint', '')} 模板默认模型：{model}；"
+                    f"{name_note}；{fmt.get('hint', '')} 模板默认模型：{model}；"
                     f"{'，'.join(notes) if notes else '自动写入模板里的默认参数'}。"
                 )
 
@@ -862,7 +987,8 @@ class ApiEditorMixin:
 
             format_box.currentTextChanged.connect(on_format_change)
             tpl_box.currentTextChanged.connect(on_tpl_change)
-            url_edit.textChanged.connect(lambda text, s=state: s.__setitem__("apibase", text))
+            name_edit.textChanged.connect(lambda text, s=state: (s.__setitem__("name", text.strip()), sync_summary()))
+            url_edit.textChanged.connect(lambda text, s=state: (s.__setitem__("apibase", text), sync_summary()))
             key_edit.textChanged.connect(lambda text, s=state: s.__setitem__("apikey", text))
             model_box.currentTextChanged.connect(lambda text, s=state: s.__setitem__("model", text.strip()))
             advanced_toggle.toggled.connect(sync_advanced_fold)
@@ -886,6 +1012,7 @@ class ApiEditorMixin:
         self._qt_api_state.append(
             {
                 "var": var,
+                "name": "",
                 "format": format_key,
                 "tpl_key": tpl_key,
                 "apibase": defaults.get("apibase", ""),

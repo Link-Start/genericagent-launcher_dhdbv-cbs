@@ -6,16 +6,32 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional artifact version (defaults to CI version)"
+        required: false
+        type: string
 
 jobs:
   validate-macos:
-    runs-on: macos-15-intel
+    name: validate-macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+            runner_label: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+            runner_label: macos-15
     env:
       PYTHONUTF8: "1"
-      GA_MACOS_RUNNER_LABEL: "macos-15-intel"
-      GA_MACOS_EXPECTED_ARCH: "x86_64"
+      GA_MACOS_RUNNER_LABEL: ${{ matrix.runner_label }}
+      GA_MACOS_EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,7 +40,11 @@ jobs:
         id: ver
         shell: bash
         run: |
-          echo "value=0.0.0-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          v="${{ github.event.inputs.version }}"
+          if [ -z "$v" ]; then
+            v="0.0.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -130,6 +150,6 @@ jobs:
       - name: Upload macOS validation artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: launcher-macos-validate-${{ steps.ver.outputs.value }}
+          name: launcher-macos-validate-${{ matrix.arch }}-${{ steps.ver.outputs.value }}
           path: |
             release/${{ steps.ver.outputs.value }}/macos/**

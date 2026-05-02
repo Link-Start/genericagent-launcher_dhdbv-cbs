@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+import bridge
 import launcher_bootstrap
 from launcher_app import core as lz
 from launcher_app import window as launcher_window
@@ -487,6 +490,566 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(ready_dummy.llm_combo.current_index, 0)
         self.assertTrue(ready_dummy.llm_combo.enabled)
         self.assertEqual(ready_dummy.llm_combo.tooltip, "切换当前会话使用的模型。")
+
+    def test_bridge_runtime_sync_reasoning_effort_combo_tracks_runtime_state(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+                self.current_index = -1
+                self.enabled = None
+                self.tooltip = ""
+
+            def clear(self):
+                self.items.clear()
+                self.current_index = -1
+
+            def addItem(self, label, data):
+                self.items.append((str(label), data))
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _apply_bridge_widget_state = BridgeRuntimeMixin._apply_bridge_widget_state
+            _bridge_reasoning_effort_combo_disabled_reason = BridgeRuntimeMixin._bridge_reasoning_effort_combo_disabled_reason
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _current_session_reasoning_effort_override = BridgeRuntimeMixin._current_session_reasoning_effort_override
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _current_reasoning_effort_selection = BridgeRuntimeMixin._current_reasoning_effort_selection
+            _sync_reasoning_effort_combo = BridgeRuntimeMixin._sync_reasoning_effort_combo
+
+            def __init__(self, *, llms=None, reasoning_effort=""):
+                self.llms = list(llms or [])
+                self.current_session = None
+                self._pending_reasoning_effort_override = None
+                self._bridge_reasoning_effort = reasoning_effort
+                self._ignore_reasoning_effort_change = False
+                self.reasoning_effort_combo = DummyCombo()
+                self.sync_calls = 0
+
+            def _sync_floating_reasoning_effort_combo(self):
+                self.sync_calls += 1
+
+        dummy = DummyBridge()
+        dummy._sync_reasoning_effort_combo()
+        self.assertEqual(dummy.reasoning_effort_combo.items[0], ("跟随配置", ""))
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 0)
+        self.assertFalse(dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(dummy.reasoning_effort_combo.tooltip, "当前还没有可用的 LLM 配置。")
+
+        ready_dummy = DummyBridge(llms=[{"idx": 0, "name": "GPT", "current": True}], reasoning_effort="high")
+        ready_dummy._sync_reasoning_effort_combo()
+        self.assertEqual(ready_dummy.reasoning_effort_combo.items[5], ("high", "high"))
+        self.assertEqual(ready_dummy.reasoning_effort_combo.current_index, 5)
+        self.assertTrue(ready_dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(ready_dummy.reasoning_effort_combo.tooltip, "切换当前会话使用的思考强度。")
+        self.assertEqual(ready_dummy.sync_calls, 1)
+
+        restored_dummy = DummyBridge(llms=[{"idx": 0, "name": "GPT", "current": True}])
+        restored_dummy.current_session = {"id": "sess-1", "snapshot": {"reasoning_effort": "medium", "reasoning_effort_source": "runtime"}}
+        self.assertEqual(restored_dummy._current_session_reasoning_effort_override(), "")
+        self.assertEqual(restored_dummy._current_reasoning_effort_selection(), "")
+        restored_dummy._sync_reasoning_effort_combo()
+        self.assertEqual(restored_dummy.reasoning_effort_combo.current_index, 0)
+
+        explicit_dummy = DummyBridge(llms=[{"idx": 0, "name": "GPT", "current": True}])
+        explicit_dummy.current_session = {
+            "id": "sess-2",
+            "reasoning_effort": "medium",
+            "snapshot": {"reasoning_effort": "medium", "reasoning_effort_source": "override"},
+        }
+        self.assertEqual(explicit_dummy._current_session_reasoning_effort_override(), "medium")
+        self.assertEqual(explicit_dummy._current_reasoning_effort_selection(), "medium")
+
+    def test_bridge_runtime_reasoning_effort_change_persists_session_and_sends_command(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+
+            def addItem(self, label, data):
+                self.items.append((str(label), data))
+
+            def itemData(self, index):
+                return self.items[int(index)][1]
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _on_reasoning_effort_changed = BridgeRuntimeMixin._on_reasoning_effort_changed
+
+            def __init__(self):
+                self.current_session = {"id": "sess-1", "snapshot": {}}
+                self.reasoning_effort_combo = DummyCombo()
+                self.reasoning_effort_combo.addItem("跟随配置", "")
+                self.reasoning_effort_combo.addItem("high", "high")
+                self._ignore_reasoning_effort_change = False
+                self._pending_reasoning_effort_override = None
+                self._bridge_reasoning_effort = ""
+                self._bridge_ready = True
+                self.persisted = []
+                self.sent = []
+                self.statuses = []
+
+            def _persist_session(self, session):
+                self.persisted.append(dict(session))
+
+            def _is_remote_session(self, session=None):
+                return False
+
+            def _send_cmd(self, payload):
+                self.sent.append(dict(payload))
+
+            def _sync_floating_reasoning_effort_combo(self):
+                return None
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyBridge()
+        dummy._on_reasoning_effort_changed(1)
+
+        self.assertEqual(dummy.current_session["reasoning_effort"], "high")
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort"], "high")
+        self.assertEqual(dummy._pending_reasoning_effort_override, "high")
+        self.assertEqual(len(dummy.persisted), 1)
+        self.assertEqual(dummy.sent, [{"cmd": "switch_reasoning_effort", "reasoning_effort": "high"}])
+        self.assertEqual(dummy._bridge_reasoning_effort, "high")
+
+    def test_apply_state_to_session_keeps_runtime_reasoning_out_of_top_level_override(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _apply_state_to_session = BridgeRuntimeMixin._apply_state_to_session
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.current_session = {"id": "sess-1", "snapshot": {}}
+                self._bridge_reasoning_effort = ""
+                self.persisted = []
+                self.sync_calls = 0
+
+            def _sync_reasoning_effort_combo(self):
+                self.sync_calls += 1
+
+            def _persist_session(self, session):
+                self.persisted.append(dict(session))
+
+        dummy = DummyBridge()
+        dummy._apply_state_to_session("sess-1", [{"role": "user", "content": "hi"}], [], reasoning_effort="high")
+
+        self.assertNotIn("reasoning_effort", dummy.current_session)
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort"], "high")
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort_source"], "runtime")
+        self.assertEqual(dummy._bridge_reasoning_effort, "high")
+        self.assertEqual(dummy.sync_calls, 1)
+        self.assertNotIn("reasoning_effort", dummy.persisted[-1])
+
+    def test_handle_event_reasoning_effort_switched_persists_current_session(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_event = BridgeRuntimeMixin._handle_event
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+
+            def __init__(self):
+                self.current_session = {
+                    "id": "sess-1",
+                    "reasoning_effort": "medium",
+                    "snapshot": {"reasoning_effort": "medium", "reasoning_effort_source": "override"},
+                }
+                self._bridge_reasoning_effort = ""
+                self.persisted = []
+                self.sync_calls = 0
+                self.statuses = []
+                self.refresh_calls = 0
+
+            def _persist_session(self, session):
+                self.persisted.append(dict(session))
+
+            def _handle_download_event(self, ev):
+                return False
+
+            def _sync_reasoning_effort_combo(self):
+                self.sync_calls += 1
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _refresh_composer_enabled(self):
+                self.refresh_calls += 1
+
+        dummy = DummyBridge()
+        dummy._handle_event({"event": "reasoning_effort_switched", "reasoning_effort": "high"})
+
+        self.assertEqual(dummy._bridge_reasoning_effort, "high")
+        self.assertEqual(dummy.current_session["reasoning_effort"], "high")
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort"], "high")
+        self.assertEqual(dummy.persisted[-1]["reasoning_effort"], "high")
+        self.assertEqual(dummy.sync_calls, 1)
+        self.assertEqual(dummy.statuses, ["思考强度已切换。"])
+        self.assertEqual(dummy.refresh_calls, 1)
+
+    def test_submit_user_message_routes_slash_new_before_channel_process_block(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _submit_user_message = BridgeRuntimeMixin._submit_user_message
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+
+            def __init__(self):
+                self.current_session = {"id": "snap-1", "session_kind": "channel_process"}
+                self._pending_input_attachments_data = []
+                self.new_session_calls = []
+
+            def _handle_input_image_attachments(self, *_args, **_kwargs):
+                return None
+
+            def _is_channel_process_session(self):
+                return True
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_from_floating(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+            def _current_device_context(self):
+                return "local", "local"
+
+            def _new_session(self, checked=False, *, scope="", device_id="", prompt_device=True):
+                self.new_session_calls.append((bool(checked), str(scope), str(device_id), bool(prompt_device)))
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+        with mock.patch.object(bridge_runtime.QMessageBox, "information") as info_box:
+            result = dummy._submit_user_message("/new", attachments=None, source_editor=editor)
+
+        self.assertFalse(result)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.new_session_calls, [(False, "local", "local", False)])
+        info_box.assert_not_called()
+
+    def test_local_slash_clear_input_clears_main_and_floating_drafts(self):
+        class DummyEditor:
+            def __init__(self, text=""):
+                self.text = str(text)
+                self.cleared = 0
+
+            def clear(self):
+                self.text = ""
+                self.cleared += 1
+
+            def toPlainText(self):
+                return self.text
+
+            def setPlainText(self, text):
+                self.text = str(text)
+
+        class DummyFloating:
+            def __init__(self):
+                self.input_box = DummyEditor("stale-floating-draft")
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+
+            def __init__(self):
+                self.input_box = DummyEditor("/help")
+                self._floating_chat_window = DummyFloating()
+                self._pending_input_attachments_data = [{"path": "demo.png"}]
+                self.attachment_refreshes = 0
+
+            def _refresh_input_attachment_bar(self):
+                self.attachment_refreshes += 1
+
+            def _sync_draft_to_floating(self, *, force=False):
+                if force:
+                    self._floating_chat_window.input_box.setPlainText(self.input_box.toPlainText())
+
+        dummy = DummyBridge()
+        dummy._local_slash_clear_input(source_editor=dummy.input_box)
+
+        self.assertEqual(dummy.input_box.text, "")
+        self.assertEqual(dummy._floating_chat_window.input_box.text, "")
+        self.assertEqual(dummy.input_box.cleared, 1)
+        self.assertEqual(dummy._floating_chat_window.input_box.cleared, 1)
+        self.assertEqual(dummy._pending_input_attachments_data, [])
+        self.assertEqual(dummy.attachment_refreshes, 1)
+
+    def test_handle_local_slash_continue_restores_recent_session_silently(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+            _local_slash_continue_rows = BridgeRuntimeMixin._local_slash_continue_rows
+            _local_slash_restore_session = BridgeRuntimeMixin._local_slash_restore_session
+
+            def __init__(self):
+                self.current_session = {"id": "sess-current"}
+                self._pending_input_attachments_data = []
+                self.loaded = []
+                self.statuses = []
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_from_floating(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+            def _current_device_context(self):
+                return "local", "local"
+
+            def _active_sessions_for_channel(self, channel_id, device_scope=None, device_id=None):
+                self.request = (str(channel_id), str(device_scope), str(device_id))
+                return [
+                    {"id": "sess-current", "pinned": False, "updated_at": 10},
+                    {"id": "sess-older", "pinned": False, "updated_at": 20},
+                    {"id": "sess-newer", "pinned": True, "updated_at": 15},
+                ]
+
+            def _load_session_by_id(self, sid):
+                self.loaded.append(str(sid))
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+        with mock.patch.object(bridge_runtime.QMessageBox, "information") as info_box, mock.patch.object(
+            bridge_runtime.QMessageBox, "warning"
+        ) as warning_box:
+            consumed = dummy._handle_local_slash_command("/continue", source_editor=editor)
+
+        self.assertTrue(consumed)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.request, ("launcher", "local", "local"))
+        self.assertEqual(dummy.loaded, ["sess-older"])
+        self.assertEqual(dummy.statuses, [])
+        info_box.assert_not_called()
+        warning_box.assert_not_called()
+
+    def test_handle_local_slash_continue_restores_nth_recent_session(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+            _local_slash_continue_rows = BridgeRuntimeMixin._local_slash_continue_rows
+            _local_slash_restore_session = BridgeRuntimeMixin._local_slash_restore_session
+
+            def __init__(self):
+                self.current_session = {"id": "sess-current"}
+                self._pending_input_attachments_data = []
+                self.loaded = []
+                self.statuses = []
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+            def _current_device_context(self):
+                return "local", "local"
+
+            def _active_sessions_for_channel(self, channel_id, device_scope=None, device_id=None):
+                return [
+                    {"id": "sess-current", "pinned": False, "updated_at": 10},
+                    {"id": "sess-most-recent", "pinned": False, "updated_at": 30},
+                    {"id": "sess-second", "pinned": True, "updated_at": 20},
+                    {"id": "sess-third", "pinned": False, "updated_at": 15},
+                ]
+
+            def _load_session_by_id(self, sid):
+                self.loaded.append(str(sid))
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+
+        consumed = dummy._handle_local_slash_command("/continue 2", source_editor=editor)
+
+        self.assertTrue(consumed)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.loaded, ["sess-second"])
+        self.assertEqual(dummy.statuses, [])
+
+    def test_handle_local_slash_llm_switches_by_llm_idx(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyCombo:
+            def __init__(self):
+                self.current_index = -1
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+            _local_slash_switch_llm = BridgeRuntimeMixin._local_slash_switch_llm
+
+            def __init__(self):
+                self.llms = [
+                    {"idx": 0, "name": "First", "current": True},
+                    {"idx": 7, "name": "Second", "current": False},
+                ]
+                self.llm_combo = DummyCombo()
+                self._ignore_llm_change = False
+                self._pending_input_attachments_data = []
+                self.changed = []
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_from_floating(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+            def _on_llm_changed(self, index):
+                self.changed.append(int(index))
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+        consumed = dummy._handle_local_slash_command("/llm 7", source_editor=editor)
+
+        self.assertTrue(consumed)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.llm_combo.current_index, 1)
+        self.assertEqual(dummy.changed, [1])
+
+    def test_handle_local_slash_llm_respects_channel_process_read_only(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyCombo:
+            def __init__(self):
+                self.current_index = -1
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+            _local_slash_switch_llm = BridgeRuntimeMixin._local_slash_switch_llm
+
+            def __init__(self):
+                self.current_session = {"id": "snap-1", "session_kind": "channel_process"}
+                self.llms = [
+                    {"idx": 0, "name": "First", "current": True},
+                    {"idx": 7, "name": "Second", "current": False},
+                ]
+                self.llm_combo = DummyCombo()
+                self._ignore_llm_change = False
+                self._pending_input_attachments_data = []
+                self.changed = []
+                self.statuses = []
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+            def _is_channel_process_session(self, session=None):
+                return True
+
+            def _on_llm_changed(self, index):
+                self.changed.append(int(index))
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+        with mock.patch.object(bridge_runtime.QMessageBox, "information") as info_box:
+            consumed = dummy._handle_local_slash_command("/llm 7", source_editor=editor)
+
+        self.assertTrue(consumed)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.llm_combo.current_index, -1)
+        self.assertEqual(dummy.changed, [])
+        self.assertEqual(dummy.statuses, ["渠道进程会话仅支持查看日志，不能切换模型。"])
+        info_box.assert_called_once()
+        self.assertIn("不能切换模型", info_box.call_args.args[2])
+
+    def test_handle_local_slash_llm_invalid_index_reports_actual_valid_ids(self):
+        class DummyEditor:
+            def __init__(self):
+                self.cleared = 0
+
+            def clear(self):
+                self.cleared += 1
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_local_slash_command = BridgeRuntimeMixin._handle_local_slash_command
+            _local_slash_clear_input = BridgeRuntimeMixin._local_slash_clear_input
+            _local_slash_switch_llm = BridgeRuntimeMixin._local_slash_switch_llm
+
+            def __init__(self):
+                self.llms = [
+                    {"idx": 0, "name": "First", "current": True},
+                    {"idx": 7, "name": "Second", "current": False},
+                ]
+                self.llm_combo = None
+                self._pending_input_attachments_data = []
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _sync_draft_to_floating(self, *, force=False):
+                return None
+
+        dummy = DummyBridge()
+        editor = DummyEditor()
+        with mock.patch.object(bridge_runtime.QMessageBox, "warning") as warning_box:
+            consumed = dummy._handle_local_slash_command("/llm 1", source_editor=editor)
+
+        self.assertTrue(consumed)
+        self.assertEqual(editor.cleared, 1)
+        warning_box.assert_called_once()
+        self.assertIn("有效编号: 0, 7", warning_box.call_args.args[2])
 
     def test_set_agent_dir_stops_lan_interface_when_switching_agent(self):
         class DummyList:
@@ -3417,6 +3980,439 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertIn("/remote/mykey.py", notice_text)
         self.assertIn("当前读取失败：SSH 连接失败", notice_text)
 
+    def test_apply_loaded_api_source_restores_auto_generated_names_to_blank_fields(self):
+        class DummyApi(ApiEditorMixin):
+            _apply_loaded_api_source = ApiEditorMixin._apply_loaded_api_source
+            _api_make_simple_state = ApiEditorMixin._api_make_simple_state
+
+            def __init__(self):
+                self.settings_api_notice = mock.Mock()
+                self._qt_api_hidden_configs = []
+                self._qt_api_state = []
+                self._qt_api_extras = {}
+                self._qt_api_passthrough = []
+                self._qt_api_parse_error = ""
+                self._qt_api_py_path = ""
+                self.render_calls = 0
+
+            def _render_api_cards(self):
+                self.render_calls += 1
+
+            def _refresh_api_source_actions(self):
+                return None
+
+        dummy = DummyApi()
+        dummy._apply_loaded_api_source(
+            "C:\\demo\\mykey.py",
+            {
+                "error": "",
+                "configs": [
+                    {
+                        "var": "native_oai_config",
+                        "kind": "native_oai",
+                        "data": {
+                            "name": "api.openai.com",
+                            "apibase": "https://api.openai.com/v1",
+                            "apikey": "sk-demo",
+                            "model": "gpt-5.4",
+                        },
+                    },
+                    {
+                        "var": "native_oai_config2",
+                        "kind": "native_oai",
+                        "data": {
+                            "name": "api.openai.com-2",
+                            "apibase": "https://api.openai.com/v1",
+                            "apikey": "sk-demo-2",
+                            "model": "gpt-5.4-mini",
+                        },
+                    },
+                    {
+                        "var": "native_oai_config3",
+                        "kind": "native_oai",
+                        "data": {
+                            "name": "Prod OpenAI",
+                            "apibase": "https://api.third.example/v1",
+                            "apikey": "sk-demo-3",
+                            "model": "gpt-5.4",
+                        },
+                    }
+                ],
+                "extras": {},
+                "passthrough": [],
+            },
+        )
+
+        self.assertEqual(dummy.render_calls, 1)
+        self.assertEqual(dummy._qt_api_state[0]["name"], "")
+        self.assertEqual(dummy._qt_api_state[0]["persisted_name"], "api.openai.com")
+        self.assertTrue(dummy._qt_api_state[0]["auto_name_locked"])
+        self.assertEqual(dummy._qt_api_state[1]["name"], "")
+        self.assertEqual(dummy._qt_api_state[1]["persisted_name"], "api.openai.com-2")
+        self.assertTrue(dummy._qt_api_state[1]["auto_name_locked"])
+        self.assertEqual(dummy._qt_api_state[2]["name"], "Prod OpenAI")
+        self.assertEqual(dummy._qt_api_state[2]["persisted_name"], "Prod OpenAI")
+        self.assertFalse(dummy._qt_api_state[2]["auto_name_locked"])
+
+    def test_api_build_save_configs_prefers_custom_name_and_keeps_blank_fallback(self):
+        class DummyApi(ApiEditorMixin):
+            _api_build_save_configs = ApiEditorMixin._api_build_save_configs
+            _api_format_meta = ApiEditorMixin._api_format_meta
+            _api_sync_state_var_kind = ApiEditorMixin._api_sync_state_var_kind
+            _api_advanced_field_keys = ApiEditorMixin._api_advanced_field_keys
+            _api_normalize_advanced_value = ApiEditorMixin._api_normalize_advanced_value
+            _api_effective_name = ApiEditorMixin._api_effective_name
+            _api_base_name = ApiEditorMixin._api_base_name
+            _api_state_kind = ApiEditorMixin._api_state_kind
+
+            def __init__(self):
+                self._qt_api_hidden_configs = []
+                self._qt_api_state = []
+
+        dummy = DummyApi()
+        dummy._qt_api_state = [
+            {
+                "var": "native_oai_config",
+                "name": "Prod OpenAI",
+                "format": "oai_chat",
+                "tpl_key": "openai",
+                "apibase": "https://api.openai.com/v1",
+                "apikey": "sk-live",
+                "model": "gpt-5.4",
+                "advanced_values": {},
+                "advanced_expanded": False,
+                "user_agent": "",
+                "raw_extra": {},
+                "model_choices": [],
+                "model_status": "",
+                "model_fetching": False,
+            },
+            {
+                "var": "native_oai_config2",
+                "name": "",
+                "format": "oai_chat",
+                "tpl_key": "openai",
+                "apibase": "https://api.second.example/v1",
+                "apikey": "sk-second",
+                "model": "gpt-5.4-mini",
+                "advanced_values": {},
+                "advanced_expanded": False,
+                "user_agent": "",
+                "raw_extra": {},
+                "model_choices": [],
+                "model_status": "",
+                "model_fetching": False,
+            },
+        ]
+
+        configs = dummy._api_build_save_configs()
+
+        self.assertEqual(configs[0]["data"]["name"], "Prod OpenAI")
+        self.assertEqual(configs[1]["data"]["name"], "api.second.example")
+
+    def test_qt_api_move_reorders_visible_state_and_save_order(self):
+        class DummyApi(ApiEditorMixin):
+            _qt_api_move = ApiEditorMixin._qt_api_move
+            _qt_api_move_disabled_reason = ApiEditorMixin._qt_api_move_disabled_reason
+            _api_build_save_configs = ApiEditorMixin._api_build_save_configs
+            _api_format_meta = ApiEditorMixin._api_format_meta
+            _api_sync_state_var_kind = ApiEditorMixin._api_sync_state_var_kind
+            _api_advanced_field_keys = ApiEditorMixin._api_advanced_field_keys
+            _api_normalize_advanced_value = ApiEditorMixin._api_normalize_advanced_value
+            _api_effective_name = ApiEditorMixin._api_effective_name
+            _api_base_name = ApiEditorMixin._api_base_name
+            _api_state_kind = ApiEditorMixin._api_state_kind
+
+            def __init__(self):
+                self._qt_api_hidden_configs = [{"var": "legacy_hidden", "kind": "custom", "data": {"x": 1}}]
+                self._qt_api_state = []
+                self.render_calls = 0
+
+            def _render_api_cards(self):
+                self.render_calls += 1
+
+        dummy = DummyApi()
+        dummy._qt_api_state = [
+            {
+                "var": "native_oai_config",
+                "name": "First",
+                "format": "oai_chat",
+                "tpl_key": "openai",
+                "apibase": "https://first.example/v1",
+                "apikey": "sk-first",
+                "model": "gpt-5.4",
+                "advanced_values": {},
+                "advanced_expanded": False,
+                "user_agent": "",
+                "raw_extra": {},
+                "model_choices": [],
+                "model_status": "",
+                "model_fetching": False,
+            },
+            {
+                "var": "native_oai_config2",
+                "name": "Second",
+                "format": "oai_chat",
+                "tpl_key": "openai",
+                "apibase": "https://second.example/v1",
+                "apikey": "sk-second",
+                "model": "gpt-5.4-mini",
+                "advanced_values": {},
+                "advanced_expanded": False,
+                "user_agent": "",
+                "raw_extra": {},
+                "model_choices": [],
+                "model_status": "",
+                "model_fetching": False,
+            },
+            {
+                "var": "native_oai_config3",
+                "name": "Third",
+                "format": "oai_chat",
+                "tpl_key": "openai",
+                "apibase": "https://third.example/v1",
+                "apikey": "sk-third",
+                "model": "gpt-5.4-nano",
+                "advanced_values": {},
+                "advanced_expanded": False,
+                "user_agent": "",
+                "raw_extra": {},
+                "model_choices": [],
+                "model_status": "",
+                "model_fetching": False,
+            },
+        ]
+
+        self.assertTrue(dummy._qt_api_move(2, -1))
+        self.assertEqual(dummy.render_calls, 1)
+        self.assertEqual(
+            [state["var"] for state in dummy._qt_api_state],
+            ["native_oai_config", "native_oai_config3", "native_oai_config2"],
+        )
+
+        configs = dummy._api_build_save_configs()
+
+        self.assertEqual(
+            [cfg["var"] for cfg in configs],
+            ["native_oai_config", "native_oai_config3", "native_oai_config2", "legacy_hidden"],
+        )
+
+    def test_api_round_trip_keeps_hidden_slots_and_avoids_hidden_name_collisions(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyApi(ApiEditorMixin):
+            _apply_loaded_api_source = ApiEditorMixin._apply_loaded_api_source
+            _qt_api_move = ApiEditorMixin._qt_api_move
+            _qt_api_move_disabled_reason = ApiEditorMixin._qt_api_move_disabled_reason
+            _api_build_save_configs = ApiEditorMixin._api_build_save_configs
+            _api_make_simple_state = ApiEditorMixin._api_make_simple_state
+            _api_format_meta = ApiEditorMixin._api_format_meta
+            _api_template_choices = ApiEditorMixin._api_template_choices
+            _api_infer_template_key = ApiEditorMixin._api_infer_template_key
+            _api_infer_format_key = ApiEditorMixin._api_infer_format_key
+            _api_known_advanced_keys_for_kind = ApiEditorMixin._api_known_advanced_keys_for_kind
+            _api_default_model_for_state = ApiEditorMixin._api_default_model_for_state
+            _api_auto_generated_name = ApiEditorMixin._api_auto_generated_name
+            _api_effective_name = ApiEditorMixin._api_effective_name
+            _api_base_name = ApiEditorMixin._api_base_name
+            _api_unique_name = ApiEditorMixin._api_unique_name
+            _api_persisted_name = ApiEditorMixin._api_persisted_name
+            _api_state_kind = ApiEditorMixin._api_state_kind
+            _api_sync_state_var_kind = ApiEditorMixin._api_sync_state_var_kind
+            _api_advanced_field_keys = ApiEditorMixin._api_advanced_field_keys
+            _api_normalize_advanced_value = ApiEditorMixin._api_normalize_advanced_value
+
+            def __init__(self):
+                self.settings_api_notice = DummyLabel()
+                self._qt_api_hidden_configs = []
+                self._qt_api_state = []
+                self._qt_api_order_slots = []
+                self._qt_api_extras = {}
+                self._qt_api_passthrough = []
+                self._qt_api_parse_error = ""
+                self._qt_api_py_path = ""
+                self.render_calls = 0
+
+            def _set_api_source_status(self, status, *, py_path=None, error_text=None):
+                self.api_status = str(status)
+                if py_path is not None:
+                    self._qt_api_py_path = str(py_path)
+                if error_text is not None:
+                    self._qt_api_parse_error = str(error_text)
+
+            def _render_api_cards(self):
+                self.render_calls += 1
+
+            def _refresh_api_source_actions(self):
+                self.refresh_calls = getattr(self, "refresh_calls", 0) + 1
+
+            def _qt_api_add_channel(self, format_key, *, render=True):
+                raise AssertionError("unexpected auto add")
+
+        src = """
+native_oai_config = {
+    'name': 'First',
+    'apikey': 'sk-first',
+    'apibase': 'https://first.example/v1',
+    'model': 'gpt-5.4',
+}
+legacy_hidden = {
+    'name': 'api.second.example',
+    'llm_nos': [0, 1],
+}
+native_oai_config2 = {
+    'name': 'api.second.example',
+    'apikey': 'sk-second',
+    'apibase': 'https://api.second.example/v1',
+    'model': 'gpt-5.4-mini',
+}
+"""
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "mykey.py")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(src)
+            parsed = lz.parse_mykey_py(fp)
+
+        dummy = DummyApi()
+        dummy._apply_loaded_api_source("C:\\demo\\mykey.py", parsed)
+        self.assertTrue(dummy._qt_api_move(1, -1))
+
+        configs = dummy._api_build_save_configs()
+
+        self.assertEqual(
+            [cfg["var"] for cfg in configs],
+            ["native_oai_config2", "legacy_hidden", "native_oai_config"],
+        )
+        self.assertEqual(configs[0]["data"]["name"], "api.second.example-2")
+        self.assertEqual(configs[1]["data"]["name"], "api.second.example")
+
+    def test_api_reorder_keeps_loaded_auto_generated_names_stable_for_hidden_mixin_refs(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyApi(ApiEditorMixin):
+            _apply_loaded_api_source = ApiEditorMixin._apply_loaded_api_source
+            _qt_api_move = ApiEditorMixin._qt_api_move
+            _qt_api_move_disabled_reason = ApiEditorMixin._qt_api_move_disabled_reason
+            _api_build_save_configs = ApiEditorMixin._api_build_save_configs
+            _api_make_simple_state = ApiEditorMixin._api_make_simple_state
+            _api_format_meta = ApiEditorMixin._api_format_meta
+            _api_template_choices = ApiEditorMixin._api_template_choices
+            _api_infer_template_key = ApiEditorMixin._api_infer_template_key
+            _api_infer_format_key = ApiEditorMixin._api_infer_format_key
+            _api_known_advanced_keys_for_kind = ApiEditorMixin._api_known_advanced_keys_for_kind
+            _api_default_model_for_state = ApiEditorMixin._api_default_model_for_state
+            _api_auto_generated_name = ApiEditorMixin._api_auto_generated_name
+            _api_effective_name = ApiEditorMixin._api_effective_name
+            _api_base_name = ApiEditorMixin._api_base_name
+            _api_unique_name = ApiEditorMixin._api_unique_name
+            _api_persisted_name = ApiEditorMixin._api_persisted_name
+            _api_state_kind = ApiEditorMixin._api_state_kind
+            _api_sync_state_var_kind = ApiEditorMixin._api_sync_state_var_kind
+            _api_advanced_field_keys = ApiEditorMixin._api_advanced_field_keys
+            _api_normalize_advanced_value = ApiEditorMixin._api_normalize_advanced_value
+
+            def __init__(self):
+                self.settings_api_notice = DummyLabel()
+                self._qt_api_hidden_configs = []
+                self._qt_api_state = []
+                self._qt_api_order_slots = []
+                self._qt_api_extras = {}
+                self._qt_api_passthrough = []
+                self._qt_api_parse_error = ""
+                self._qt_api_py_path = ""
+
+            def _set_api_source_status(self, status, *, py_path=None, error_text=None):
+                self.api_status = str(status)
+                if py_path is not None:
+                    self._qt_api_py_path = str(py_path)
+                if error_text is not None:
+                    self._qt_api_parse_error = str(error_text)
+
+            def _render_api_cards(self):
+                return None
+
+            def _refresh_api_source_actions(self):
+                return None
+
+            def _qt_api_add_channel(self, format_key, *, render=True):
+                raise AssertionError("unexpected auto add")
+
+        src = """
+native_oai_config = {
+    'name': 'api.openai.com',
+    'apikey': 'sk-first',
+    'apibase': 'https://api.openai.com/v1',
+    'model': 'gpt-5.4',
+}
+mixin_config = {
+    'name': 'Primary Mixin',
+    'llm_nos': ['api.openai.com-2'],
+}
+native_oai_config2 = {
+    'name': 'api.openai.com-2',
+    'apikey': 'sk-second',
+    'apibase': 'https://api.openai.com/v1',
+    'model': 'gpt-5.4-mini',
+}
+"""
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "mykey.py")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(src)
+            parsed = lz.parse_mykey_py(fp)
+
+        dummy = DummyApi()
+        dummy._apply_loaded_api_source("C:\\demo\\mykey.py", parsed)
+        self.assertTrue(dummy._qt_api_move(1, -1))
+
+        configs = dummy._api_build_save_configs()
+
+        self.assertEqual(
+            [cfg["var"] for cfg in configs],
+            ["native_oai_config2", "mixin_config", "native_oai_config"],
+        )
+        self.assertEqual(configs[0]["data"]["name"], "api.openai.com-2")
+        self.assertEqual(configs[1]["data"]["llm_nos"], ["api.openai.com-2"])
+        self.assertEqual(configs[2]["data"]["name"], "api.openai.com")
+
+    def test_qt_api_move_ignores_edge_and_single_card_requests(self):
+        class DummyApi(ApiEditorMixin):
+            _qt_api_move = ApiEditorMixin._qt_api_move
+            _qt_api_move_disabled_reason = ApiEditorMixin._qt_api_move_disabled_reason
+
+            def __init__(self):
+                self._qt_api_state = [
+                    {
+                        "var": "native_oai_config",
+                        "name": "",
+                        "format": "oai_chat",
+                        "tpl_key": "openai",
+                    }
+                ]
+                self.render_calls = 0
+
+            def _render_api_cards(self):
+                self.render_calls += 1
+
+        dummy = DummyApi()
+
+        self.assertFalse(dummy._qt_api_move(0, -1))
+        self.assertFalse(dummy._qt_api_move(0, 1))
+        self.assertFalse(dummy._qt_api_move(3, -1))
+        self.assertEqual(dummy._qt_api_move_disabled_reason(0, -1), "当前只有一张 API 卡片，无需调整顺序。")
+        self.assertEqual(dummy.render_calls, 0)
+        self.assertEqual(dummy._qt_api_state[0]["var"], "native_oai_config")
+
     def test_refresh_api_source_actions_disables_remote_restart_and_load_failed_save(self):
         class DummyButton:
             def __init__(self):
@@ -4057,6 +5053,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             _composer_send_disabled_reason = SessionShellMixin._composer_send_disabled_reason
             _composer_stop_disabled_reason = SessionShellMixin._composer_stop_disabled_reason
             _composer_llm_disabled_reason = SessionShellMixin._composer_llm_disabled_reason
+            _composer_reasoning_effort_disabled_reason = SessionShellMixin._composer_reasoning_effort_disabled_reason
 
             def __init__(self, *, channel_process=False, remote=False, busy=False, abort_requested=False, llms=None):
                 self._channel_process = bool(channel_process)
@@ -4068,7 +5065,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 self.send_btn = DummyWidget()
                 self.stop_btn = DummyWidget()
                 self.llm_combo = DummyWidget()
+                self.reasoning_effort_combo = DummyWidget()
                 self.sync_calls = 0
+                self.reasoning_sync_calls = 0
                 self.refresh_calls = 0
 
             def _is_channel_process_session(self, session=None):
@@ -4079,6 +5078,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
             def _sync_floating_llm_combo(self):
                 self.sync_calls += 1
+
+            def _sync_floating_reasoning_effort_combo(self):
+                self.reasoning_sync_calls += 1
 
             def _refresh_floating_chat_window(self):
                 self.refresh_calls += 1
@@ -4093,6 +5095,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(channel_dummy.stop_btn.tooltip, "渠道进程会话仅用于回顾日志与快照，不能在这里停止任务。")
         self.assertFalse(channel_dummy.llm_combo.enabled)
         self.assertEqual(channel_dummy.llm_combo.tooltip, "渠道进程会话仅支持查看日志，不能切换模型。")
+        self.assertFalse(channel_dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(channel_dummy.reasoning_effort_combo.tooltip, "渠道进程会话仅支持查看日志，不能切换思考强度。")
 
         remote_busy_dummy = DummySession(remote=True, busy=True, llms=[{"idx": 0}])
         remote_busy_dummy._refresh_composer_enabled()
@@ -4102,6 +5106,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(remote_busy_dummy.stop_btn.tooltip, "当前会话在远程设备执行，这里不支持直接停止远端任务。")
         self.assertTrue(remote_busy_dummy.llm_combo.enabled)
         self.assertEqual(remote_busy_dummy.llm_combo.tooltip, "切换当前会话使用的模型。")
+        self.assertTrue(remote_busy_dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(remote_busy_dummy.reasoning_effort_combo.tooltip, "切换当前会话使用的思考强度。")
         self.assertIn("远程设备执行", remote_busy_dummy.input_box.placeholder)
 
         local_idle_dummy = DummySession(remote=False, busy=False, llms=[])
@@ -4112,6 +5118,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(local_idle_dummy.stop_btn.tooltip, "当前没有正在执行的本地回复任务。")
         self.assertFalse(local_idle_dummy.llm_combo.enabled)
         self.assertEqual(local_idle_dummy.llm_combo.tooltip, "当前还没有可用的 LLM 配置。")
+        self.assertFalse(local_idle_dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(local_idle_dummy.reasoning_effort_combo.tooltip, "当前还没有可用的 LLM 配置。")
 
     def test_sync_draft_to_floating_force_uses_main_editor_as_source_of_truth(self):
         class DummyEditor:
@@ -4921,7 +5929,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _is_channel_process_session(self, session=None):
                 return False
 
-            def _bind_session_to_current_bridge(self, session):
+            def _bind_session_to_current_bridge(self, session, *, preserve_session_state=False):
                 return None
 
             def _refresh_remote_session_cache_async(self, session):
@@ -4946,6 +5954,1224 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy._sidebar_view_mode, "sessions")
         self.assertIsNone(dummy._last_session_list_signature)
         self.assertEqual(dummy.status_text, "已载入远程会话缓存，正在后台同步；可继续发送，新内容会尝试写回远端。")
+
+    def test_load_session_by_id_restores_snapshot_reasoning_effort_for_local_bridge(self):
+        class DummySidebar(SidebarSessionsMixin, BridgeRuntimeMixin):
+            _load_session_by_id = SidebarSessionsMixin._load_session_by_id
+            _session_reasoning_effort_payload = BridgeRuntimeMixin._session_reasoning_effort_payload
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._busy = False
+                self.current_session = None
+                self._selected_session_id = None
+                self.sent = []
+                self.requested = []
+                self.rendered = None
+                self.reasoning_sync_calls = 0
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+            def _align_sidebar_to_session(self, session):
+                return None
+
+            def _render_session(self, session):
+                self.rendered = dict(session)
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _is_channel_process_session(self, session=None):
+                return False
+
+            def _bind_session_to_current_bridge(self, session, *, preserve_session_state=False):
+                self.bound = dict(session)
+
+            def _send_cmd(self, payload):
+                self.sent.append(dict(payload))
+
+            def _request_backend_state(self, sid):
+                self.requested.append(str(sid))
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _sync_reasoning_effort_combo(self):
+                self.reasoning_sync_calls += 1
+
+            @property
+            def _bridge_ready(self):
+                return True
+
+        dummy = DummySidebar()
+        payload = {
+            "id": "sess-1",
+            "title": "Local session",
+            "backend_history": [],
+            "agent_history": [],
+            "reasoning_effort": "high",
+            "snapshot": {"llm_idx": 2, "reasoning_effort": "high", "reasoning_effort_source": "override"},
+        }
+        with mock.patch.object(lz, "load_session", return_value=dict(payload)):
+            dummy._load_session_by_id("sess-1")
+
+        self.assertEqual(dummy.sent[0]["reasoning_effort"], "high")
+        self.assertEqual(dummy.sent[0]["llm_idx"], 2)
+        self.assertEqual(dummy.requested, ["sess-1"])
+        self.assertEqual(dummy.reasoning_sync_calls, 1)
+        self.assertEqual(dummy.status_text, "已载入本地会话。")
+
+    def test_load_session_by_id_does_not_promote_runtime_reasoning_snapshot_into_override_payload(self):
+        class DummySidebar(SidebarSessionsMixin, BridgeRuntimeMixin):
+            _load_session_by_id = SidebarSessionsMixin._load_session_by_id
+            _session_reasoning_effort_payload = BridgeRuntimeMixin._session_reasoning_effort_payload
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._busy = False
+                self.current_session = None
+                self._selected_session_id = None
+                self.sent = []
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+            def _align_sidebar_to_session(self, session):
+                return None
+
+            def _render_session(self, session):
+                self.rendered = dict(session)
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _is_channel_process_session(self, session=None):
+                return False
+
+            def _bind_session_to_current_bridge(self, session, *, preserve_session_state=False):
+                self.bound = dict(session)
+
+            def _send_cmd(self, payload):
+                self.sent.append(dict(payload))
+
+            def _request_backend_state(self, sid):
+                self.requested = str(sid)
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _sync_reasoning_effort_combo(self):
+                return None
+
+            @property
+            def _bridge_ready(self):
+                return True
+
+        dummy = DummySidebar()
+        payload = {
+            "id": "sess-1",
+            "title": "Follow config session",
+            "backend_history": [],
+            "agent_history": [],
+            "snapshot": {"llm_idx": 2, "reasoning_effort": "high", "reasoning_effort_source": "runtime"},
+        }
+        with mock.patch.object(lz, "load_session", return_value=dict(payload)):
+            dummy._load_session_by_id("sess-1")
+
+        self.assertNotIn("reasoning_effort", dummy.sent[0])
+        self.assertEqual(dummy.sent[0]["llm_idx"], 2)
+        self.assertEqual(dummy.status_text, "已载入本地会话。")
+
+    def test_handle_event_ready_restores_pending_snapshot_reasoning_effort(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _handle_event = BridgeRuntimeMixin._handle_event
+            _session_reasoning_effort_payload = BridgeRuntimeMixin._session_reasoning_effort_payload
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+
+            def __init__(self):
+                self._bridge_ready = False
+                self.llms = []
+                self._bridge_reasoning_effort = ""
+                self._pending_state_session = {
+                    "id": "sess-1",
+                    "backend_history": [{"role": "user", "content": "hi"}],
+                    "agent_history": [{"role": "assistant", "content": "hello"}],
+                    "reasoning_effort": "medium",
+                    "snapshot": {"llm_idx": 3, "reasoning_effort": "medium", "reasoning_effort_source": "override"},
+                }
+                self.current_session = None
+                self.sent = []
+                self.requested = []
+                self.reasoning_sync_calls = 0
+                self.llm_sync_calls = 0
+                self.status_text = ""
+
+            def _stream_done(self, *_args, **_kwargs):
+                raise AssertionError("unexpected stream_done")
+
+            def _stream_update(self, *_args, **_kwargs):
+                raise AssertionError("unexpected stream_update")
+
+            def _handle_download_event(self, ev):
+                return False
+
+            def _sync_llm_combo(self):
+                self.llm_sync_calls += 1
+
+            def _sync_reasoning_effort_combo(self):
+                self.reasoning_sync_calls += 1
+
+            def _render_session(self, session):
+                self.rendered = dict(session)
+
+            def _send_cmd(self, payload):
+                self.sent.append(dict(payload))
+
+            def _request_backend_state(self, sid):
+                self.requested.append(str(sid))
+
+            def _refresh_composer_enabled(self):
+                self.refreshed = True
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+        dummy = DummyBridge()
+        dummy._handle_event({"event": "ready", "llms": [{"idx": 3, "name": "GPT", "current": True}]})
+
+        self.assertTrue(dummy._bridge_ready)
+        self.assertEqual(dummy.sent[0]["reasoning_effort"], "medium")
+        self.assertEqual(dummy.sent[0]["llm_idx"], 3)
+        self.assertEqual(dummy.requested, ["sess-1"])
+        self.assertIsNone(dummy._pending_state_session)
+        self.assertEqual(dummy.status_text, "桥接进程已就绪。")
+
+    def test_load_session_by_id_preserves_saved_local_state_with_real_bind_mixin(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+                self.current_index = None
+                self.enabled = None
+                self.tooltip = ""
+
+            def clear(self):
+                self.items = []
+                self.current_index = None
+
+            def addItem(self, label, value):
+                self.items.append((label, value))
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def itemData(self, index):
+                return self.items[index][1]
+
+        class DummySidebar(SidebarSessionsMixin, SessionShellMixin, BridgeRuntimeMixin):
+            _load_session_by_id = SidebarSessionsMixin._load_session_by_id
+            _bind_session_to_current_bridge = SessionShellMixin._bind_session_to_current_bridge
+            _apply_bridge_widget_state = BridgeRuntimeMixin._apply_bridge_widget_state
+            _bridge_reasoning_effort_combo_disabled_reason = BridgeRuntimeMixin._bridge_reasoning_effort_combo_disabled_reason
+            _current_session_reasoning_effort_override = BridgeRuntimeMixin._current_session_reasoning_effort_override
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _current_reasoning_effort_selection = BridgeRuntimeMixin._current_reasoning_effort_selection
+            _session_reasoning_effort_payload = BridgeRuntimeMixin._session_reasoning_effort_payload
+            _sync_reasoning_effort_combo = BridgeRuntimeMixin._sync_reasoning_effort_combo
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _is_remote_session = BridgeRuntimeMixin._is_remote_session
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._busy = False
+                self.current_session = None
+                self._selected_session_id = None
+                self._pending_reasoning_effort_override = "xhigh"
+                self._bridge_reasoning_effort = "low"
+                self._ignore_reasoning_effort_change = False
+                self.bridge_proc = mock.Mock(pid=4321)
+                self.llms = [{"idx": 0, "name": "GPT", "current": True}]
+                self.reasoning_effort_combo = DummyCombo()
+                self.sent = []
+                self.requested = []
+                self.status_text = ""
+                self.rendered = None
+
+            def _current_llm_index(self):
+                return 0
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+            def _align_sidebar_to_session(self, session):
+                return None
+
+            def _render_session(self, session):
+                self.rendered = dict(session)
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _is_channel_process_session(self, session=None):
+                return False
+
+            def _send_cmd(self, payload):
+                self.sent.append(dict(payload))
+
+            def _request_backend_state(self, sid):
+                self.requested.append(str(sid))
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _sync_floating_reasoning_effort_combo(self):
+                return None
+
+            @property
+            def _bridge_ready(self):
+                return True
+
+        dummy = DummySidebar()
+        payload = {
+            "id": "sess-1",
+            "title": "Local session",
+            "backend_history": [{"role": "user", "content": "hi"}],
+            "agent_history": [{"role": "assistant", "content": "hello"}],
+            "reasoning_effort": "high",
+            "llm_idx": 2,
+            "snapshot": {"llm_idx": 2, "reasoning_effort": "high", "reasoning_effort_source": "override"},
+        }
+        with mock.patch.object(lz, "load_session", return_value=dict(payload)):
+            dummy._load_session_by_id("sess-1")
+
+        self.assertIsNone(dummy._pending_reasoning_effort_override)
+        self.assertEqual(dummy.current_session["llm_idx"], 2)
+        self.assertEqual(dummy.current_session["process_pid"], 4321)
+        self.assertEqual(dummy.current_session["snapshot"]["llm_idx"], 2)
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort"], "high")
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 5)
+        self.assertEqual(dummy.sent[0]["llm_idx"], 2)
+        self.assertEqual(dummy.sent[0]["reasoning_effort"], "high")
+        self.assertEqual(dummy.requested, ["sess-1"])
+        self.assertEqual(dummy.status_text, "已载入本地会话。")
+
+    def test_bridge_set_state_without_reasoning_effort_resets_backend_to_model_default(self):
+        class DummyBackend:
+            def __init__(self, reasoning_effort):
+                self.reasoning_effort = reasoning_effort
+                self.history = []
+
+        class DummyLLMClient:
+            def __init__(self, backend):
+                self.backend = backend
+
+        created = {}
+
+        class DummyAgent:
+            def __init__(self):
+                self.backends = [DummyBackend("low"), DummyBackend(None)]
+                self.llmclients = [DummyLLMClient(item) for item in self.backends]
+                self.llm_no = 0
+                self.llmclient = self.llmclients[0]
+                self.history = []
+                self.handler = None
+                self.inc_out = False
+                created["agent"] = self
+
+            def run(self):
+                return None
+
+            def list_llms(self):
+                return [
+                    (0, "launcher/default", self.llm_no == 0),
+                    (1, "launcher/secondary", self.llm_no == 1),
+                ]
+
+            def next_llm(self, idx):
+                self.llm_no = int(idx)
+                self.llmclient = self.llmclients[self.llm_no]
+
+            def abort(self):
+                return None
+
+        agentmain = types.ModuleType("agentmain")
+        agentmain.GeneraticAgent = DummyAgent
+        commands = "\n".join(
+            [
+                json.dumps({"cmd": "switch_reasoning_effort", "reasoning_effort": "high"}, ensure_ascii=False),
+                json.dumps({"cmd": "set_state", "backend_history": [], "agent_history": [], "llm_idx": 0}, ensure_ascii=False),
+                json.dumps({"cmd": "get_state", "session_id": "sess-1", "request_id": 1}, ensure_ascii=False),
+                json.dumps({"cmd": "quit"}, ensure_ascii=False),
+            ]
+        ) + "\n"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        prev_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            sys.modules, {"agentmain": agentmain}, clear=False
+        ), mock.patch.object(
+            bridge, "_patch_llm_usage_capture", return_value=None
+        ), mock.patch.object(
+            bridge, "_patch_code_run_stdin", return_value=None
+        ), mock.patch.object(
+            sys, "argv", ["bridge.py", td]
+        ), mock.patch.object(
+            sys, "stdin", io.StringIO(commands)
+        ), mock.patch.object(
+            sys, "stdout", stdout
+        ), mock.patch.object(
+            sys, "stderr", stderr
+        ):
+            try:
+                bridge.main()
+            finally:
+                os.chdir(prev_cwd)
+
+        events = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+        state_event = next(ev for ev in reversed(events) if ev.get("event") == "state")
+
+        self.assertEqual(state_event["reasoning_effort"], "low")
+        self.assertEqual(created["agent"].backends[0].reasoning_effort, "low")
+
+    def test_bridge_switch_llm_without_reasoning_override_resets_backend_to_model_default(self):
+        class DummyBackend:
+            def __init__(self, reasoning_effort):
+                self.reasoning_effort = reasoning_effort
+                self.history = []
+
+        class DummyLLMClient:
+            def __init__(self, backend):
+                self.backend = backend
+
+        created = {}
+
+        class DummyAgent:
+            def __init__(self):
+                self.backends = [DummyBackend("low"), DummyBackend("medium")]
+                self.llmclients = [DummyLLMClient(item) for item in self.backends]
+                self.llm_no = 0
+                self.llmclient = self.llmclients[0]
+                self.history = []
+                self.handler = None
+                self.inc_out = False
+                created["agent"] = self
+
+            def run(self):
+                return None
+
+            def list_llms(self):
+                return [
+                    (0, "launcher/default", self.llm_no == 0),
+                    (1, "launcher/secondary", self.llm_no == 1),
+                ]
+
+            def next_llm(self, idx):
+                self.llm_no = int(idx)
+                self.llmclient = self.llmclients[self.llm_no]
+
+            def abort(self):
+                return None
+
+        agentmain = types.ModuleType("agentmain")
+        agentmain.GeneraticAgent = DummyAgent
+        commands = "\n".join(
+            [
+                json.dumps({"cmd": "switch_reasoning_effort", "reasoning_effort": "high"}, ensure_ascii=False),
+                json.dumps({"cmd": "switch_llm", "idx": 1}, ensure_ascii=False),
+                json.dumps({"cmd": "switch_llm", "idx": 0}, ensure_ascii=False),
+                json.dumps({"cmd": "get_state", "session_id": "sess-1", "request_id": 1}, ensure_ascii=False),
+                json.dumps({"cmd": "quit"}, ensure_ascii=False),
+            ]
+        ) + "\n"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        prev_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+            sys.modules, {"agentmain": agentmain}, clear=False
+        ), mock.patch.object(
+            bridge, "_patch_llm_usage_capture", return_value=None
+        ), mock.patch.object(
+            bridge, "_patch_code_run_stdin", return_value=None
+        ), mock.patch.object(
+            sys, "argv", ["bridge.py", td]
+        ), mock.patch.object(
+            sys, "stdin", io.StringIO(commands)
+        ), mock.patch.object(
+            sys, "stdout", stdout
+        ), mock.patch.object(
+            sys, "stderr", stderr
+        ):
+            try:
+                bridge.main()
+            finally:
+                os.chdir(prev_cwd)
+
+        events = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
+        state_event = next(ev for ev in reversed(events) if ev.get("event") == "state")
+
+        self.assertEqual(state_event["reasoning_effort"], "low")
+        self.assertEqual(created["agent"].backends[0].reasoning_effort, "low")
+        self.assertEqual(created["agent"].backends[1].reasoning_effort, "medium")
+
+    def test_load_remote_session_without_saved_reasoning_keeps_combo_on_follow_config(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+                self.current_index = None
+                self.enabled = None
+                self.tooltip = ""
+
+            def clear(self):
+                self.items = []
+                self.current_index = None
+
+            def addItem(self, label, value):
+                self.items.append((label, value))
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+        class DummySidebar(SidebarSessionsMixin, BridgeRuntimeMixin):
+            _load_session_by_id = SidebarSessionsMixin._load_session_by_id
+            _apply_bridge_widget_state = BridgeRuntimeMixin._apply_bridge_widget_state
+            _bridge_reasoning_effort_combo_disabled_reason = BridgeRuntimeMixin._bridge_reasoning_effort_combo_disabled_reason
+            _current_session_reasoning_effort_override = BridgeRuntimeMixin._current_session_reasoning_effort_override
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _current_reasoning_effort_selection = BridgeRuntimeMixin._current_reasoning_effort_selection
+            _sync_reasoning_effort_combo = BridgeRuntimeMixin._sync_reasoning_effort_combo
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _is_remote_session = BridgeRuntimeMixin._is_remote_session
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._busy = False
+                self.current_session = None
+                self._selected_session_id = None
+                self._pending_reasoning_effort_override = "medium"
+                self._bridge_reasoning_effort = "high"
+                self._ignore_reasoning_effort_change = False
+                self.llms = [{"idx": 0, "name": "GPT", "current": True}]
+                self.reasoning_effort_combo = DummyCombo()
+                self.status_text = ""
+                self.remote_refresh = None
+
+            def _session_device_scope_id(self, session):
+                return ("remote", "box-1")
+
+            def _remote_device_by_id(self, device_id):
+                return {"id": device_id, "name": "Mac Mini"}
+
+            def _align_sidebar_to_session(self, session):
+                return None
+
+            def _render_session(self, session):
+                self.rendered = dict(session)
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _is_channel_process_session(self, session=None):
+                return False
+
+            def _refresh_remote_session_cache_async(self, session):
+                self.remote_refresh = dict(session)
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _sync_floating_reasoning_effort_combo(self):
+                return None
+
+            @property
+            def _bridge_ready(self):
+                return False
+
+        dummy = DummySidebar()
+        payload = {
+            "id": "sess-remote",
+            "title": "Remote session",
+            "channel_id": "launcher",
+            "snapshot": {"llm_idx": 0},
+        }
+        with mock.patch.object(lz, "load_session", return_value=dict(payload)):
+            dummy._load_session_by_id("sess-remote")
+
+        self.assertIsNone(dummy._pending_reasoning_effort_override)
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 0)
+        self.assertTrue(dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(dummy.reasoning_effort_combo.tooltip, "切换当前会话使用的思考强度。")
+        self.assertEqual(dummy.status_text, "已载入远程会话缓存，正在后台同步；可继续发送，新内容会尝试写回远端。")
+
+    def test_new_blank_session_clears_stale_pending_reasoning_but_keeps_manual_first_send_override(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+                self.current_index = None
+                self.enabled = None
+                self.tooltip = ""
+
+            def clear(self):
+                self.items = []
+                self.current_index = None
+
+            def addItem(self, label, value):
+                self.items.append((label, value))
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def itemData(self, index):
+                return self.items[index][1]
+
+        class DummySidebar(SidebarSessionsMixin, BridgeRuntimeMixin):
+            _new_session = SidebarSessionsMixin._new_session
+            _ensure_session = SidebarSessionsMixin._ensure_session
+            _on_reasoning_effort_changed = BridgeRuntimeMixin._on_reasoning_effort_changed
+            _apply_bridge_widget_state = BridgeRuntimeMixin._apply_bridge_widget_state
+            _bridge_reasoning_effort_combo_disabled_reason = BridgeRuntimeMixin._bridge_reasoning_effort_combo_disabled_reason
+            _current_session_reasoning_effort_override = BridgeRuntimeMixin._current_session_reasoning_effort_override
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _current_reasoning_effort_selection = BridgeRuntimeMixin._current_reasoning_effort_selection
+            _sync_reasoning_effort_combo = BridgeRuntimeMixin._sync_reasoning_effort_combo
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+            _is_remote_session = BridgeRuntimeMixin._is_remote_session
+
+            def __init__(self):
+                self._busy = False
+                self.agent_dir = "C:\\demo"
+                self.current_session = {"id": "old-session", "device_scope": "local", "device_id": "local"}
+                self._selected_session_id = "old-session"
+                self._pending_state_session = {"id": "pending"}
+                self._pending_reasoning_effort_override = "high"
+                self._bridge_reasoning_effort = "low"
+                self._ignore_reasoning_effort_change = False
+                self._bridge_ready = False
+                self.bridge_proc = mock.Mock(pid=99)
+                self.llms = [{"idx": 0, "name": "GPT", "current": True}]
+                self.reasoning_effort_combo = DummyCombo()
+                self._sidebar_view_mode = "roots"
+                self._sidebar_device_scope = "local"
+                self._sidebar_device_id = "local"
+                self._sidebar_channel_id = "launcher"
+                self.status_text = ""
+                self.reset_text = ""
+                self.restart_calls = 0
+                self.refresh_calls = 0
+                self.header_updates = 0
+
+            def _can_create_session_for_channel(self, channel_id, show_message=True, device_scope=None, device_id=None):
+                return True
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _reset_chat_area(self, text):
+                self.reset_text = str(text)
+
+            def _restart_bridge(self):
+                self.restart_calls += 1
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+            def _current_llm_index(self):
+                return 0
+
+            def _ensure_session_usage_metadata(self, session):
+                return None
+
+            def _update_header_labels(self):
+                self.header_updates += 1
+
+            def _sync_floating_reasoning_effort_combo(self):
+                return None
+
+        dummy = DummySidebar()
+        dummy._new_session(scope="local", device_id="local", prompt_device=False)
+
+        self.assertIsNone(dummy.current_session)
+        self.assertIsNone(dummy._pending_reasoning_effort_override)
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 3)
+        self.assertEqual(dummy.restart_calls, 1)
+
+        dummy._on_reasoning_effort_changed(5)
+        self.assertEqual(dummy._pending_reasoning_effort_override, "high")
+
+        dummy._ensure_session("hello world")
+
+        self.assertEqual(dummy.current_session["reasoning_effort"], "high")
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort"], "high")
+        self.assertEqual(dummy.current_session["snapshot"]["reasoning_effort_source"], "override")
+        self.assertEqual(dummy.header_updates, 1)
+
+    def test_clear_current_context_after_session_removed_clears_pending_reasoning_and_prevents_leak(self):
+        class DummyCombo:
+            def __init__(self):
+                self.items = []
+                self.current_index = None
+                self.enabled = None
+                self.tooltip = ""
+
+            def clear(self):
+                self.items = []
+                self.current_index = None
+
+            def addItem(self, label, value):
+                self.items.append((label, value))
+
+            def setCurrentIndex(self, index):
+                self.current_index = int(index)
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+        class DummySidebar(SidebarSessionsMixin, BridgeRuntimeMixin):
+            _clear_current_context_after_session_removed = SidebarSessionsMixin._clear_current_context_after_session_removed
+            _ensure_session = SidebarSessionsMixin._ensure_session
+            _apply_bridge_widget_state = BridgeRuntimeMixin._apply_bridge_widget_state
+            _bridge_reasoning_effort_combo_disabled_reason = BridgeRuntimeMixin._bridge_reasoning_effort_combo_disabled_reason
+            _current_session_reasoning_effort_override = BridgeRuntimeMixin._current_session_reasoning_effort_override
+            _session_snapshot_reasoning_effort = BridgeRuntimeMixin._session_snapshot_reasoning_effort
+            _session_snapshot_reasoning_effort_source = BridgeRuntimeMixin._session_snapshot_reasoning_effort_source
+            _current_reasoning_effort_selection = BridgeRuntimeMixin._current_reasoning_effort_selection
+            _sync_reasoning_effort_combo = BridgeRuntimeMixin._sync_reasoning_effort_combo
+            _normalize_reasoning_effort_value = BridgeRuntimeMixin._normalize_reasoning_effort_value
+
+            def __init__(self):
+                self._pending_state_session = {"id": "pending"}
+                self.current_session = {
+                    "id": "old-session",
+                    "reasoning_effort": "high",
+                    "snapshot": {"reasoning_effort": "high", "reasoning_effort_source": "override"},
+                }
+                self._selected_session_id = "old-session"
+                self._pending_reasoning_effort_override = "high"
+                self._bridge_reasoning_effort = "low"
+                self._ignore_reasoning_effort_change = False
+                self.llms = [{"idx": 0, "name": "GPT", "current": True}]
+                self.reasoning_effort_combo = DummyCombo()
+                self.bridge_proc = mock.Mock(pid=99)
+                self.status_text = ""
+                self.reset_text = ""
+                self.restart_calls = 0
+                self.composer_refreshes = 0
+                self.header_updates = 0
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _reset_chat_area(self, text):
+                self.reset_text = str(text)
+
+            def _restart_bridge(self):
+                self.restart_calls += 1
+
+            def _refresh_composer_enabled(self):
+                self.composer_refreshes += 1
+
+            def _sync_floating_reasoning_effort_combo(self):
+                return None
+
+            def _current_device_context(self):
+                return "local", "local"
+
+            def _current_llm_index(self):
+                return 0
+
+            def _ensure_session_usage_metadata(self, session):
+                return None
+
+            def _update_header_labels(self):
+                self.header_updates += 1
+
+        dummy = DummySidebar()
+        dummy._sync_reasoning_effort_combo()
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 5)
+
+        dummy._clear_current_context_after_session_removed("当前会话已删除。", restart_bridge=True)
+
+        self.assertIsNone(dummy._pending_state_session)
+        self.assertIsNone(dummy.current_session)
+        self.assertIsNone(dummy._selected_session_id)
+        self.assertIsNone(dummy._pending_reasoning_effort_override)
+        self.assertEqual(dummy.reasoning_effort_combo.current_index, 3)
+        self.assertTrue(dummy.reasoning_effort_combo.enabled)
+        self.assertEqual(dummy.reasoning_effort_combo.tooltip, "切换当前会话使用的思考强度。")
+        self.assertEqual(dummy.status_text, "当前会话已删除。")
+        self.assertEqual(dummy.reset_text, "选择一个会话，或新建会话开始聊天。")
+        self.assertEqual(dummy.restart_calls, 1)
+        self.assertEqual(dummy.composer_refreshes, 1)
+
+        dummy._ensure_session("hello world")
+
+        self.assertNotIn("reasoning_effort", dummy.current_session)
+        self.assertNotIn("reasoning_effort", dummy.current_session["snapshot"])
+        self.assertEqual(dummy.header_updates, 1)
+
+    def test_rename_sidebar_session_updates_title_and_refreshes_list(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _rename_sidebar_session = SidebarSessionsMixin._rename_sidebar_session
+
+            def __init__(self):
+                self.current_session = {"id": "sess-1", "title": "Old Title", "channel_id": "launcher"}
+                self._last_session_list_signature = "cached"
+                self.saved = []
+                self.refresh_calls = 0
+                self.status_text = ""
+                self.header_updates = 0
+
+            def _load_sidebar_session_row(self, row):
+                return {"id": "sess-1", "title": "Old Title", "channel_id": "launcher"}
+
+            def _save_sidebar_session_row(self, row, data, *, touch=True):
+                self.saved.append((dict(row), dict(data), bool(touch)))
+                return True, ""
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+            def _update_header_labels(self):
+                self.header_updates += 1
+
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.QInputDialog, "getText", return_value=("New Title", True)):
+            dummy._rename_sidebar_session({"id": "sess-1"})
+
+        self.assertEqual(len(dummy.saved), 1)
+        self.assertEqual(dummy.saved[0][1]["title"], "New Title")
+        self.assertTrue(dummy.saved[0][2])
+        self.assertEqual(dummy.current_session["title"], "New Title")
+        self.assertEqual(dummy.header_updates, 1)
+        self.assertIsNone(dummy._last_session_list_signature)
+        self.assertEqual(dummy.refresh_calls, 1)
+        self.assertEqual(dummy.status_text, "已重命名会话：New Title")
+
+    def test_rename_sidebar_session_ignores_cancel_blank_and_unchanged_titles(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _rename_sidebar_session = SidebarSessionsMixin._rename_sidebar_session
+
+            def __init__(self):
+                self.current_session = {"id": "sess-1", "title": "Old Title"}
+                self._last_session_list_signature = "cached"
+                self.save_calls = 0
+                self.refresh_calls = 0
+                self.status_text = ""
+
+            def _load_sidebar_session_row(self, row):
+                return {"id": "sess-1", "title": "Old Title"}
+
+            def _save_sidebar_session_row(self, row, data, *, touch=True):
+                self.save_calls += 1
+                return True, ""
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+        for result in ((None, False), ("   ", True), ("Old Title", True)):
+            dummy = DummySidebar()
+            with mock.patch.object(sidebar_sessions.QInputDialog, "getText", return_value=result):
+                dummy._rename_sidebar_session({"id": "sess-1"})
+
+            self.assertEqual(dummy.save_calls, 0)
+            self.assertEqual(dummy.refresh_calls, 0)
+            self.assertEqual(dummy.current_session["title"], "Old Title")
+            self.assertEqual(dummy._last_session_list_signature, "cached")
+            self.assertEqual(dummy.status_text, "")
+
+    def test_save_sidebar_session_row_local_failure_returns_structured_error(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _save_sidebar_session_row = SidebarSessionsMixin._save_sidebar_session_row
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+        dummy = DummySidebar()
+        with mock.patch.object(lz, "save_session", side_effect=OSError("disk full")) as save_session:
+            ok, err = dummy._save_sidebar_session_row({"id": "sess-1"}, {"id": "sess-1", "title": "Demo"}, touch=True)
+
+        self.assertFalse(ok)
+        self.assertEqual(err, "写入本地会话失败：disk full")
+        save_session.assert_called_once()
+
+    def test_rename_local_sidebar_session_failure_warns_with_generic_save_title(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _rename_sidebar_session = SidebarSessionsMixin._rename_sidebar_session
+            _save_sidebar_session_row = SidebarSessionsMixin._save_sidebar_session_row
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.current_session = {"id": "sess-1", "title": "Old Title", "channel_id": "launcher"}
+                self._last_session_list_signature = "cached"
+                self.refresh_calls = 0
+                self.status_text = ""
+
+            def _load_sidebar_session_row(self, row):
+                return {"id": "sess-1", "title": "Old Title", "channel_id": "launcher"}
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.QInputDialog, "getText", return_value=("New Title", True)), mock.patch.object(
+            sidebar_sessions.QMessageBox, "warning"
+        ) as warning_box, mock.patch.object(lz, "save_session", side_effect=OSError("disk full")) as save_session:
+            dummy._rename_sidebar_session({"id": "sess-1"})
+
+        save_session.assert_called_once()
+        self.assertEqual(dummy.current_session["title"], "Old Title")
+        self.assertEqual(dummy.refresh_calls, 0)
+        self.assertEqual(dummy._last_session_list_signature, "cached")
+        self.assertEqual(dummy.status_text, "")
+        warning_box.assert_called_once()
+        self.assertEqual(warning_box.call_args.args[1], "保存失败")
+        self.assertEqual(warning_box.call_args.args[2], "写入本地会话失败：disk full")
+
+    def test_rename_remote_sidebar_session_failure_keeps_local_title_and_skips_local_save(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _rename_sidebar_session = SidebarSessionsMixin._rename_sidebar_session
+            _save_sidebar_session_row = SidebarSessionsMixin._save_sidebar_session_row
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.current_session = {
+                    "id": "sess-1",
+                    "title": "Old Title",
+                    "device_scope": "remote",
+                    "device_id": "box-1",
+                }
+                self._last_session_list_signature = "cached"
+                self.refresh_calls = 0
+                self.status_text = ""
+
+            def _load_sidebar_session_row(self, row):
+                return {
+                    "id": "sess-1",
+                    "title": "Old Title",
+                    "device_scope": "remote",
+                    "device_id": "box-1",
+                }
+
+            def _session_device_scope_id(self, session):
+                return ("remote", "box-1")
+
+            def _save_remote_session_source(self, data):
+                self.remote_attempt = dict(data)
+                return False, "SSH 超时"
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+            def _set_status(self, text):
+                self.status_text = str(text)
+
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.QInputDialog, "getText", return_value=("New Title", True)), mock.patch.object(
+            sidebar_sessions.QMessageBox, "warning"
+        ) as warning_box, mock.patch.object(lz, "save_session") as save_session:
+            dummy._rename_sidebar_session({"id": "sess-1"})
+
+        save_session.assert_not_called()
+        self.assertEqual(dummy.remote_attempt["title"], "New Title")
+        self.assertEqual(dummy.current_session["title"], "Old Title")
+        self.assertEqual(dummy.refresh_calls, 0)
+        self.assertEqual(dummy._last_session_list_signature, "cached")
+        self.assertEqual(dummy.status_text, "")
+        warning_box.assert_called_once()
+        self.assertEqual(warning_box.call_args.args[1], "保存失败")
+        self.assertIn("SSH 超时", warning_box.call_args.args[2])
+
+    def test_set_sidebar_sessions_pinned_collects_local_save_failures(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _set_sidebar_sessions_pinned = SidebarSessionsMixin._set_sidebar_sessions_pinned
+            _save_sidebar_session_row = SidebarSessionsMixin._save_sidebar_session_row
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._last_session_list_signature = "cached"
+                self.refresh_calls = 0
+
+            def _load_sidebar_session_row(self, row):
+                return {"id": row["id"], "title": row["title"], "channel_id": "launcher"}
+
+            def _session_device_scope_id(self, session):
+                return ("local", "local")
+
+            def _refresh_sessions(self):
+                self.refresh_calls += 1
+
+        rows = [
+            {"id": "sess-1", "title": "One", "pinned": False},
+            {"id": "sess-2", "title": "Two", "pinned": False},
+        ]
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.QMessageBox, "warning") as warning_box, mock.patch.object(
+            lz, "save_session", side_effect=OSError("disk full")
+        ) as save_session:
+            dummy._set_sidebar_sessions_pinned(rows, True)
+
+        self.assertEqual(save_session.call_count, 2)
+        self.assertIsNone(dummy._last_session_list_signature)
+        self.assertEqual(dummy.refresh_calls, 1)
+        warning_box.assert_called_once()
+        self.assertEqual(warning_box.call_args.args[1], "保存失败")
+        self.assertEqual(warning_box.call_args.args[2], "写入本地会话失败：disk full")
+
+    def test_save_remote_session_source_rolls_back_remote_when_local_cache_save_fails(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    if path not in storage:
+                        raise FileNotFoundError(path)
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self.storage = storage
+
+            def open(self, path, mode):
+                return DummyRemoteFile(self.storage, path, mode)
+
+            def remove(self, path):
+                if path not in self.storage:
+                    raise FileNotFoundError(path)
+                del self.storage[path]
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._sftp = DummySFTP(storage)
+
+            def open_sftp(self):
+                return self._sftp
+
+            def close(self):
+                return None
+
+        class DummySidebar(SidebarSessionsMixin):
+            _save_remote_session_source = SidebarSessionsMixin._save_remote_session_source
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+
+            def _session_device_scope_id(self, session):
+                return ("remote", "box-1")
+
+            def _is_channel_process_session(self, session):
+                return False
+
+            def _remote_device_by_id(self, device_id):
+                return {"id": "box-1", "name": "远程设备"}
+
+            def _remote_source_session_id(self, data):
+                return "remote-1"
+
+            def _remote_launcher_sessions_dir(self, device):
+                return "/remote/sessions"
+
+            def _open_remote_device_client(self, dev, timeout=12):
+                return DummyClient(self._storage), "", None
+
+            def _ensure_remote_launcher_sessions_dir(self, client, dev):
+                return True, ""
+
+        remote_fp = "/remote/sessions/remote-1.json"
+        original_remote = json.dumps({"id": "remote-1", "title": "Old Title"}, ensure_ascii=False, indent=2).encode("utf-8")
+        storage = {remote_fp: original_remote}
+        dummy = DummySidebar(storage)
+        session = {
+            "id": "cache-1",
+            "title": "New Title",
+            "device_scope": "remote",
+            "device_id": "box-1",
+            "remote_session_id": "remote-1",
+        }
+        with mock.patch.object(sidebar_sessions, "runtime_context_matches", return_value=True), mock.patch.object(
+            lz, "save_session", side_effect=OSError("disk full")
+        ) as save_session:
+            ok, err = dummy._save_remote_session_source(session)
+
+        self.assertFalse(ok)
+        self.assertIn("disk full", err)
+        self.assertIn("已回滚远端改动", err)
+        save_session.assert_called_once()
+        self.assertEqual(storage[remote_fp], original_remote)
+
+    def test_save_remote_session_source_still_updates_local_cache_after_runtime_context_changes(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    if path not in storage:
+                        raise FileNotFoundError(path)
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self.storage = storage
+
+            def open(self, path, mode):
+                return DummyRemoteFile(self.storage, path, mode)
+
+            def remove(self, path):
+                if path not in self.storage:
+                    raise FileNotFoundError(path)
+                del self.storage[path]
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._sftp = DummySFTP(storage)
+
+            def open_sftp(self):
+                return self._sftp
+
+            def close(self):
+                return None
+
+        class DummySidebar(SidebarSessionsMixin):
+            _save_remote_session_source = SidebarSessionsMixin._save_remote_session_source
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+
+            def _session_device_scope_id(self, session):
+                return ("remote", "box-1")
+
+            def _is_channel_process_session(self, session):
+                return False
+
+            def _remote_device_by_id(self, device_id):
+                return {"id": "box-1", "name": "远程设备"}
+
+            def _remote_source_session_id(self, data):
+                return "remote-1"
+
+            def _remote_launcher_sessions_dir(self, device):
+                return "/remote/sessions"
+
+            def _open_remote_device_client(self, dev, timeout=12):
+                return DummyClient(self._storage), "", None
+
+            def _ensure_remote_launcher_sessions_dir(self, client, dev):
+                return True, ""
+
+        remote_fp = "/remote/sessions/remote-1.json"
+        original_remote = json.dumps({"id": "remote-1", "title": "Old Title"}, ensure_ascii=False, indent=2).encode("utf-8")
+        storage = {remote_fp: original_remote}
+        dummy = DummySidebar(storage)
+        session = {
+            "id": "cache-1",
+            "title": "New Title",
+            "device_scope": "remote",
+            "device_id": "box-1",
+            "remote_session_id": "remote-1",
+        }
+        with mock.patch.object(sidebar_sessions, "runtime_context_matches", return_value=False), mock.patch.object(
+            lz, "save_session"
+        ) as save_session:
+            ok, err = dummy._save_remote_session_source(session, runtime_context={"agent_dir": "C:\\other"})
+
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        save_session.assert_called_once()
+        saved_payload = save_session.call_args.args[1]
+        self.assertEqual(saved_payload["id"], "cache-1")
+        self.assertEqual(saved_payload["title"], "New Title")
 
     def test_refresh_remote_session_cache_async_updates_status_when_sync_succeeds(self):
         class ImmediateThread:
@@ -5077,6 +7303,45 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             dummy._save_remote_session_source_async({"id": "sess-1", "device_scope": "remote", "device_id": "box-1"})
 
         self.assertEqual(dummy.statuses, ["远端会话写回失败，当前内容仍保留在本地缓存：SSH 超时；可稍后重试同步或检查 SSH。"])
+
+    def test_save_remote_session_source_async_reports_remote_rollback_status(self):
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if callable(self._target):
+                    self._target()
+
+        class DummySidebar(SidebarSessionsMixin):
+            _save_remote_session_source_async = SidebarSessionsMixin._save_remote_session_source_async
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._runtime_context_generation = 2
+                self.statuses = []
+
+            def _session_device_scope_id(self, session):
+                return ("remote", "box-1")
+
+            def _save_remote_session_source(self, session, *, agent_dir="", runtime_context=None):
+                return False, "写入本地缓存失败：disk full；已回滚远端改动。"
+
+            def _sidebar_post_ui(self, callback):
+                if callable(callback):
+                    callback()
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.threading, "Thread", ImmediateThread):
+            dummy._save_remote_session_source_async({"id": "sess-1", "device_scope": "remote", "device_id": "box-1"})
+
+        self.assertEqual(
+            dummy.statuses,
+            ["远端会话写回失败，已回滚远端改动，本地缓存保持不变：写入本地缓存失败：disk full；已回滚远端改动。；可稍后重试同步或检查本地磁盘。"],
+        )
 
     def test_reload_personal_panel_remote_sync_notice_and_completion_status(self):
         class DummyLabel:

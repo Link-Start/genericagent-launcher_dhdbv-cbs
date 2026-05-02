@@ -742,36 +742,54 @@ class SidebarSessionsMixin:
         client, err_msg, _missing = self._open_remote_device_client(dev, timeout=12)
         if client is None:
             return False, err_msg
+        sftp = None
         try:
             ok, detail = self._ensure_remote_launcher_sessions_dir(client, dev)
             if not ok:
                 return False, detail
             sftp = client.open_sftp()
+            remote_dir = self._remote_launcher_sessions_dir(dev)
+            remote_fp = f"{remote_dir}/{remote_sid}.json"
+            previous_remote_bytes = None
             try:
-                remote_dir = self._remote_launcher_sessions_dir(dev)
-                remote_fp = f"{remote_dir}/{remote_sid}.json"
-                text = json.dumps(payload, ensure_ascii=False, indent=2)
-                with sftp.open(remote_fp, "wb") as fp:
-                    fp.write(text.encode("utf-8"))
-            finally:
-                try:
-                    sftp.close()
-                except Exception:
-                    pass
+                with sftp.open(remote_fp, "rb") as fp:
+                    previous_remote_bytes = fp.read()
+            except Exception as read_err:
+                read_text = str(read_err or "").strip().lower()
+                read_errno = getattr(read_err, "errno", None)
+                if read_errno not in (None, 2) and "no such file" not in read_text and "not found" not in read_text:
+                    raise
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            with sftp.open(remote_fp, "wb") as fp:
+                fp.write(text.encode("utf-8"))
         except Exception as e:
             return False, f"写入远端会话失败：{e}"
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
         local_payload = dict(payload)
         local_payload["id"] = cache_sid
         local_payload["remote_session_id"] = remote_sid
         local_payload["remote_updated_at"] = float(payload.get("updated_at", 0) or 0)
-        if not runtime_context_matches(self, runtime_context):
-            return False, ""
-        lz.save_session(root, local_payload, touch=False)
+        try:
+            lz.save_session(root, local_payload, touch=False)
+        except Exception as save_err:
+            try:
+                if previous_remote_bytes is None:
+                    sftp.remove(remote_fp)
+                else:
+                    with sftp.open(remote_fp, "wb") as fp:
+                        fp.write(previous_remote_bytes)
+            except Exception as rollback_err:
+                return False, f"写入本地缓存失败：{save_err}；且远端回滚失败：{rollback_err}"
+            return False, f"写入本地缓存失败：{save_err}；已回滚远端改动。"
+        finally:
+            try:
+                if sftp is not None:
+                    sftp.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
         return True, ""
 
     def _save_remote_session_source_async(self, session, *, on_error_status=True):
@@ -789,7 +807,13 @@ class SidebarSessionsMixin:
                 if not runtime_context_matches(self, context):
                     return
                 if not ok and on_error_status:
-                    self._set_status(f"远端会话写回失败，当前内容仍保留在本地缓存：{err}；可稍后重试同步或检查 SSH。")
+                    detail = str(err or "").strip()
+                    if "已回滚远端改动" in detail:
+                        self._set_status(f"远端会话写回失败，已回滚远端改动，本地缓存保持不变：{detail}；可稍后重试同步或检查本地磁盘。")
+                    elif "远端回滚失败" in detail:
+                        self._set_status(f"远端会话写回失败，本地缓存未更新且远端回滚失败：{detail}；请尽快检查远端会话状态。")
+                    else:
+                        self._set_status(f"远端会话写回失败，当前内容仍保留在本地缓存：{detail}；可稍后重试同步或检查 SSH。")
 
             self._sidebar_post_ui(done)
 
@@ -1775,9 +1799,13 @@ class SidebarSessionsMixin:
         count = len(rows)
         all_pinned = all(bool(row.get("pinned", False)) for row in rows)
         menu = QMenu(self)
+        rename_action = menu.addAction("重命名") if count == 1 else None
         pin_action = menu.addAction(f"{'取消收藏' if all_pinned else '收藏'}所选 ({count})")
         delete_action = menu.addAction(f"删除所选 ({count})")
         chosen = menu.exec(self.session_list.viewport().mapToGlobal(pos))
+        if chosen is rename_action:
+            self._rename_sidebar_session(rows[0])
+            return
         if chosen is pin_action:
             self._set_sidebar_sessions_pinned(rows, not all_pinned)
             return
@@ -1788,11 +1816,42 @@ class SidebarSessionsMixin:
         return lz.load_session(self.agent_dir, row.get("id"))
 
     def _save_sidebar_session_row(self, row, data, *, touch=True):
-        lz.save_session(self.agent_dir, data, touch=touch)
         scope, _did = self._session_device_scope_id(data)
         if scope == "remote":
             return self._save_remote_session_source(data)
+        try:
+            lz.save_session(self.agent_dir, data, touch=touch)
+        except Exception as save_err:
+            return False, f"写入本地会话失败：{save_err}"
         return True, ""
+
+    def _rename_sidebar_session(self, row):
+        if not isinstance(row, dict):
+            return
+        data = self._load_sidebar_session_row(row)
+        if not data:
+            return
+        old_title = str(data.get("title") or "").strip()
+        text, ok = QInputDialog.getText(self, "重命名会话", "会话名称", text=old_title)
+        if not ok:
+            return
+        new_title = str(text or "").strip()
+        if not new_title or new_title == old_title:
+            return
+        data["title"] = new_title
+        ok, err = self._save_sidebar_session_row(row, data, touch=True)
+        if not ok:
+            QMessageBox.warning(self, "保存失败", str(err or "保存会话失败。"))
+            return
+        if str((self.current_session or {}).get("id") or "") == str(data.get("id") or ""):
+            self.current_session = dict(self.current_session or {})
+            self.current_session["title"] = new_title
+            updater = getattr(self, "_update_header_labels", None)
+            if callable(updater):
+                updater()
+        self._last_session_list_signature = None
+        self._refresh_sessions()
+        self._set_status(f"已重命名会话：{new_title}")
 
     def _set_sidebar_sessions_pinned(self, rows, pinned: bool):
         failed = []
@@ -1803,20 +1862,24 @@ class SidebarSessionsMixin:
             data["pinned"] = bool(pinned)
             ok, err = self._save_sidebar_session_row(row, data, touch=True)
             if not ok:
-                failed.append(str(err or "同步远端失败。"))
+                failed.append(str(err or "保存会话失败。"))
         self._last_session_list_signature = None
         self._refresh_sessions()
         if failed:
-            QMessageBox.warning(self, "远端同步失败", "\n".join(dict.fromkeys(failed)))
+            QMessageBox.warning(self, "保存失败", "\n".join(dict.fromkeys(failed)))
 
     def _clear_current_context_after_session_removed(self, status_text: str, *, restart_bridge=True):
         self._pending_state_session = None
         self.current_session = None
         self._selected_session_id = None
+        self._pending_reasoning_effort_override = None
         self._set_status(status_text)
         self._reset_chat_area("选择一个会话，或新建会话开始聊天。")
         if restart_bridge:
             self._restart_bridge()
+        sync_reasoning = getattr(self, "_sync_reasoning_effort_combo", None)
+        if callable(sync_reasoning):
+            sync_reasoning()
         self._refresh_composer_enabled()
 
     def _delete_sidebar_sessions(self, rows):
@@ -1883,6 +1946,10 @@ class SidebarSessionsMixin:
         self._align_sidebar_to_session(data)
         self._selected_session_id = sid
         self.current_session = data
+        self._pending_reasoning_effort_override = None
+        sync_reasoning = getattr(self, "_sync_reasoning_effort_combo", None)
+        if callable(sync_reasoning):
+            sync_reasoning()
         self._render_session(self.current_session)
         self._refresh_composer_enabled()
         if self._is_channel_process_session(self.current_session):
@@ -1892,16 +1959,24 @@ class SidebarSessionsMixin:
             self._set_status("已载入远程会话缓存，正在后台同步；可继续发送，新内容会尝试写回远端。")
             self._refresh_remote_session_cache_async(self.current_session)
             return
-        self._bind_session_to_current_bridge(self.current_session)
+        self._bind_session_to_current_bridge(self.current_session, preserve_session_state=True)
         if self._bridge_ready:
-            self._send_cmd(
-                {
-                    "cmd": "set_state",
-                    "backend_history": data.get("backend_history") or [],
-                    "agent_history": data.get("agent_history") or [],
-                    "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
-                }
-            )
+            payload = {
+                "cmd": "set_state",
+                "backend_history": data.get("backend_history") or [],
+                "agent_history": data.get("agent_history") or [],
+                "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
+            }
+            payload_helper = getattr(self, "_session_reasoning_effort_payload", None)
+            if callable(payload_helper):
+                include_reasoning, reasoning_value = payload_helper(data)
+                if include_reasoning:
+                    payload["reasoning_effort"] = reasoning_value
+            else:
+                session_reasoning_effort = data.get("reasoning_effort", ((data.get("snapshot") or {}).get("reasoning_effort")))
+                if session_reasoning_effort is not None:
+                    payload["reasoning_effort"] = session_reasoning_effort
+            self._send_cmd(payload)
             self._request_backend_state(sid)
             self._set_status("已载入本地会话。")
         else:
@@ -2022,6 +2097,7 @@ class SidebarSessionsMixin:
         self._pending_state_session = None
         self.current_session = None
         self._selected_session_id = None
+        self._pending_reasoning_effort_override = None
         self._sidebar_view_mode = "sessions"
         self._sidebar_device_scope = scope
         self._sidebar_device_id = did if scope == "remote" else "local"
@@ -2037,6 +2113,9 @@ class SidebarSessionsMixin:
         )
         if scope == "local":
             self._restart_bridge()
+        sync_reasoning = getattr(self, "_sync_reasoning_effort_combo", None)
+        if callable(sync_reasoning):
+            sync_reasoning()
         self._refresh_composer_enabled()
         self._last_session_list_signature = None
         self._refresh_sessions()
@@ -2084,6 +2163,11 @@ class SidebarSessionsMixin:
                 "has_agent_history": False,
             },
         }
+        pending_reasoning = str(getattr(self, "_pending_reasoning_effort_override", "") or "").strip().lower()
+        if pending_reasoning:
+            self.current_session["reasoning_effort"] = pending_reasoning
+            self.current_session["snapshot"]["reasoning_effort"] = pending_reasoning
+            self.current_session["snapshot"]["reasoning_effort_source"] = "override"
         self._ensure_session_usage_metadata(self.current_session)
         self._selected_session_id = self.current_session["id"]
         self._update_header_labels()

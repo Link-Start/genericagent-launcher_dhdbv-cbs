@@ -118,6 +118,45 @@ def _llm_backend(llmclient):
     return None
 
 
+_REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
+
+
+def _normalize_reasoning_effort(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    return text if text in _REASONING_EFFORT_VALUES else None
+
+
+def _current_reasoning_effort(agent):
+    backend = _llm_backend(getattr(agent, "llmclient", None))
+    if backend is None:
+        return None
+    return _normalize_reasoning_effort(getattr(backend, "reasoning_effort", None))
+
+
+def _reasoning_effort_defaults(agent):
+    out = {}
+    for idx, llmclient in enumerate(list(getattr(agent, "llmclients", []) or [])):
+        backend = _llm_backend(llmclient)
+        out[idx] = _normalize_reasoning_effort(getattr(backend, "reasoning_effort", None) if backend is not None else None)
+    return out
+
+
+def _apply_reasoning_effort(agent, value, *, defaults=None):
+    backend = _llm_backend(getattr(agent, "llmclient", None))
+    if backend is None:
+        return None
+    normalized = _normalize_reasoning_effort(value)
+    if normalized is None and isinstance(defaults, dict):
+        try:
+            normalized = _normalize_reasoning_effort(defaults.get(int(getattr(agent, "llm_no", 0) or 0)))
+        except Exception:
+            normalized = None
+    setattr(backend, "reasoning_effort", normalized)
+    return _current_reasoning_effort(agent)
+
+
 def _copy_backend_history(llmclient):
     backend = _llm_backend(llmclient)
     if backend is None:
@@ -184,10 +223,19 @@ def send(obj):
         pass
 
 
+def _ui_llm_display_name(raw_name):
+    text = str(raw_name or "").strip()
+    if not text:
+        return ""
+    if "/" not in text:
+        return text
+    return text.split("/", 1)[1].strip() or text
+
+
 def _ui_llms(agent):
     items = []
     for i, raw_name, current in agent.list_llms():
-        items.append({"idx": i, "name": str(raw_name or "").strip(), "current": current})
+        items.append({"idx": i, "name": _ui_llm_display_name(raw_name), "current": current})
     return items
 
 
@@ -735,10 +783,11 @@ def main():
             send({"event": "error", "msg": setup_msg})
             return
         agent.inc_out = False
+        reasoning_defaults = _reasoning_effort_defaults(agent)
         if setup_msg:
             send({"event": "log", "msg": setup_msg})
         threading.Thread(target=agent.run, daemon=True).start()
-        send({"event": "ready", "llms": _ui_llms(agent)})
+        send({"event": "ready", "llms": _ui_llms(agent), "reasoning_effort": _current_reasoning_effort(agent)})
     except Exception as e:
         send({"event": "error", "msg": str(e), "trace": traceback.format_exc()[-1500:]})
         return
@@ -775,6 +824,7 @@ def main():
                             "backend_history": backend_hist,
                             "agent_history": list(agent.history or []),
                             "llm_idx": int(getattr(agent, "llm_no", 0) or 0),
+                            "reasoning_effort": _current_reasoning_effort(agent),
                             "process_pid": os.getpid(),
                             "snapshot_ts": time.time(),
                         }
@@ -813,7 +863,11 @@ def main():
                     if not ok:
                         send({"event": "error", "msg": setup_msg})
                         continue
-                send({"event": "llm_switched", "llms": _ui_llms(agent)})
+                applied = _apply_reasoning_effort(agent, None, defaults=reasoning_defaults)
+                send({"event": "llm_switched", "llms": _ui_llms(agent), "reasoning_effort": applied})
+            elif c == "switch_reasoning_effort":
+                applied = _apply_reasoning_effort(agent, cmd.get("reasoning_effort"), defaults=reasoning_defaults)
+                send({"event": "reasoning_effort_switched", "reasoning_effort": applied})
             elif c == "new_session":
                 try: agent.abort()
                 except Exception: pass
@@ -827,6 +881,7 @@ def main():
                       "backend_history": backend_hist,
                       "agent_history": list(agent.history or []),
                       "llm_idx": agent.llm_no,
+                      "reasoning_effort": _current_reasoning_effort(agent),
                       "session_id": cmd.get("session_id"),
                       "request_id": cmd.get("request_id")})
             elif c == "set_state":
@@ -839,14 +894,26 @@ def main():
                             agent.next_llm(int(requested_llm_idx))
                         except Exception:
                             pass
+                    if "reasoning_effort" in cmd:
+                        _apply_reasoning_effort(agent, cmd.get("reasoning_effort"), defaults=reasoning_defaults)
                     if _llm_backend(getattr(agent, "llmclient", None)) is None:
                         ok, setup_msg = _sanitize_agent_llmclients(agent)
                         if not ok:
                             raise RuntimeError(setup_msg)
+                    _apply_reasoning_effort(
+                        agent,
+                        cmd.get("reasoning_effort") if "reasoning_effort" in cmd else None,
+                        defaults=reasoning_defaults,
+                    )
                     agent.history = list(cmd.get("agent_history") or [])
                     _assign_backend_history(getattr(agent, "llmclient", None), cmd.get("backend_history") or [])
                     agent.handler = None
-                    send({"event": "state_loaded", "llms": _ui_llms(agent), "llm_idx": int(getattr(agent, "llm_no", 0) or 0)})
+                    send({
+                        "event": "state_loaded",
+                        "llms": _ui_llms(agent),
+                        "llm_idx": int(getattr(agent, "llm_no", 0) or 0),
+                        "reasoning_effort": _current_reasoning_effort(agent),
+                    })
                 except Exception as e:
                     send({"event": "error", "msg": f"set_state: {e}"})
             elif c == "quit":

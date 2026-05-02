@@ -285,26 +285,25 @@ def serialize_mykey_py(configs, extras, passthrough=None):
         "# ══════════════════════════════════════════════════════════════════════════════\n"
     )
 
-    groups = [
-        ("mixin", "# ── Mixin 故障转移 ───────────────────────────────────────────────"),
-        ("native_claude", "# ── NativeClaudeSession 渠道 ──────────────────────────────────────"),
-        ("native_oai", "# ── NativeOAISession 渠道 ─────────────────────────────────────────"),
-        ("claude", "# ── ClaudeSession 渠道 (deprecated) ───────────────────────────────"),
-        ("oai", "# ── LLMSession 渠道 (deprecated) ──────────────────────────────────"),
-        ("unknown", "# ── 其它 ─────────────────────────────────────────────────────────"),
-    ]
-    by_kind = {}
-    for c in configs:
-        by_kind.setdefault(c.get("kind", "unknown"), []).append(c)
+    group_titles = {
+        "mixin": "# ── Mixin 故障转移 ───────────────────────────────────────────────",
+        "native_claude": "# ── NativeClaudeSession 渠道 ──────────────────────────────────────",
+        "native_oai": "# ── NativeOAISession 渠道 ─────────────────────────────────────────",
+        "claude": "# ── ClaudeSession 渠道 (deprecated) ───────────────────────────────",
+        "oai": "# ── LLMSession 渠道 (deprecated) ──────────────────────────────────",
+        "unknown": "# ── 其它 ─────────────────────────────────────────────────────────",
+    }
 
     parts = [header]
-    for kind, title in groups:
-        items = by_kind.get(kind, [])
-        if not items:
-            continue
-        parts.append("\n" + title + "\n")
-        for c in items:
-            parts.append(f"{c['var']} = {_fmt_dict(c.get('data') or {})}\n")
+    last_kind = None
+    for c in configs:
+        kind = str(c.get("kind") or "unknown").strip() or "unknown"
+        if kind not in group_titles:
+            kind = "unknown"
+        if kind != last_kind:
+            parts.append("\n" + group_titles[kind] + "\n")
+            last_kind = kind
+        parts.append(f"{c['var']} = {_fmt_dict(c.get('data') or {})}\n")
 
     passthrough = list(passthrough or [])
     if passthrough:

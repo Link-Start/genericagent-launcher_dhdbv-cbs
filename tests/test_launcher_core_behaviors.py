@@ -273,13 +273,13 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         self.assertEqual(agent.llm_no, 0)
         self.assertEqual(agent.llmclient.last_tools, "")
 
-    def test_bridge_ui_llms_keeps_provider_prefix(self):
+    def test_bridge_ui_llms_strips_provider_prefix_but_keeps_display_name(self):
         class DummyAgent:
             def list_llms(self):
                 return [(0, "anthropic/claude-opus-4-6", True)]
 
         items = bridge._ui_llms(DummyAgent())
-        self.assertEqual(items[0]["name"], "anthropic/claude-opus-4-6")
+        self.assertEqual(items[0]["name"], "claude-opus-4-6")
 
     def test_bridge_claude_sse_patch_preserves_thinking_signature_field(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -481,6 +481,7 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
     def test_parse_mykey_py_extracts_configs_and_extras(self):
         src = """
 native_oai_config = {
+    'name': 'Primary OpenAI',
     'apikey': 'k',
     'apibase': 'https://api.openai.com/v1',
     'model': 'gpt-5.4',
@@ -502,6 +503,7 @@ tg_bot_token = '123'
         self.assertIsNone(out["error"])
         self.assertEqual(len(out["configs"]), 1)
         self.assertEqual(out["configs"][0]["kind"], "native_oai")
+        self.assertEqual(out["configs"][0]["data"].get("name"), "Primary OpenAI")
         self.assertEqual(out["extras"].get("tg_bot_token"), "123")
         self.assertEqual(out["extras"].get("langfuse_config", {}).get("public_key"), "pk-demo")
         self.assertEqual(out["passthrough"][0]["name"], "my_cookie")
@@ -527,16 +529,48 @@ tg_bot_token = '123'
                 {
                     "var": "native_claude_config",
                     "kind": "native_claude",
-                    "data": {"apikey": "k", "apibase": "https://x", "model": "m"},
+                    "data": {"name": "Claude Prod", "apikey": "k", "apibase": "https://x", "model": "m"},
                 }
             ],
             extras={"tg_bot_token": "abc", "langfuse_config": {"public_key": "pk", "secret_key": "sk"}},
             passthrough=[{"name": "my_cookie", "value": "cookie-v"}],
         )
         self.assertIn("native_claude_config", text)
+        self.assertIn("'name': 'Claude Prod'", text)
         self.assertIn("tg_bot_token", text)
         self.assertIn("langfuse_config", text)
         self.assertIn("my_cookie", text)
+
+    def test_serialize_mykey_py_preserves_cross_kind_config_order_on_round_trip(self):
+        configs = [
+            {
+                "var": "native_oai_config",
+                "kind": "native_oai",
+                "data": {"name": "OpenAI First", "apikey": "sk-a", "apibase": "https://api.openai.com/v1", "model": "gpt-5.4"},
+            },
+            {
+                "var": "native_claude_config",
+                "kind": "native_claude",
+                "data": {"name": "Claude Middle", "apikey": "sk-b", "apibase": "https://api.anthropic.com", "model": "claude-opus-4-7[1m]"},
+            },
+            {
+                "var": "native_oai_config2",
+                "kind": "native_oai",
+                "data": {"name": "OpenAI Last", "apikey": "sk-c", "apibase": "https://api.second.example/v1", "model": "gpt-5.4-mini"},
+            },
+        ]
+        text = lz.serialize_mykey_py(configs=configs, extras={}, passthrough=[])
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "mykey.py")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(text)
+            parsed = lz.parse_mykey_py(fp)
+
+        self.assertIsNone(parsed["error"])
+        self.assertEqual(
+            [cfg["var"] for cfg in parsed["configs"]],
+            ["native_oai_config", "native_claude_config", "native_oai_config2"],
+        )
 
     def test_api_editor_save_keeps_claude_card_as_native_claude_after_reload(self):
         class DummyApiEditor(ApiEditorMixin):
@@ -2512,7 +2546,14 @@ tg_bot_token = '123'
         steps = _workflow_step_map(path)
         ordered_names = [step["name"] for step in _workflow_named_steps(path)]
         self.assertIn("macos-validate", src)
+        self.assertIn("workflow_dispatch:", src)
+        self.assertIn("inputs:", src)
+        self.assertIn("version:", src)
+        self.assertIn("matrix:", src)
+        self.assertIn("x86_64", src)
+        self.assertIn("arm64", src)
         self.assertIn("macos-15-intel", src)
+        self.assertIn("macos-15", src)
         self.assertIn("pull_request", src)
         self.assertIn("branches:", src)
         self.assertIn("main", src)
@@ -2556,7 +2597,7 @@ tg_bot_token = '123'
         self.assertIn("python tools/validate_macos_release.py", steps["Validate macOS release contract"])
         self.assertIn("--expected-arch", steps["Validate macOS release contract"])
         self.assertIn("--expected-runner-label", steps["Validate macOS release contract"])
-        self.assertIn("Upload macOS validation artifacts", src)
+        self.assertIn("launcher-macos-validate-${{ matrix.arch }}-${{ steps.ver.outputs.value }}", src)
 
     def test_docs_cover_macos_manual_install_contract_and_smoke_checklist(self):
         root = os.path.dirname(os.path.dirname(__file__))

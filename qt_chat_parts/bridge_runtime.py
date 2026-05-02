@@ -19,6 +19,17 @@ from launcher_app.theme import C
 
 from .common import _session_copy, normalize_remote_agent_dir, normalize_ssh_error_text
 
+_RUNTIME_REASONING_EFFORT_CHOICES = [
+    ("", "跟随配置"),
+    ("none", "none"),
+    ("minimal", "minimal"),
+    ("low", "low"),
+    ("medium", "medium"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+]
+_RUNTIME_REASONING_EFFORT_VALUES = {value for value, _label in _RUNTIME_REASONING_EFFORT_CHOICES if value}
+
 
 class BridgeRuntimeMixin:
     def _apply_bridge_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
@@ -40,6 +51,236 @@ class BridgeRuntimeMixin:
         if bool(getattr(self, "llms", None)):
             return ""
         return "当前还没有可用的 LLM 配置。"
+
+    def _bridge_reasoning_effort_combo_disabled_reason(self):
+        if bool(getattr(self, "llms", None)):
+            return ""
+        return "当前还没有可用的 LLM 配置。"
+
+    def _local_slash_help_text(self):
+        return "\n".join(
+            [
+                "/help - 显示帮助",
+                "/stop - 停止当前任务",
+                "/new - 触发启动器新建会话",
+                "/llm - 查看当前模型列表",
+                "/llm N - 切换到第 N 个模型",
+                "/continue - 后台恢复最近一条历史会话",
+                "/continue N - 后台恢复第 N 条历史会话",
+                "/session.<attr>=<val> - 透传给上游 agant 执行运行时参数覆盖",
+            ]
+        )
+
+    def _local_slash_llm_text(self):
+        if not self.llms:
+            return "当前没有可用的 LLM 配置。"
+        lines = []
+        for pos, llm in enumerate(self.llms):
+            marker = "→" if llm.get("current") else "  "
+            label = str(llm.get("name") or "(未命名)").strip() or "(未命名)"
+            lines.append(f"{marker} [{int(llm.get('idx', pos) or pos)}] {label}")
+        return "LLMs:\n" + "\n".join(lines)
+
+    def _local_slash_clear_input(self, source_editor=None):
+        editors = []
+        for editor in (
+            source_editor,
+            getattr(self, "input_box", None),
+            getattr(getattr(self, "_floating_chat_window", None), "input_box", None),
+        ):
+            if editor is None or any(editor is existing for existing in editors):
+                continue
+            editors.append(editor)
+        for editor in editors:
+            try:
+                editor.clear()
+            except Exception:
+                pass
+        self._pending_input_attachments_data = []
+        refresher = getattr(self, "_refresh_input_attachment_bar", None)
+        if callable(refresher):
+            refresher()
+        sync_to_floating = getattr(self, "_sync_draft_to_floating", None)
+        if callable(sync_to_floating):
+            try:
+                sync_to_floating(force=True)
+            except Exception:
+                pass
+
+    def _local_slash_switch_llm(self, llm_idx):
+        try:
+            target = int(llm_idx)
+        except Exception:
+            return False
+        combo = getattr(self, "llm_combo", None)
+        if combo is None:
+            return False
+        for pos, llm in enumerate(self.llms):
+            try:
+                candidate = int(llm.get("idx", pos) or pos)
+            except Exception:
+                continue
+            if candidate != target:
+                continue
+            self._ignore_llm_change = True
+            try:
+                combo.setCurrentIndex(pos)
+            finally:
+                self._ignore_llm_change = False
+            self._on_llm_changed(pos)
+            return True
+        return False
+
+    def _local_slash_continue_rows(self):
+        scope = "local"
+        did = "local"
+        resolver = getattr(self, "_current_device_context", None)
+        if callable(resolver):
+            try:
+                scope, did = resolver()
+            except Exception:
+                scope, did = "local", "local"
+        rows = list(self._active_sessions_for_channel("launcher", device_scope=scope, device_id=did))
+        current_sid = str((self.current_session or {}).get("id") or "").strip()
+        rows = [row for row in rows if str(row.get("id") or "").strip() and str(row.get("id") or "").strip() != current_sid]
+        rows.sort(key=lambda row: float(row.get("updated_at", 0) or 0), reverse=True)
+        return rows
+
+    def _local_slash_restore_session(self, index: int):
+        rows = self._local_slash_continue_rows()
+        if not rows:
+            self._set_status("没有可恢复的历史会话。")
+            return True
+        target = int(index or 0)
+        if target < 0 or target >= len(rows):
+            self._set_status(f"历史会话索引越界（有效范围 1-{len(rows)}）。")
+            return True
+        sid = str(rows[target].get("id") or "").strip()
+        if not sid:
+            self._set_status("目标历史会话无效。")
+            return True
+        self._load_session_by_id(sid)
+        return True
+
+    def _handle_local_slash_command(self, text: str, *, source_editor=None):
+        cmd = str(text or "").strip()
+        if not cmd.startswith("/"):
+            return False
+        if cmd.startswith("/session."):
+            return False
+        parts = cmd.split()
+        op = str(parts[0] if parts else "").strip().lower()
+        if op == "/help":
+            self._local_slash_clear_input(source_editor=source_editor)
+            QMessageBox.information(self, "斜杠命令", self._local_slash_help_text())
+            self._set_status("已显示启动器支持的斜杠命令。")
+            return True
+        if op == "/stop":
+            self._local_slash_clear_input(source_editor=source_editor)
+            self._abort()
+            return True
+        if op == "/new":
+            self._local_slash_clear_input(source_editor=source_editor)
+            scope, did = ("local", "local")
+            resolver = getattr(self, "_current_device_context", None)
+            if callable(resolver):
+                try:
+                    scope, did = resolver()
+                except Exception:
+                    scope, did = "local", "local"
+            self._new_session(scope=scope, device_id=did, prompt_device=False)
+            return True
+        if op == "/llm":
+            self._local_slash_clear_input(source_editor=source_editor)
+            if len(parts) == 1:
+                QMessageBox.information(self, "模型列表", self._local_slash_llm_text())
+                self._set_status("已显示当前模型列表。")
+                return True
+            disabled_reason = ""
+            channel_checker = getattr(self, "_is_channel_process_session", None)
+            try:
+                if callable(channel_checker) and channel_checker():
+                    disabled_reason = "渠道进程会话仅支持查看日志，不能切换模型。"
+            except Exception:
+                disabled_reason = ""
+            if disabled_reason:
+                QMessageBox.information(self, "当前会话只读", disabled_reason)
+                self._set_status(disabled_reason)
+                return True
+            if self._local_slash_switch_llm(parts[1]):
+                return True
+            valid_ids = []
+            for pos, llm in enumerate(self.llms):
+                try:
+                    valid_ids.append(str(int(llm.get("idx", pos) or pos)))
+                except Exception:
+                    continue
+            detail = f"有效编号: {', '.join(dict.fromkeys(valid_ids))}" if valid_ids else "当前没有可用的 LLM 配置。"
+            QMessageBox.warning(self, "切换失败", f"用法: /llm N\n{detail}")
+            return True
+        if op == "/continue":
+            self._local_slash_clear_input(source_editor=source_editor)
+            if len(parts) == 1:
+                return self._local_slash_restore_session(0)
+            try:
+                target_index = int(parts[1]) - 1
+            except Exception:
+                self._set_status("用法: /continue 或 /continue N")
+                return True
+            return self._local_slash_restore_session(target_index)
+        return False
+
+    def _normalize_reasoning_effort_value(self, value):
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return text if text in _RUNTIME_REASONING_EFFORT_VALUES else ""
+
+    def _session_snapshot_reasoning_effort_source(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return ""
+        source = str(((data.get("snapshot") or {}).get("reasoning_effort_source")) or "").strip().lower()
+        return source if source in {"override", "runtime"} else ""
+
+    def _current_session_reasoning_effort_override(self):
+        session = self.current_session if isinstance(getattr(self, "current_session", None), dict) else None
+        if isinstance(session, dict):
+            if "reasoning_effort" in session:
+                return self._normalize_reasoning_effort_value(session.get("reasoning_effort"))
+            if self._session_snapshot_reasoning_effort_source(session) == "override":
+                return self._session_snapshot_reasoning_effort(session)
+            return ""
+        return self._normalize_reasoning_effort_value(getattr(self, "_pending_reasoning_effort_override", None))
+
+    def _session_snapshot_reasoning_effort(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return ""
+        return self._normalize_reasoning_effort_value((data.get("snapshot") or {}).get("reasoning_effort"))
+
+    def _session_reasoning_effort_payload(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return False, None
+        if "reasoning_effort" in data:
+            return True, self._normalize_reasoning_effort_value(data.get("reasoning_effort")) or None
+        if self._session_snapshot_reasoning_effort_source(data) == "override":
+            snapshot_value = self._session_snapshot_reasoning_effort(data) or None
+            if snapshot_value:
+                return True, snapshot_value
+        snapshot_value = self._session_snapshot_reasoning_effort(data) or None
+        return False, None
+
+    def _current_reasoning_effort_selection(self):
+        override = self._current_session_reasoning_effort_override()
+        if override:
+            return override
+        if isinstance(getattr(self, "current_session", None), dict):
+            return ""
+        if self._is_remote_session():
+            return ""
+        return self._normalize_reasoning_effort_value(getattr(self, "_bridge_reasoning_effort", None))
 
     def _remote_parse_bridge_event_text(self, text):
         raw = str(text or "").strip()
@@ -397,7 +638,16 @@ class BridgeRuntimeMixin:
         self._state_request_seq += 1
         self._send_cmd({"cmd": "get_state", "session_id": sid, "request_id": self._state_request_seq})
 
-    def _apply_state_to_session(self, session_id, backend_history, agent_history, llm_idx=None, process_pid=None, snapshot_ts=None):
+    def _apply_state_to_session(
+        self,
+        session_id,
+        backend_history,
+        agent_history,
+        llm_idx=None,
+        process_pid=None,
+        snapshot_ts=None,
+        reasoning_effort=None,
+    ):
         if not session_id:
             return
         target = None
@@ -422,6 +672,12 @@ class BridgeRuntimeMixin:
                 target["process_pid"] = int(process_pid)
             except Exception:
                 pass
+        had_explicit_override = bool("reasoning_effort" in target or self._session_snapshot_reasoning_effort_source(target) == "override")
+        normalized_reasoning_effort = self._normalize_reasoning_effort_value(reasoning_effort)
+        if had_explicit_override and normalized_reasoning_effort:
+            target["reasoning_effort"] = normalized_reasoning_effort
+        else:
+            target.pop("reasoning_effort", None)
         snapshot = dict(target.get("snapshot") or {})
         snapshot["version"] = int(snapshot.get("version", 1) or 1)
         snapshot["kind"] = "turn_complete"
@@ -431,9 +687,17 @@ class BridgeRuntimeMixin:
         snapshot["process_pid"] = int(target.get("process_pid", 0) or 0)
         snapshot["has_backend_history"] = bool(target["backend_history"])
         snapshot["has_agent_history"] = bool(target["agent_history"])
+        if normalized_reasoning_effort:
+            snapshot["reasoning_effort"] = normalized_reasoning_effort
+            snapshot["reasoning_effort_source"] = "override" if ("reasoning_effort" in target) else "runtime"
+        else:
+            snapshot.pop("reasoning_effort", None)
+            snapshot.pop("reasoning_effort_source", None)
         target["snapshot"] = snapshot
         if self.current_session and self.current_session.get("id") == session_id:
             self.current_session = target
+            self._bridge_reasoning_effort = normalized_reasoning_effort
+            self._sync_reasoning_effort_combo()
         self._persist_session(target)
 
     def _current_llm_name(self):
@@ -491,6 +755,31 @@ class BridgeRuntimeMixin:
         if callable(floating_sync):
             floating_sync()
 
+    def _sync_reasoning_effort_combo(self):
+        combo = getattr(self, "reasoning_effort_combo", None)
+        if combo is None:
+            return
+        self._ignore_reasoning_effort_change = True
+        combo.clear()
+        current_value = self._current_reasoning_effort_selection()
+        current_idx = 0
+        for idx, (value, label) in enumerate(_RUNTIME_REASONING_EFFORT_CHOICES):
+            combo.addItem(label, value)
+            if value == current_value:
+                current_idx = idx
+        combo.setCurrentIndex(current_idx)
+        disabled_reason = self._bridge_reasoning_effort_combo_disabled_reason()
+        self._apply_bridge_widget_state(
+            combo,
+            not bool(disabled_reason),
+            enabled_tooltip="切换当前会话使用的思考强度。",
+            disabled_tooltip=disabled_reason,
+        )
+        self._ignore_reasoning_effort_change = False
+        floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+        if callable(floating_sync):
+            floating_sync()
+
     def _on_llm_changed(self, index: int):
         if self._ignore_llm_change or index < 0:
             return
@@ -516,7 +805,44 @@ class BridgeRuntimeMixin:
         if not self._bridge_ready:
             return
         self._send_cmd({"cmd": "switch_llm", "idx": int(target)})
+        override = self._current_session_reasoning_effort_override()
+        if override:
+            self._send_cmd({"cmd": "switch_reasoning_effort", "reasoning_effort": override})
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
+        if callable(floating_sync):
+            floating_sync()
+
+    def _on_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False) or index < 0:
+            return
+        combo = getattr(self, "reasoning_effort_combo", None)
+        if combo is None:
+            return
+        value = self._normalize_reasoning_effort_value(combo.itemData(index))
+        self._pending_reasoning_effort_override = value or None
+        if isinstance(self.current_session, dict):
+            snapshot = dict(self.current_session.get("snapshot") or {})
+            if value:
+                self.current_session["reasoning_effort"] = value
+                snapshot["reasoning_effort"] = value
+                snapshot["reasoning_effort_source"] = "override"
+            else:
+                self.current_session.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+            self.current_session["snapshot"] = snapshot
+            self._persist_session(self.current_session)
+        if self._is_remote_session():
+            self._set_status("远程会话思考强度已记录，将在下一次发送时传给服务器 agant。")
+            floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+            if callable(floating_sync):
+                floating_sync()
+            return
+        self._bridge_reasoning_effort = value
+        if not self._bridge_ready:
+            return
+        self._send_cmd({"cmd": "switch_reasoning_effort", "reasoning_effort": (value or None)})
+        floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
         if callable(floating_sync):
             floating_sync()
 
@@ -752,6 +1078,9 @@ class BridgeRuntimeMixin:
                 "agent_history": list((session or {}).get("agent_history") or []),
                 "llm_idx": (session or {}).get("llm_idx", (((session or {}).get("snapshot") or {}).get("llm_idx"))),
             }
+            include_reasoning, reasoning_value = self._session_reasoning_effort_payload(session)
+            if include_reasoning:
+                state_payload["reasoning_effort"] = reasoning_value
             send_payload = {
                 "cmd": "send",
                 "text": str(prompt_text or ""),
@@ -823,6 +1152,7 @@ class BridgeRuntimeMixin:
                         "backend_history": ev.get("backend_history") or [],
                         "agent_history": ev.get("agent_history") or [],
                         "llm_idx": ev.get("llm_idx"),
+                        "reasoning_effort": ev.get("reasoning_effort"),
                         "process_pid": ev.get("process_pid"),
                         "snapshot_ts": ev.get("snapshot_ts"),
                     }
@@ -836,6 +1166,7 @@ class BridgeRuntimeMixin:
                         "backend_history": ev.get("backend_history") or [],
                         "agent_history": ev.get("agent_history") or [],
                         "llm_idx": ev.get("llm_idx"),
+                        "reasoning_effort": ev.get("reasoning_effort"),
                     }
                     self._remote_emit_bridge_event(payload, session_id=(ev.get("session_id") or session_id))
                     continue
@@ -965,7 +1296,9 @@ class BridgeRuntimeMixin:
             raise RuntimeError(f"bridge.py 不存在：{bridge}")
         self._bridge_ready = False
         self.llms = []
+        self._bridge_reasoning_effort = ""
         self._sync_llm_combo()
+        self._sync_reasoning_effort_combo()
         self._set_status("正在启动桥接进程…")
         self._stderr_buf = []
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1039,6 +1372,8 @@ class BridgeRuntimeMixin:
             if os.path.isfile(str((item or {}).get("path") or "").strip())
         ]
         if not text and not attachments:
+            return False
+        if self._handle_local_slash_command(text, source_editor=source_editor):
             return False
         if self._is_channel_process_session():
             QMessageBox.information(self, "不可发送", "当前选中的是渠道进程会话，只能回顾快照，不能从这里继续发送消息。")
@@ -1316,6 +1651,7 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
             )
             return
         if et == "remote_turn_snapshot":
@@ -1324,6 +1660,7 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
                 process_pid=ev.get("process_pid"),
                 snapshot_ts=ev.get("snapshot_ts"),
             )
@@ -1348,20 +1685,24 @@ class BridgeRuntimeMixin:
         if et == "ready":
             self._bridge_ready = True
             self.llms = ev.get("llms", [])
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
             self._sync_llm_combo()
+            self._sync_reasoning_effort_combo()
             self._set_status("桥接进程已就绪。")
             if self._pending_state_session:
                 data = _session_copy(self._pending_state_session)
                 self.current_session = data
                 self._render_session(data)
-                self._send_cmd(
-                    {
-                        "cmd": "set_state",
-                        "backend_history": data.get("backend_history") or [],
-                        "agent_history": data.get("agent_history") or [],
-                        "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
-                    }
-                )
+                payload = {
+                    "cmd": "set_state",
+                    "backend_history": data.get("backend_history") or [],
+                    "agent_history": data.get("agent_history") or [],
+                    "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
+                }
+                include_reasoning, reasoning_value = self._session_reasoning_effort_payload(data)
+                if include_reasoning:
+                    payload["reasoning_effort"] = reasoning_value
+                self._send_cmd(payload)
                 self._request_backend_state(data.get("id"))
                 self._pending_state_session = None
             self._refresh_composer_enabled()
@@ -1382,6 +1723,7 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
             )
             return
         if et == "turn_snapshot":
@@ -1390,17 +1732,41 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
                 process_pid=ev.get("process_pid"),
                 snapshot_ts=ev.get("snapshot_ts"),
             )
             return
         if et == "llm_switched":
             self.llms = ev.get("llms", self.llms)
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
             self._sync_llm_combo()
+            self._sync_reasoning_effort_combo()
             if self.current_session:
                 self.current_session["llm_idx"] = int(self._current_llm_index() or 0)
                 self._persist_session(self.current_session)
             self._set_status("模型已切换。")
+            self._refresh_composer_enabled()
+            return
+        if et == "reasoning_effort_switched":
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
+            if isinstance(self.current_session, dict):
+                explicit_override = bool("reasoning_effort" in self.current_session or self._session_snapshot_reasoning_effort_source(self.current_session) == "override")
+                if explicit_override and self._bridge_reasoning_effort:
+                    self.current_session["reasoning_effort"] = self._bridge_reasoning_effort
+                else:
+                    self.current_session.pop("reasoning_effort", None)
+                snapshot = dict(self.current_session.get("snapshot") or {})
+                if self._bridge_reasoning_effort:
+                    snapshot["reasoning_effort"] = self._bridge_reasoning_effort
+                    snapshot["reasoning_effort_source"] = "override" if explicit_override else "runtime"
+                else:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
+                self.current_session["snapshot"] = snapshot
+                self._persist_session(self.current_session)
+            self._sync_reasoning_effort_combo()
+            self._set_status("思考强度已切换。")
             self._refresh_composer_enabled()
             return
         if et == "tools_reinjected":

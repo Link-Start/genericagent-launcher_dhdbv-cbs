@@ -132,6 +132,7 @@ class FloatingOrbWindow(QWidget):
         self._expanded_size = QSize(480, 760)
         self._collapsed_size = QSize(56, 56)
         self._ignore_llm_change = False
+        self._ignore_reasoning_effort_change = False
         self._rendered_rows = []
         self._focus_latest_user_after_refresh = False
         self._orb_hover = False
@@ -242,6 +243,11 @@ class FloatingOrbWindow(QWidget):
         self.llm_combo.setMaximumWidth(280)
         self.llm_combo.currentIndexChanged.connect(self._on_llm_changed)
         tool_row.addWidget(self.llm_combo, 0)
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.setMinimumWidth(126)
+        self.reasoning_effort_combo.setMaximumWidth(170)
+        self.reasoning_effort_combo.currentIndexChanged.connect(self._on_reasoning_effort_changed)
+        tool_row.addWidget(self.reasoning_effort_combo, 0)
         self.info_btn = QPushButton()
         self.info_btn.setObjectName("infoBtn")
         self.info_btn.setFixedSize(26, 26)
@@ -363,6 +369,13 @@ class FloatingOrbWindow(QWidget):
         if self._ignore_llm_change or index < 0:
             return
         syncer = getattr(self._host, "_on_floating_llm_changed", None)
+        if callable(syncer):
+            syncer(index)
+
+    def _on_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False) or index < 0:
+            return
+        syncer = getattr(self._host, "_on_floating_reasoning_effort_changed", None)
         if callable(syncer):
             syncer(index)
 
@@ -598,6 +611,7 @@ class FloatingOrbWindow(QWidget):
             f"QTextEdit {{ background: transparent; border: none; color: {C['text']}; font-size: {body_fs}px; padding: 2px; }}"
         )
         self.llm_combo.setStyleSheet(host._api_combo_style())
+        self.reasoning_effort_combo.setStyleSheet(host._api_combo_style())
         self.session_combo.setStyleSheet(host._api_combo_style())
         self.info_btn.setIcon(_svg_icon("floating_info", _SVG_INFO, color=C["muted"], size=14))
         self.restore_btn.setStyleSheet(host._action_button_style())
@@ -811,6 +825,19 @@ class FloatingOrbWindow(QWidget):
         self.llm_combo.setCurrentIndex(target)
         self.llm_combo.setEnabled(bool(enabled) and bool(llms))
         self._ignore_llm_change = False
+
+    def sync_reasoning_effort_items(self, rows, *, enabled: bool, current_index: int):
+        self._ignore_reasoning_effort_change = True
+        self.reasoning_effort_combo.clear()
+        for idx, row in enumerate(rows or []):
+            self.reasoning_effort_combo.addItem(str(row.get("label") or ""), row.get("value"))
+        if self.reasoning_effort_combo.count() == 0:
+            self.reasoning_effort_combo.addItem("跟随配置", "")
+            enabled = False
+        target = current_index if 0 <= int(current_index or -1) < self.reasoning_effort_combo.count() else 0
+        self.reasoning_effort_combo.setCurrentIndex(target)
+        self.reasoning_effort_combo.setEnabled(bool(enabled))
+        self._ignore_reasoning_effort_change = False
 
     def sync_session_items(self, rows, *, current_session_id: str, enabled: bool):
         self.session_combo.blockSignals(True)
@@ -1152,6 +1179,9 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._bridge_ready = False
         self._ignore_session_select = False
         self._ignore_llm_change = False
+        self._ignore_reasoning_effort_change = False
+        self._bridge_reasoning_effort = ""
+        self._pending_reasoning_effort_override = None
         self._user_scrolled_up = False
         self._follow_latest_user_message = False
         self._state_request_seq = 0
@@ -1733,6 +1763,11 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self.llm_combo.setMaximumWidth(320)
         self.llm_combo.currentIndexChanged.connect(self._on_llm_changed)
         tool_row.addWidget(self.llm_combo)
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.setMinimumWidth(126)
+        self.reasoning_effort_combo.setMaximumWidth(170)
+        self.reasoning_effort_combo.currentIndexChanged.connect(self._on_reasoning_effort_changed)
+        tool_row.addWidget(self.reasoning_effort_combo)
         tool_row.addStretch(1)
 
         self.info_btn = QPushButton()
@@ -1982,6 +2017,32 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             current_index=current_idx,
         )
 
+    def _sync_floating_reasoning_effort_combo(self):
+        floating = getattr(self, "_floating_chat_window", None)
+        if floating is None or not hasattr(floating, "sync_reasoning_effort_items"):
+            return
+        disabled = self._is_channel_process_session()
+        current_value = self._current_reasoning_effort_selection()
+        rows = [
+            {"value": "", "label": "跟随配置"},
+            {"value": "none", "label": "none"},
+            {"value": "minimal", "label": "minimal"},
+            {"value": "low", "label": "low"},
+            {"value": "medium", "label": "medium"},
+            {"value": "high", "label": "high"},
+            {"value": "xhigh", "label": "xhigh"},
+        ]
+        current_idx = 0
+        for idx, row in enumerate(rows):
+            if str(row.get("value") or "") == str(current_value or ""):
+                current_idx = idx
+                break
+        floating.sync_reasoning_effort_items(
+            rows,
+            enabled=((not disabled) and bool(self.llms) and (not self._busy)),
+            current_index=current_idx,
+        )
+
     def _on_floating_llm_changed(self, index: int):
         if getattr(self, "_ignore_llm_change", False):
             return
@@ -1993,6 +2054,18 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         finally:
             self._ignore_llm_change = False
         self._on_llm_changed(index)
+
+    def _on_floating_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False):
+            return
+        if index < 0 or getattr(self, "reasoning_effort_combo", None) is None:
+            return
+        self._ignore_reasoning_effort_change = True
+        try:
+            self.reasoning_effort_combo.setCurrentIndex(index)
+        finally:
+            self._ignore_reasoning_effort_change = False
+        self._on_reasoning_effort_changed(index)
 
     def _sync_draft_to_floating(self, *, force=False):
         floating = getattr(self, "_floating_chat_window", None)
