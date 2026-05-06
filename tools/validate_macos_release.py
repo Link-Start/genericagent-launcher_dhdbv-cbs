@@ -7,6 +7,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 
 
 APP_NAME = "GenericAgent Launcher"
@@ -17,6 +18,8 @@ USER_INSTALL_TARGET = f"~/Applications/{APP_BUNDLE_NAME}"
 DATA_ROOT = "~/Library/Application Support/GenericAgentLauncher"
 CONFIG_PATH = f"{DATA_ROOT}/config/launcher_config.json"
 MACOS_VERSION_JSON_RELATIVE_PATH = "Contents/Resources/version.json"
+DMG_ATTACH_RETRY_ATTEMPTS = 3
+DMG_ATTACH_RETRY_DELAY_SECONDS = 2.0
 
 
 def _parse_args():
@@ -237,13 +240,26 @@ def _assert_release_bundle(app_path: str, *, version: str, expected_commit: str 
 
 
 def _attach_dmg(dmg_path: str) -> str:
-    result = _run(["hdiutil", "attach", "-nobrowse", "-readonly", "-plist", dmg_path])
-    payload = plistlib.loads(result.stdout)
-    for entity in payload.get("system-entities", []) or []:
-        mount_point = str(entity.get("mount-point") or "").strip()
-        if mount_point:
-            return mount_point
-    _die(f"failed to resolve mount point from dmg attach output: {dmg_path}")
+    cmd = ["hdiutil", "attach", "-nobrowse", "-readonly", "-plist", dmg_path]
+    last_detail = ""
+    for attempt in range(1, DMG_ATTACH_RETRY_ATTEMPTS + 1):
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode == 0:
+            payload = plistlib.loads(result.stdout)
+            for entity in payload.get("system-entities", []) or []:
+                mount_point = str(entity.get("mount-point") or "").strip()
+                if mount_point:
+                    return mount_point
+            _die(f"failed to resolve mount point from dmg attach output: {dmg_path}")
+
+        detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
+        lowered = detail.lower()
+        last_detail = detail or f"command failed: {' '.join(cmd)}"
+        is_transient = "resource temporarily unavailable" in lowered
+        if attempt >= DMG_ATTACH_RETRY_ATTEMPTS or not is_transient:
+            _die(last_detail)
+        time.sleep(DMG_ATTACH_RETRY_DELAY_SECONDS)
+    _die(last_detail or f"failed to attach dmg: {dmg_path}")
 
 
 def _detach_dmg(mount_point: str):

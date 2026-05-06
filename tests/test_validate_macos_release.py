@@ -262,6 +262,29 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
             self.mod._assert_codesign_integrity("/tmp/GenericAgent Launcher.app")
         run.assert_called_once_with(["codesign", "--verify", "--deep", "--strict", "/tmp/GenericAgent Launcher.app"])
 
+    def test_attach_dmg_retries_transient_hdiutil_failure(self):
+        payload = {"system-entities": [{"mount-point": "/Volumes/GenericAgent Launcher"}]}
+        transient = mock.Mock(returncode=1, stdout=b"", stderr=b"hdiutil: attach failed - Resource temporarily unavailable")
+        success = mock.Mock(returncode=0, stdout=self.mod.plistlib.dumps(payload), stderr=b"")
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=[transient, success]) as run, mock.patch.object(
+            self.mod.time, "sleep"
+        ) as sleep:
+            mount_point = self.mod._attach_dmg("/tmp/sample.dmg")
+        self.assertEqual(mount_point, "/Volumes/GenericAgent Launcher")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(self.mod.DMG_ATTACH_RETRY_DELAY_SECONDS)
+
+    def test_attach_dmg_does_not_retry_non_transient_hdiutil_failure(self):
+        failure = mock.Mock(returncode=1, stdout=b"", stderr=b"hdiutil: attach failed - no mountable file systems")
+        with mock.patch.object(self.mod.subprocess, "run", return_value=failure) as run, mock.patch.object(
+            self.mod.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(SystemExit) as ctx:
+                self.mod._attach_dmg("/tmp/sample.dmg")
+        self.assertIn("no mountable file systems", str(ctx.exception))
+        run.assert_called_once()
+        sleep.assert_not_called()
+
     def test_assert_mounted_layout_propagates_expected_arch_to_bundle_check(self):
         with tempfile.TemporaryDirectory() as td:
             app_dir = os.path.join(td, "GenericAgent Launcher.app")
