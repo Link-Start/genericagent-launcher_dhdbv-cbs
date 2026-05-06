@@ -31,12 +31,13 @@
 
 - 关于页已有“安装状态”卡片
 - mac 更新入口已固定为“查看手动升级说明”
-- 手动升级说明会指向 `.dmg`、`.sha256`、`README-macOS.txt`、`install-metadata.json`
+- 手动升级说明会指向双架构 `.dmg`、`.sha256`、`README-macOS-<arch>.txt`、`install-metadata-<arch>.json`
 - README 已改成 Windows / macOS 双平台叙事
 
 ### 3. 打包与 CI
 
 - `tools/build_macos_release.py` 会生成 `.app/.dmg/.sha256/README-macOS.txt/install-metadata.json`
+- `release-installer.yml` 在公开 release 上传阶段会把 README / metadata 复制成带架构后缀的发布资产
 - `release-installer.yml` 的 `build-macos` job 会发布 macOS Release 资产
 - `macos-validate.yml` 会做：
   - `python -m pytest tests -q`

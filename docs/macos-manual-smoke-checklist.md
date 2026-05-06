@@ -7,10 +7,10 @@
 
 ## 安装与首次打开
 
-1. 从 Release 或 CI 产物获取 `GenericAgentLauncher-macos-<version>.dmg`
+1. 从 Release 或 CI 产物获取对应架构的 `GenericAgentLauncher-macos-<arch>-<version>.dmg`
 2. 校对可选资产是否齐全：
-   `GenericAgentLauncher-macos-<version>.sha256`、`README-macOS.txt`、`install-metadata.json`
-   并打开 `install-metadata.json`，确认当前公开发布合同仍是 `build_arch = x86_64`、`runner_label = macos-15-intel`
+   `GenericAgentLauncher-macos-<arch>-<version>.sha256`、`README-macOS-<arch>.txt`、`install-metadata-<arch>.json`
+   并打开对应架构的 `install-metadata-<arch>.json`，确认 `build_arch / runner_label` 与下载的架构一致
 3. 打开 `.dmg`，确认窗口内包含：
    `GenericAgent Launcher.app`、`Applications` 别名、`README-macOS.txt`
 4. 把 app 拖到 `/Applications`（推荐）；如果只安装给当前用户，也可拖到 `~/Applications`
@@ -40,7 +40,7 @@
 
 ## 手动升级
 
-1. 下载更新版本的 `GenericAgentLauncher-macos-<version>.dmg`
+1. 下载更新版本的 `GenericAgentLauncher-macos-<arch>-<version>.dmg`
 2. 关闭当前 app
 3. 手动替换 `/Applications/GenericAgent Launcher.app`；如果用户级安装，则改为手动替换 `~/Applications/GenericAgent Launcher.app`
 4. 重新打开后确认：

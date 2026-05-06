@@ -12,12 +12,19 @@ import uuid
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout
 
 from launcher_app import core as lz
 from launcher_app.theme import C
 
-from .common import _session_copy, normalize_remote_agent_dir, normalize_ssh_error_text
+from .common import (
+    _session_copy,
+    normalize_remote_agent_dir,
+    normalize_ssh_error_text,
+    remote_device_agent_dir,
+    remote_device_agent_mode,
+    remote_device_container_name,
+)
 
 _RUNTIME_REASONING_EFFORT_CHOICES = [
     ("", "跟随配置"),
@@ -368,10 +375,7 @@ class BridgeRuntimeMixin:
                 widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
-        pending_items = list(self._pending_input_attachments())
-        active_items = list(self._active_turn_attachments())
-        active_mode = bool(active_items)
-        items = active_items if active_mode else pending_items
+        items = list(self._attachment_bar_display_items())
         host.setVisible(bool(items))
         if list_widget is not None:
             list_widget.setVisible(bool(items))
@@ -380,10 +384,7 @@ class BridgeRuntimeMixin:
             layout.invalidate()
             self._refresh_attachment_geometry(host)
             return
-        if active_mode:
-            summary.setText(f"本轮已附带 {len(items)} 张图片。当前回复结束后会自动清除。")
-        else:
-            summary.setText(f"本轮将附带 {len(items)} 张图片。发送成功后它们只对这一轮有效。")
+        summary.setText(f"本轮将附带 {len(items)} 张图片。发送成功后它们只对这一轮有效。")
         for idx, item in enumerate(items):
             row = QFrame()
             row.setObjectName("cardInset")
@@ -417,19 +418,21 @@ class BridgeRuntimeMixin:
 
             remove_btn = QPushButton("移除")
             remove_btn.setStyleSheet(self._action_button_style())
-            disabled_reason = self._bridge_attachment_remove_disabled_reason(active_mode=active_mode)
+            disabled_reason = self._bridge_attachment_remove_disabled_reason(active_mode=False)
             self._apply_bridge_widget_state(
                 remove_btn,
                 not bool(disabled_reason),
                 enabled_tooltip="把这张图片从下一轮输入中移除。",
                 disabled_tooltip=disabled_reason,
             )
-            if not active_mode:
-                remove_btn.clicked.connect(lambda _=False, i=idx: self._remove_pending_input_attachment(i))
+            remove_btn.clicked.connect(lambda _=False, i=idx: self._remove_pending_input_attachment(i))
             box.addWidget(remove_btn, 0)
             layout.addWidget(row)
         layout.invalidate()
         self._refresh_attachment_geometry(host)
+
+    def _attachment_bar_display_items(self):
+        return list(self._pending_input_attachments())
 
     def _refresh_attachment_geometry(self, host):
         current = host
@@ -569,7 +572,21 @@ class BridgeRuntimeMixin:
     def _ensure_reply_notify_tray(self):
         tray = getattr(self, "_reply_notify_tray", None)
         if tray is not None:
-            return tray
+            if getattr(self, "_launcher_tray_icon", None) is None:
+                visible_getter = getattr(tray, "isVisible", None)
+                if callable(visible_getter):
+                    try:
+                        if not bool(visible_getter()):
+                            try:
+                                tray.hide()
+                            except Exception:
+                                pass
+                            tray = None
+                            self._reply_notify_tray = None
+                    except Exception:
+                        pass
+            if tray is not None:
+                return tray
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return None
         icon = self.windowIcon()
@@ -598,6 +615,11 @@ class BridgeRuntimeMixin:
             try:
                 import winsound
 
+                try:
+                    winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                    return
+                except Exception:
+                    pass
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 return
             except Exception:
@@ -619,7 +641,15 @@ class BridgeRuntimeMixin:
             if len(preview) > 72:
                 preview = preview[:72].rstrip() + "…"
             msg = f"{msg}：{preview}"
-        tray = self._ensure_reply_notify_tray()
+        tray = None
+        launcher_tray_getter = getattr(self, "_ensure_launcher_tray_icon", None)
+        if callable(launcher_tray_getter):
+            try:
+                tray = launcher_tray_getter()
+            except Exception:
+                tray = None
+        if tray is None:
+            tray = self._ensure_reply_notify_tray()
         if tray is None:
             if lz.IS_MACOS:
                 setter = getattr(self, "_set_status", None)
@@ -629,7 +659,14 @@ class BridgeRuntimeMixin:
                     except Exception:
                         pass
             return
-        tray.showMessage("GenericAgent 启动器", msg, QSystemTrayIcon.Information, 1500)
+        try:
+            tray.show()
+        except Exception:
+            pass
+        try:
+            tray.showMessage("GenericAgent 启动器", msg, QSystemTrayIcon.Information, 1500)
+        except Exception:
+            pass
 
     def _request_backend_state(self, session_id=None):
         sid = session_id or ((self.current_session or {}).get("id"))
@@ -863,7 +900,20 @@ class BridgeRuntimeMixin:
         return 0
 
     def _set_status(self, text: str):
-        self.status_label.setText(text)
+        new_text = str(text or "")
+        if new_text == "桥接进程已就绪。":
+            try:
+                last_done_at = float(getattr(self, "_last_task_complete_status_at", 0.0) or 0.0)
+            except Exception:
+                last_done_at = 0.0
+            if last_done_at > 0 and (time.time() - last_done_at) <= 6.0:
+                try:
+                    current = str(self.status_label.text() or "").strip()
+                except Exception:
+                    current = ""
+                if current in {"已完成。", "正在中断…", "已发送中断请求。"}:
+                    return
+        self.status_label.setText(new_text)
         self._refresh_info_tooltip()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
@@ -957,6 +1007,48 @@ class BridgeRuntimeMixin:
                 pass
         return remote_bridge
 
+    def _remote_device_stage_root(self, device) -> str:
+        dev = device if isinstance(device, dict) else {}
+        raw = str(dev.get("id") or dev.get("host") or "remote-device").strip() or "remote-device"
+        safe = "".join(ch for ch in raw if (ch.isalnum() or ch in ("_", "-")))
+        if not safe:
+            safe = uuid.uuid4().hex[:12]
+        return f"/tmp/genericagent_launcher_remote/{safe}"
+
+    def _remote_stage_bridge_runtime_for_device(self, client, device):
+        dev = device if isinstance(device, dict) else {}
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
+        if remote_device_agent_mode(dev) != "docker":
+            return self._remote_stage_bridge_runtime(client, remote_dir)
+        runtime_dir = posixpath.join(str(remote_dir).rstrip("/"), "temp", "launcher_runtime")
+        host_stage_root = self._remote_device_stage_root(dev)
+        host_stage_fp = posixpath.join(host_stage_root, "bridge.py")
+        container = remote_device_container_name(dev)
+        rc, _out, err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(host_stage_root)}", timeout=20)
+        if rc != 0:
+            raise RuntimeError(str(err or "创建远端 bridge 暂存目录失败。").strip() or "创建远端 bridge 暂存目录失败。")
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(host_stage_fp, "wb") as fp:
+                fp.write(self._remote_bridge_source_text().encode("utf-8"))
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        cmd = (
+            f"docker exec {shlex.quote(container)} sh -lc {shlex.quote('mkdir -p ' + shlex.quote(runtime_dir))} && "
+            f"docker cp {shlex.quote(host_stage_fp)} {shlex.quote(container + ':' + posixpath.join(runtime_dir, 'bridge.py'))}"
+        )
+        rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+        if rc != 0:
+            raise RuntimeError(str(err or "写入容器内 bridge 运行文件失败。").strip() or "写入容器内 bridge 运行文件失败。")
+        try:
+            self._vps_exec_remote(client, f"rm -f {shlex.quote(host_stage_fp)} >/dev/null 2>&1 || true", timeout=10)
+        except Exception:
+            pass
+        return posixpath.join(runtime_dir, "bridge.py")
+
     def _remote_stage_chat_images(self, client, remote_dir: str, images):
         local_images = [str(p or "").strip() for p in (images or []) if os.path.isfile(str(p or "").strip())]
         if not local_images:
@@ -981,11 +1073,61 @@ class BridgeRuntimeMixin:
                 pass
         return remote_paths
 
-    def _remote_cleanup_files(self, client, remote_paths):
+    def _remote_stage_chat_images_for_device(self, client, device, images):
+        dev = device if isinstance(device, dict) else {}
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
+        if remote_device_agent_mode(dev) != "docker":
+            return self._remote_stage_chat_images(client, remote_dir, images)
+        local_images = [str(p or "").strip() for p in (images or []) if os.path.isfile(str(p or "").strip())]
+        if not local_images:
+            return []
+        upload_dir = posixpath.join(str(remote_dir).rstrip("/"), "temp", "launcher_runtime", "chat_uploads")
+        host_stage_root = self._remote_device_stage_root(dev)
+        container = remote_device_container_name(dev)
+        rc, _out, err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(host_stage_root)}", timeout=20)
+        if rc != 0:
+            raise RuntimeError(str(err or "创建远端图片暂存目录失败。").strip() or "创建远端图片暂存目录失败。")
+        rc, _out, err = self._vps_exec_remote(
+            client,
+            f"docker exec {shlex.quote(container)} sh -lc {shlex.quote('mkdir -p ' + shlex.quote(upload_dir))}",
+            timeout=20,
+        )
+        if rc != 0:
+            raise RuntimeError(str(err or "创建容器内图片上传目录失败。").strip() or "创建容器内图片上传目录失败。")
+        remote_paths = []
+        sftp = client.open_sftp()
+        try:
+            for local_fp in local_images:
+                name = f"{uuid.uuid4().hex[:12]}_{os.path.basename(local_fp)}"
+                host_stage_fp = posixpath.join(host_stage_root, name)
+                container_fp = posixpath.join(upload_dir, name)
+                sftp.put(local_fp, host_stage_fp)
+                cmd = f"docker cp {shlex.quote(host_stage_fp)} {shlex.quote(container + ':' + container_fp)}"
+                rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+                if rc != 0:
+                    raise RuntimeError(str(err or "复制图片到容器失败。").strip() or "复制图片到容器失败。")
+                try:
+                    self._vps_exec_remote(client, f"rm -f {shlex.quote(host_stage_fp)} >/dev/null 2>&1 || true", timeout=10)
+                except Exception:
+                    pass
+                remote_paths.append(container_fp)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        return remote_paths
+
+    def _remote_cleanup_files(self, client, remote_paths, *, device=None):
         paths = [str(p or "").strip() for p in (remote_paths or []) if str(p or "").strip()]
         if (client is None) or (not paths):
             return
-        cmd = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
+        if remote_device_agent_mode(device) == "docker":
+            container = remote_device_container_name(device)
+            inner = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
+            cmd = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}"
+        else:
+            cmd = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
         try:
             self._vps_exec_remote(client, cmd, timeout=20)
         except Exception:
@@ -999,8 +1141,10 @@ class BridgeRuntimeMixin:
 
     def _remote_exec_chat_turn(self, session, prompt_text: str, images):
         dev, payload = self._remote_device_payload(session)
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
         python_cmd = str(dev.get("python_cmd") or "python3").strip() or "python3"
+        agent_mode = remote_device_agent_mode(dev)
+        container = remote_device_container_name(dev)
         client, err_msg, detail, missing = self._open_vps_ssh_client(payload, timeout=12)
         if client is None:
             if missing:
@@ -1009,23 +1153,27 @@ class BridgeRuntimeMixin:
             raise RuntimeError(normalize_ssh_error_text(text, context="远端 SSH 连接"))
         remote_cleanup = []
         try:
-            remote_bridge = self._remote_stage_bridge_runtime(client, remote_dir)
-            remote_images = self._remote_stage_chat_images(client, remote_dir, images)
+            remote_bridge = self._remote_stage_bridge_runtime_for_device(client, dev)
+            remote_images = self._remote_stage_chat_images_for_device(client, dev, images)
             remote_cleanup.extend(remote_images)
             try:
+                inner_cmd = (
+                    "set -e; "
+                    f"cd {shlex.quote(remote_dir)}; "
+                    f"PY_BIN={shlex.quote(python_cmd)}; "
+                    "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
+                    "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
+                    "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
+                    "else echo '{\"event\":\"error\",\"msg\":\"远端设备未检测到 Python，可在设备配置里指定 python_cmd。\"}'; exit 62; fi; "
+                    "fi; "
+                    "export PYTHONIOENCODING=utf-8 PYTHONUTF8=1; "
+                    f"\"$PY_BIN\" -u {shlex.quote(remote_bridge)} {shlex.quote(remote_dir)}"
+                )
+                exec_cmd = inner_cmd
+                if agent_mode == "docker":
+                    exec_cmd = f"docker exec -i {shlex.quote(container)} sh -lc {shlex.quote(inner_cmd)}"
                 stdin, stdout, stderr = client.exec_command(
-                    (
-                        "set -e; "
-                        f"cd {shlex.quote(remote_dir)}; "
-                        f"PY_BIN={shlex.quote(python_cmd)}; "
-                        "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
-                        "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
-                        "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
-                        "else echo '{\"event\":\"error\",\"msg\":\"远端设备未检测到 Python，可在设备配置里指定 python_cmd。\"}'; exit 62; fi; "
-                        "fi; "
-                        "export PYTHONIOENCODING=utf-8 PYTHONUTF8=1; "
-                        f"\"$PY_BIN\" -u {shlex.quote(remote_bridge)} {shlex.quote(remote_dir)}"
-                    ),
+                    exec_cmd,
                     timeout=7200,
                     get_pty=False,
                 )
@@ -1195,7 +1343,7 @@ class BridgeRuntimeMixin:
                 raise RuntimeError("远端返回为空，请检查服务器日志。")
             return done_text
         finally:
-            self._remote_cleanup_files(client, remote_cleanup)
+            self._remote_cleanup_files(client, remote_cleanup, device=dev)
             try:
                 client.close()
             except Exception:
@@ -1222,10 +1370,14 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
+        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
+        if callable(anchor_setter):
+            anchor_setter(user_row)
+        self._user_scrolled_up = False
         follower = getattr(self, "_set_follow_latest_user", None)
         if callable(follower):
             follower(True)
-        self._scroll_row_to_top(user_row)
+        self._scroll_row_to_top(user_row, preserve_scroll_state=True)
         self._busy = True
         self._abort_requested = False
         self._current_stream_text = ""
@@ -1395,10 +1547,14 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
+        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
+        if callable(anchor_setter):
+            anchor_setter(user_row)
+        self._user_scrolled_up = False
         follower = getattr(self, "_set_follow_latest_user", None)
         if callable(follower):
             follower(True)
-        self._scroll_row_to_top(user_row)
+        self._scroll_row_to_top(user_row, preserve_scroll_state=True)
         self._busy = True
         self._abort_requested = False
         self._current_stream_text = ""
@@ -1442,9 +1598,26 @@ class BridgeRuntimeMixin:
                 refresher()
             return True
         except Exception as e:
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
+            self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
+            follower = getattr(self, "_set_follow_latest_user", None)
+            if callable(follower):
+                follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self._refresh_composer_enabled()
+            self._refresh_token_label()
             QMessageBox.critical(self, "发送失败", str(e))
             refresher = getattr(self, "_refresh_floating_chat_window", None)
             if callable(refresher):
@@ -1510,9 +1683,13 @@ class BridgeRuntimeMixin:
         self._pending_stream_text = None
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self._last_task_complete_status_at = float(time.time())
         self._set_status("已完成。")
         self._refresh_composer_enabled()
         self._clear_active_turn_attachments()
+        anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+        if callable(anchor_clearer):
+            anchor_clearer()
         if not was_aborted:
             self._notify_reply_done(final_text)
 
@@ -1668,12 +1845,30 @@ class BridgeRuntimeMixin:
         if et == "remote_error":
             msg = str(ev.get("msg") or "远程执行失败。").strip() or "远程执行失败。"
             self._clear_active_turn_attachments()
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
             self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
+            follower = getattr(self, "_set_follow_latest_user", None)
+            if callable(follower):
+                follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self._set_status(msg)
             self._refresh_composer_enabled()
+            self._refresh_token_label()
+            refresher = getattr(self, "_refresh_floating_chat_window", None)
+            if callable(refresher):
+                refresher()
             QMessageBox.warning(self, "远程聊天失败", msg)
             return
         if et == "launcher_autonomous_trigger":
@@ -1779,14 +1974,30 @@ class BridgeRuntimeMixin:
             msg = ev.get("msg", "")
             trace = ev.get("trace", "")
             self._clear_active_turn_attachments()
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
+            self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
             follower = getattr(self, "_set_follow_latest_user", None)
             if callable(follower):
                 follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self._set_status(f"错误: {msg}")
             self._refresh_composer_enabled()
+            self._refresh_token_label()
+            refresher = getattr(self, "_refresh_floating_chat_window", None)
+            if callable(refresher):
+                refresher()
             if trace:
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Warning)

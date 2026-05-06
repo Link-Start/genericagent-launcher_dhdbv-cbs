@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
-import subprocess
 
-from PySide6.QtCore import QByteArray, QSize, Qt
+from PySide6.QtCore import QByteArray, QSize, QTimer, Qt
 from PySide6.QtGui import QCursor, QIcon, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,6 +44,7 @@ _HTML_FONT_CLOSE_RE = re.compile(r"<\s*/\s*font\s*>", re.IGNORECASE)
 _LEGACY_REMOTE_AGENT_DIR = "/opt/agant"
 _ROOT_REMOTE_AGENT_DIR = "/root/agant"
 _HOME_REMOTE_AGENT_DIR_RE = re.compile(r"^/home/[^/\s]+/agant/?$")
+_AUTO_DOCKER_NAME_SUFFIX = "（Docker）"
 _SSH_DISCONNECT_HINTS = (
     "10054",
     "远程主机强迫关闭了一个现有的连接",
@@ -80,6 +81,224 @@ def normalize_remote_agent_dir(path: str, *, username: str = "") -> str:
     if not value or value == _LEGACY_REMOTE_AGENT_DIR:
         return remote_agent_dir_default(username)
     return value
+
+
+def strip_auto_docker_name_suffix(value: str) -> str:
+    text = str(value or "").strip()
+    while text.endswith(_AUTO_DOCKER_NAME_SUFFIX):
+        next_text = text[: -len(_AUTO_DOCKER_NAME_SUFFIX)].rstrip()
+        if next_text == text:
+            break
+        text = next_text
+    return text
+
+
+def remote_device_agent_mode(raw, *, default: str = "host") -> str:
+    item = raw if isinstance(raw, dict) else {}
+    container = str(
+        item.get("docker_container")
+        or item.get("docker_container_name")
+        or item.get("takeover_docker_container")
+        or item.get("container_name")
+        or ""
+    ).strip()
+    text = str(item.get("agent_mode") or default or "host").strip().lower()
+    if text not in ("host", "docker"):
+        text = str(default or "host").strip().lower()
+    if text not in ("host", "docker"):
+        text = "host"
+    if text == "host" and container:
+        return "docker"
+    if text == "host":
+        return "host"
+    return "docker" if container else "host"
+
+
+def remote_device_container_name(raw) -> str:
+    item = raw if isinstance(raw, dict) else {}
+    if remote_device_agent_mode(item) != "docker":
+        return ""
+    return str(
+        item.get("docker_container")
+        or item.get("docker_container_name")
+        or item.get("takeover_docker_container")
+        or item.get("container_name")
+        or ""
+    ).strip()
+
+
+def remote_device_remote_mode(raw, *, default: str = "ssh") -> str:
+    item = raw if isinstance(raw, dict) else {}
+    text = str(item.get("remote_mode") or "").strip().lower()
+    if text == "docker_container":
+        return "docker_container"
+    if text in ("ssh", "host"):
+        return "ssh"
+    docker_container = str(
+        item.get("docker_container")
+        or item.get("docker_container_name")
+        or item.get("takeover_docker_container")
+        or item.get("container_name")
+        or ""
+    ).strip()
+    docker_agent_dir = str(
+        item.get("docker_agent_dir")
+        or item.get("takeover_docker_agent_dir")
+        or item.get("container_agent_dir")
+        or ""
+    ).strip()
+    agent_mode = str(item.get("agent_mode") or "").strip().lower()
+    if docker_container or docker_agent_dir or agent_mode == "docker":
+        return "docker_container"
+    fallback = str(default or "ssh").strip().lower()
+    return "ssh" if fallback not in ("ssh", "docker_container") else fallback
+
+
+def remote_device_agent_dir(raw, *, username: str = "") -> str:
+    item = raw if isinstance(raw, dict) else {}
+    if remote_device_agent_mode(item) == "docker":
+        value = str(
+            item.get("docker_agent_dir")
+            or item.get("takeover_docker_agent_dir")
+            or item.get("container_agent_dir")
+            or item.get("agent_dir")
+            or ""
+        ).strip()
+        return value
+    return normalize_remote_agent_dir(item.get("agent_dir") or item.get("remote_dir"), username=username)
+
+
+def normalize_process_match_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return os.path.normpath(text).replace("\\", "/").lower()
+
+
+def process_path_aliases(path: str, *, real_path: str = "") -> set[str]:
+    aliases: set[str] = set()
+    for candidate in (path, real_path):
+        raw = str(candidate or "").strip()
+        if not raw:
+            continue
+        norm = normalize_process_match_text(raw)
+        if norm:
+            aliases.add(norm)
+    return aliases
+
+
+def process_dirs_match(path: str, other: str, *, path_real: str = "", other_real: str = "") -> bool:
+    left = process_path_aliases(path, real_path=path_real)
+    right = process_path_aliases(other, real_path=other_real)
+    return bool(left and right and left.intersection(right))
+
+
+def process_cmdline_has_script(cmdline: str, script_rel: str) -> bool:
+    norm_cmd = normalize_process_match_text(cmdline)
+    rel_script = normalize_process_match_text(script_rel)
+    script_name = normalize_process_match_text(os.path.basename(str(script_rel or "").strip()))
+    module_name = normalize_process_match_text(str(script_rel or "").strip())
+    if module_name.endswith(".py"):
+        module_name = module_name[:-3]
+    module_name = module_name.replace("/", ".").replace("\\", ".")
+    module_leaf = normalize_process_match_text(str(module_name.rsplit(".", 1)[-1] if module_name else ""))
+    if not norm_cmd:
+        return False
+    if rel_script and rel_script in norm_cmd:
+        return True
+    if script_name and re.search(rf"(^|[/\s\"']){re.escape(script_name)}($|[/\s\"'])", norm_cmd):
+        return True
+    if module_name and re.search(rf"(^|[\s\"']){re.escape(module_name)}($|[\s\"'])", norm_cmd):
+        return True
+    if module_leaf and re.search(rf"(^|[\s\"']){re.escape(module_leaf)}($|[\s\"'])", norm_cmd):
+        return True
+    return False
+
+
+def process_cmdline_matches_agent_script(
+    cmdline: str,
+    *,
+    agent_dir: str,
+    script_rel: str,
+    cwd: str = "",
+    agent_dir_real: str = "",
+    cwd_real: str = "",
+) -> bool:
+    norm_cmd = normalize_process_match_text(cmdline)
+    norm_script_rel = normalize_process_match_text(script_rel)
+    if (not norm_cmd) or (not norm_script_rel):
+        return False
+    target_script = normalize_process_match_text(os.path.join(str(agent_dir or "").strip(), script_rel))
+    if target_script and target_script in norm_cmd:
+        return True
+    if not process_cmdline_has_script(norm_cmd, norm_script_rel):
+        return False
+    if process_dirs_match(cwd, agent_dir, path_real=cwd_real, other_real=agent_dir_real):
+        return True
+    agent_aliases = process_path_aliases(agent_dir, real_path=agent_dir_real)
+    return bool(agent_aliases and any(alias in norm_cmd for alias in agent_aliases))
+
+
+def process_matcher_script_source() -> str:
+    return (
+        "def normalize_process_match_text(value):\n"
+        "    text = str(value or '').strip()\n"
+        "    if not text:\n"
+        "        return ''\n"
+        "    return os.path.normpath(text).replace('\\\\', '/').lower()\n"
+        "\n"
+        "def process_path_aliases(path, real_path=''):\n"
+        "    aliases = set()\n"
+        "    for candidate in (path, real_path):\n"
+        "        raw = str(candidate or '').strip()\n"
+        "        if not raw:\n"
+        "            continue\n"
+        "        norm = normalize_process_match_text(raw)\n"
+        "        if norm:\n"
+        "            aliases.add(norm)\n"
+        "    return aliases\n"
+        "\n"
+        "def process_dirs_match(path, other, path_real='', other_real=''):\n"
+        "    left = process_path_aliases(path, real_path=path_real)\n"
+        "    right = process_path_aliases(other, real_path=other_real)\n"
+        "    return bool(left and right and left.intersection(right))\n"
+        "\n"
+        "def process_cmdline_has_script(cmdline, script_rel):\n"
+        "    norm_cmd = normalize_process_match_text(cmdline)\n"
+        "    rel_script = normalize_process_match_text(script_rel)\n"
+        "    script_name = normalize_process_match_text(os.path.basename(str(script_rel or '').strip()))\n"
+        "    module_name = normalize_process_match_text(str(script_rel or '').strip())\n"
+        "    if module_name.endswith('.py'):\n"
+        "        module_name = module_name[:-3]\n"
+        "    module_name = module_name.replace('/', '.').replace('\\\\', '.')\n"
+        "    module_leaf = normalize_process_match_text(str(module_name.rsplit('.', 1)[-1] if module_name else ''))\n"
+        "    if not norm_cmd:\n"
+        "        return False\n"
+        "    if rel_script and rel_script in norm_cmd:\n"
+        "        return True\n"
+        "    if script_name and re.search(r\"(^|[/\\\\s\\\"'])\" + re.escape(script_name) + r\"($|[/\\\\s\\\"'])\", norm_cmd):\n"
+        "        return True\n"
+        "    if module_name and re.search(r\"(^|[\\\\s\\\"'])\" + re.escape(module_name) + r\"($|[\\\\s\\\"'])\", norm_cmd):\n"
+        "        return True\n"
+        "    if module_leaf and re.search(r\"(^|[\\\\s\\\"'])\" + re.escape(module_leaf) + r\"($|[\\\\s\\\"'])\", norm_cmd):\n"
+        "        return True\n"
+        "    return False\n"
+        "\n"
+        "def process_cmdline_matches_agent_script(cmdline, agent_dir, script_rel, cwd='', agent_dir_real='', cwd_real=''):\n"
+        "    norm_cmd = normalize_process_match_text(cmdline)\n"
+        "    norm_script_rel = normalize_process_match_text(script_rel)\n"
+        "    if (not norm_cmd) or (not norm_script_rel):\n"
+        "        return False\n"
+        "    target_script = normalize_process_match_text(os.path.join(str(agent_dir or '').strip(), script_rel))\n"
+        "    if target_script and target_script in norm_cmd:\n"
+        "        return True\n"
+        "    if not process_cmdline_has_script(norm_cmd, norm_script_rel):\n"
+        "        return False\n"
+        "    if process_dirs_match(cwd, agent_dir, path_real=cwd_real, other_real=agent_dir_real):\n"
+        "        return True\n"
+        "    agent_aliases = process_path_aliases(agent_dir, real_path=agent_dir_real)\n"
+        "    return bool(agent_aliases and any(alias in norm_cmd for alias in agent_aliases))\n"
+    )
 
 
 def looks_like_ssh_disconnect(detail: str) -> bool:
@@ -407,22 +626,53 @@ def _svg_icon(key: str, svg_template: str, color: str = "#94a3b8", size: int = 1
     return _ICON_CACHE[cache_key]
 
 
+_STREAMING_HEIGHT_GROWTH_STEP_PX = 8
+_BROWSER_MIN_HEIGHT_PX = 18
+_BROWSER_HEIGHT_SLACK_PX = 2
+_STREAMING_HEIGHT_BASELINE_SLACK_PX = 8
+
+
+def _browser_frame_vertical_inset(browser: QTextBrowser) -> int:
+    try:
+        if browser.frameShape() == QFrame.NoFrame:
+            return 0
+    except Exception:
+        pass
+    try:
+        return max(0, int(browser.frameWidth() or 0)) * 2
+    except Exception:
+        return 0
+
+
 def _fit_browser_height(browser: QTextBrowser) -> None:
     doc = browser.document()
     viewport_w = browser.viewport().width()
     width = viewport_w if viewport_w > 40 else 560
-    has_wide_content = bool(browser.property("_hasWideContent"))
     width_key = width
     old_width = int(browser.property("_fitWidth") or 0)
     old_height = int(browser.property("_fitHeight") or 0)
     if old_width == width_key and old_height > 0 and not browser.property("_fitForce"):
         return
     doc.setTextWidth(width)
-    new_h = max(38, int(doc.size().height() + 10))
+    new_h = max(
+        _BROWSER_MIN_HEIGHT_PX,
+        int(math.ceil(doc.size().height()))
+        + _browser_frame_vertical_inset(browser)
+        + _BROWSER_HEIGHT_SLACK_PX,
+    )
     if browser.property("streamingHold"):
-        current_h = browser.height()
-        if new_h < current_h:
-            new_h = current_h
+        current_h = max(0, int(browser.height() or 0))
+        trusted_current_h = 0
+        if old_height > 0 and abs(current_h - old_height) <= _STREAMING_HEIGHT_BASELINE_SLACK_PX:
+            trusted_current_h = max(current_h, old_height)
+        trusted_floor = trusted_current_h or old_height
+        if trusted_floor > 0 and new_h < trusted_floor:
+            new_h = trusted_floor
+        elif old_height > 0:
+            growth = new_h - max(old_height, trusted_current_h)
+            if 0 < growth < _STREAMING_HEIGHT_GROWTH_STEP_PX:
+                browser.setProperty("_fitForce", False)
+                return
     try:
         hbar = browser.horizontalScrollBar()
         if hbar is not None and hbar.isVisible():
@@ -436,6 +686,14 @@ def _fit_browser_height(browser: QTextBrowser) -> None:
         return
     browser.setProperty("_fitHeight", new_h)
     browser.setFixedHeight(new_h)
+
+
+def _refit_browser_for_state(browser: QTextBrowser, *, streaming: bool) -> None:
+    browser.setProperty("streamingHold", bool(streaming))
+    browser.setProperty("_fitWidth", 0)
+    browser.setProperty("_fitHeight", 0)
+    browser.setProperty("_fitForce", True)
+    _fit_browser_height(browser)
 
 
 def _session_copy(data):
@@ -600,6 +858,8 @@ class TurnFold(QFrame):
         self._body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self._body.setFrameShape(QFrame.NoFrame)
+        self._body.document().setDocumentMargin(0)
         self._body.document().setDefaultStyleSheet(_MD_CSS)
         self._body.setStyleSheet(
             f"QTextBrowser {{ background: transparent; border: none; color: {C['text_soft']}; font-size: 13px; }}"
@@ -653,6 +913,7 @@ class MessageRow(QWidget):
 
         is_user = role == "user"
         self.setObjectName("userMsgRow" if is_user else "botMsgRow")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(20, 10, 20, 10)
@@ -701,14 +962,17 @@ class MessageRow(QWidget):
         else:
             host = QWidget()
             host.setStyleSheet("background: transparent;")
+            host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
             host_layout = QVBoxLayout(host)
             host_layout.setContentsMargins(0, 0, 0, 0)
             host_layout.setSpacing(6)
+            self._assistant_host = host
             self._content_layout = host_layout
             right.addWidget(host)
 
             self._action_row = QWidget()
             self._action_row.setStyleSheet("background: transparent;")
+            self._action_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
             arow = QHBoxLayout(self._action_row)
             arow.setContentsMargins(0, 4, 10, 0)
             arow.setSpacing(4)
@@ -747,6 +1011,9 @@ class MessageRow(QWidget):
             self._token_label.hide()
             arow.addWidget(self._token_label)
             right.addWidget(self._action_row)
+            self._action_row.hide()
+            self._action_row_hovered = False
+            self._action_row_live = False
 
             self._label = None
             self._bubble = None
@@ -774,19 +1041,32 @@ class MessageRow(QWidget):
             except Exception:
                 pass
 
+    def _sync_action_row_visibility(self):
+        row = getattr(self, "_action_row", None)
+        if row is None:
+            return
+        if bool(getattr(self, "_action_row_hovered", False)) or bool(getattr(self, "_action_row_live", False)):
+            row.show()
+        else:
+            row.hide()
+
     def enterEvent(self, event):
         if self._role != "user" and self._finished:
+            self._action_row_hovered = True
             if getattr(self, "_copy_btn", None):
                 self._copy_btn.show()
             if getattr(self, "_regen_btn", None):
                 self._regen_btn.show()
+            self._sync_action_row_visibility()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        self._action_row_hovered = False
         if getattr(self, "_copy_btn", None):
             self._copy_btn.hide()
         if getattr(self, "_regen_btn", None):
             self._regen_btn.hide()
+        self._sync_action_row_visibility()
         super().leaveEvent(event)
 
     def set_token_info(self, input_tokens: int, output_tokens: int, *, live: bool = False):
@@ -796,17 +1076,17 @@ class MessageRow(QWidget):
         inp = int(input_tokens or 0)
         out = int(output_tokens or 0)
         if inp <= 0 and out <= 0:
+            self._action_row_live = False
             lbl.hide()
-            row = getattr(self, "_action_row", None)
-            if row is not None:
-                row.updateGeometry()
+            self._sync_action_row_visibility()
             return
         suffix = " …" if live else ""
         lbl.setText(f"↑{inp}  ↓{out}{suffix}")
         lbl.show()
+        self._action_row_live = bool(live)
+        self._sync_action_row_visibility()
         row = getattr(self, "_action_row", None)
         if row is not None:
-            row.show()
             row.adjustSize()
             row.updateGeometry()
         self.updateGeometry()
@@ -834,6 +1114,42 @@ class MessageRow(QWidget):
         self._stream_prefix_signature = None
         self._stream_live_browser = None
 
+    def _iter_active_assistant_browsers(self):
+        if self._content_layout is None:
+            return
+        for idx in range(self._content_layout.count()):
+            item = self._content_layout.itemAt(idx)
+            widget = item.widget() if item is not None else None
+            if widget is None:
+                continue
+            if isinstance(widget, QTextBrowser):
+                yield widget
+                continue
+            for browser in widget.findChildren(QTextBrowser):
+                yield browser
+
+    def _refit_finished_assistant_browsers(self):
+        if self._role == "user" or self._content_layout is None or not self._finished:
+            return
+        for browser in self._iter_active_assistant_browsers():
+            _refit_browser_for_state(browser, streaming=False)
+        host = getattr(self, "_assistant_host", None)
+        if host is not None:
+            host.adjustSize()
+            host.updateGeometry()
+        row = getattr(self, "_action_row", None)
+        if row is not None:
+            row.adjustSize()
+            row.updateGeometry()
+        self.adjustSize()
+        self.updateGeometry()
+        self.update()
+
+    def _schedule_finished_assistant_refit(self):
+        if self._role == "user" or self._content_layout is None or not self._finished:
+            return
+        QTimer.singleShot(0, self._refit_finished_assistant_browsers)
+
     def _make_browser(self, markdown_text: str, *, streaming: bool = False) -> QTextBrowser:
         browser = QTextBrowser()
         browser.setObjectName("botMsgBrowser")
@@ -845,6 +1161,8 @@ class MessageRow(QWidget):
         browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        browser.setFrameShape(QFrame.NoFrame)
+        browser.document().setDocumentMargin(0)
         browser.document().setDefaultStyleSheet(_MD_CSS)
         browser.setProperty("_markdownText", markdown_text)
         browser.setProperty("streamingHold", bool(streaming))
@@ -979,6 +1297,10 @@ class MessageRow(QWidget):
             else:
                 prefix_segments = segments
             self._stream_prefix_signature = tuple(seg_sig(s) for s in prefix_segments)
+            return
+
+        self._refit_finished_assistant_browsers()
+        self._schedule_finished_assistant_refit()
 
 
 class OptionCard(QFrame):

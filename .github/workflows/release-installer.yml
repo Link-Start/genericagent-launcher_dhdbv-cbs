@@ -132,13 +132,23 @@ jobs:
             --clobber
 
   build-macos:
-    runs-on: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+            runner_label: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+            runner_label: macos-15
     env:
       PYTHONUTF8: "1"
-      GA_MACOS_RUNNER_LABEL: "macos-15-intel"
-      GA_MACOS_EXPECTED_ARCH: "x86_64"
+      GA_MACOS_RUNNER_LABEL: ${{ matrix.runner_label }}
+      GA_MACOS_EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -278,9 +288,18 @@ jobs:
       - name: Upload macOS build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: launcher-macos-${{ steps.ver.outputs.value }}
+          name: launcher-macos-${{ matrix.arch }}-${{ steps.ver.outputs.value }}
           path: |
             release/${{ steps.ver.outputs.value }}/macos/**
+
+      - name: Prepare macOS release sidecars
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          v="${{ steps.ver.outputs.value }}"
+          arch="$GA_MACOS_EXPECTED_ARCH"
+          cp "release/$v/macos/README-macOS.txt" "release/$v/macos/README-macOS-$arch.txt"
+          cp "release/$v/macos/install-metadata.json" "release/$v/macos/install-metadata-$arch.json"
 
       - name: Publish macOS release assets
         if: startsWith(github.ref, 'refs/tags/')
@@ -290,11 +309,12 @@ jobs:
         run: |
           v="${{ steps.ver.outputs.value }}"
           tag="v$v"
+          arch="$GA_MACOS_EXPECTED_ARCH"
           required=(
-            "release/$v/macos/GenericAgentLauncher-macos-$v.dmg"
-            "release/$v/macos/GenericAgentLauncher-macos-$v.sha256"
-            "release/$v/macos/README-macOS.txt"
-            "release/$v/macos/install-metadata.json"
+            "release/$v/macos/GenericAgentLauncher-macos-$arch-$v.dmg"
+            "release/$v/macos/GenericAgentLauncher-macos-$arch-$v.sha256"
+            "release/$v/macos/README-macOS-$arch.txt"
+            "release/$v/macos/install-metadata-$arch.json"
           )
           for p in "${required[@]}"; do
             if [ ! -e "$p" ]; then
@@ -306,8 +326,8 @@ jobs:
             gh release create "$tag" --title "GenericAgent Launcher $tag" --notes "Automated release for $tag" || gh release view "$tag" >/dev/null 2>&1
           fi
           gh release upload "$tag" \
-            "release/$v/macos/GenericAgentLauncher-macos-$v.dmg" \
-            "release/$v/macos/GenericAgentLauncher-macos-$v.sha256" \
-            "release/$v/macos/README-macOS.txt" \
-            "release/$v/macos/install-metadata.json" \
+            "release/$v/macos/GenericAgentLauncher-macos-$arch-$v.dmg" \
+            "release/$v/macos/GenericAgentLauncher-macos-$arch-$v.sha256" \
+            "release/$v/macos/README-macOS-$arch.txt" \
+            "release/$v/macos/install-metadata-$arch.json" \
             --clobber

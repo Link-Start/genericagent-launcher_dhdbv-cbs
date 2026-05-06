@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -508,6 +509,11 @@ class PersonalUsageMixin:
         best_score = -1
         asset_rows = []
         is_macos = bool(getattr(lz, "IS_MACOS", sys.platform == "darwin"))
+        local_arch = str(platform.machine() or "").strip().lower()
+        if local_arch == "aarch64":
+            local_arch = "arm64"
+        elif local_arch == "amd64":
+            local_arch = "x86_64"
         if isinstance(assets, list):
             for item in assets:
                 if not isinstance(item, dict):
@@ -522,6 +528,12 @@ class PersonalUsageMixin:
                 if is_macos:
                     if lowered.endswith(".dmg"):
                         score = 100
+                        if local_arch == "arm64" and "arm64" in lowered:
+                            score += 20
+                        elif local_arch == "x86_64" and "x86_64" in lowered:
+                            score += 20
+                        elif "arm64" in lowered or "x86_64" in lowered:
+                            score -= 5
                     elif lowered.endswith(".pkg"):
                         score = 90
                     elif lowered.endswith(".app.zip"):
@@ -554,8 +566,17 @@ class PersonalUsageMixin:
                     return str(row.get("url") or "").strip(), str(row.get("name") or "").strip()
             return "", ""
 
-        readme_url, readme_name = _pick_asset(lambda row: row.get("lowered") == "readme-macos.txt")
-        metadata_url, metadata_name = _pick_asset(lambda row: row.get("lowered") == "install-metadata.json")
+        readme_url = ""
+        readme_name = ""
+        metadata_url = ""
+        metadata_name = ""
+        if is_macos and local_arch:
+            readme_url, readme_name = _pick_asset(lambda row, arch=local_arch: row.get("lowered") == f"readme-macos-{arch}.txt")
+            metadata_url, metadata_name = _pick_asset(lambda row, arch=local_arch: row.get("lowered") == f"install-metadata-{arch}.json")
+        if not readme_url:
+            readme_url, readme_name = _pick_asset(lambda row: row.get("lowered") == "readme-macos.txt")
+        if not metadata_url:
+            metadata_url, metadata_name = _pick_asset(lambda row: row.get("lowered") == "install-metadata.json")
         sha256_url = ""
         sha256_name = ""
         if preferred_sha_name:
@@ -636,11 +657,19 @@ class PersonalUsageMixin:
         asset_name = str(payload.get("external_asset_name") or "").strip()
         if (not asset_name) and external_url:
             asset_name = str(external_url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]).strip()
-        readme_name = str(payload.get("readme_asset_name") or "README-macOS.txt").strip()
+        readme_name = str(payload.get("readme_asset_name") or "").strip()
+        if (not readme_name) and readme_url:
+            readme_name = str(readme_url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]).strip()
+        if not readme_name:
+            readme_name = "README-macOS.txt"
         sha256_name = str(payload.get("sha256_asset_name") or "").strip() or (
-            str(asset_name[:-4] + ".sha256").strip() if asset_name.lower().endswith(".dmg") else "GenericAgentLauncher-macos-<version>.sha256"
+            str(asset_name[:-4] + ".sha256").strip() if asset_name.lower().endswith(".dmg") else "GenericAgentLauncher-macos-<arch>-<version>.sha256"
         )
-        metadata_name = str(payload.get("metadata_asset_name") or "install-metadata.json").strip()
+        metadata_name = str(payload.get("metadata_asset_name") or "").strip()
+        if (not metadata_name) and metadata_url:
+            metadata_name = str(metadata_url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]).strip()
+        if not metadata_name:
+            metadata_name = "install-metadata.json"
         app_name = str(getattr(lz, "APP_DISPLAY_NAME", "GenericAgent Launcher") or "GenericAgent Launcher").strip()
         install_state = {}
         if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):

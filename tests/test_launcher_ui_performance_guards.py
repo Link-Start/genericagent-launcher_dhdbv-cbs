@@ -5,7 +5,12 @@ import types
 import unittest
 from unittest import mock
 
+from PySide6.QtCore import QPoint
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
 from launcher_app import window as launcher_window
+import qt_chat_parts.chat_view as chat_view_mod
+import qt_chat_parts.common as chat_common
 from qt_chat_parts.channel_runtime import ChannelRuntimeMixin
 from qt_chat_parts.personal_usage import PersonalUsageMixin
 from qt_chat_parts.settings_panel import SettingsPanelMixin
@@ -21,6 +26,191 @@ class LauncherUiPerformanceGuardTests(unittest.TestCase):
         self.assertIn("self._stream_flush_timer.start(90)", src)
         self.assertIn("def _flush_stream_render", src)
         self.assertIn('refresher = getattr(self, "_refresh_floating_chat_window", None)', src)
+
+    def test_chat_message_containers_use_fixed_bottom_spacer_instead_of_stretch(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "launcher_app", "window.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("self.msg_layout.setAlignment(Qt.AlignTop)", src)
+        self.assertIn("layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)", src)
+        chat_view_path = os.path.join(root, "qt_chat_parts", "chat_view.py")
+        with open(chat_view_path, "r", encoding="utf-8") as f:
+            chat_src = f.read()
+        self.assertIn("def _sync_message_layout_alignment(self):", chat_src)
+        self.assertIn("layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)", chat_src)
+        self.assertIn(
+            "self.msg_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed))",
+            src,
+        )
+        self.assertNotIn("self.msg_layout.addStretch(1)", src)
+
+    def test_message_row_action_row_stays_collapsed_when_not_hovered_or_live(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "common.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)", src)
+        self.assertIn("self._action_row.hide()", src)
+        self.assertIn("self._action_row_hovered = False", src)
+        self.assertIn("self._action_row_live = False", src)
+        self.assertIn(
+            "if bool(getattr(self, \"_action_row_hovered\", False)) or bool(getattr(self, \"_action_row_live\", False)):",
+            src,
+        )
+        self.assertIn("self._sync_action_row_visibility()", src)
+
+    def test_assistant_browsers_strip_default_document_margin_and_frame(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "common.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("browser.setFrameShape(QFrame.NoFrame)", src)
+        self.assertIn("browser.document().setDocumentMargin(0)", src)
+        self.assertIn("self._body.setFrameShape(QFrame.NoFrame)", src)
+        self.assertIn("self._body.document().setDocumentMargin(0)", src)
+
+    def test_single_line_assistant_message_keeps_action_row_close_to_text(self):
+        app = QApplication.instance() or QApplication([])
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        row = chat_common.MessageRow("短回复", "assistant", host, on_resend=lambda _row: None)
+        layout.addWidget(row)
+        host.resize(480, 220)
+        host.show()
+
+        row._action_row_hovered = True
+        row._copy_btn.show()
+        if row._regen_btn is not None:
+            row._regen_btn.show()
+        row._sync_action_row_visibility()
+        row._refit_finished_assistant_browsers()
+        app.processEvents()
+        app.processEvents()
+
+        browser = next(row._iter_active_assistant_browsers())
+        browser_origin = browser.mapTo(row, QPoint(0, 0))
+        action_origin = row._action_row.mapTo(row, QPoint(0, 0))
+        gap = int(action_origin.y() - (browser_origin.y() + browser.height()))
+
+        self.assertLessEqual(browser.height(), 24)
+        self.assertLessEqual(gap, 12)
+
+        host.close()
+        host.deleteLater()
+        app.processEvents()
+
+    def test_finished_message_row_refits_browser_and_clears_streaming_hold(self):
+        class DummyDoc:
+            def __init__(self, height):
+                self.height = height
+                self.width = None
+
+            def setTextWidth(self, width):
+                self.width = width
+
+            def size(self):
+                return types.SimpleNamespace(height=lambda: self.height)
+
+        class DummyBar:
+            def isVisible(self):
+                return False
+
+        class DummyBrowser:
+            def __init__(self):
+                self.doc = DummyDoc(28)
+                self.current_height = 120
+                self.props = {
+                    "streamingHold": True,
+                    "_fitForce": False,
+                    "_fitHeight": 120,
+                    "_fitWidth": 560,
+                }
+                self.fixed_heights = []
+
+            def document(self):
+                return self.doc
+
+            def viewport(self):
+                return types.SimpleNamespace(width=lambda: 560)
+
+            def property(self, key):
+                return self.props.get(key)
+
+            def setProperty(self, key, value):
+                self.props[key] = value
+
+            def height(self):
+                return self.current_height
+
+            def horizontalScrollBar(self):
+                return DummyBar()
+
+            def frameShape(self):
+                return 0
+
+            def frameWidth(self):
+                return 0
+
+            def setFixedHeight(self, value):
+                self.fixed_heights.append(int(value))
+                self.current_height = int(value)
+
+        browser = DummyBrowser()
+        chat_common._refit_browser_for_state(browser, streaming=False)
+
+        self.assertFalse(browser.property("streamingHold"))
+        self.assertEqual(browser.fixed_heights, [30])
+        self.assertEqual(browser.property("_fitHeight"), 30)
+        self.assertFalse(browser.property("_fitForce"))
+
+    def test_finished_message_row_schedules_refit_after_rebuild(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "qt_chat_parts", "common.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("def _schedule_finished_assistant_refit(self):", src)
+        self.assertIn("QTimer.singleShot(0, self._refit_finished_assistant_browsers)", src)
+        self.assertIn("self._refit_finished_assistant_browsers()", src)
+
+    def test_empty_live_assistant_row_first_chunk_does_not_lock_host_height(self):
+        app = QApplication.instance() or QApplication([])
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        row = chat_common.MessageRow("", "assistant", host, on_resend=lambda _row: None)
+        layout.addWidget(row)
+        host.resize(520, 480)
+        host.show()
+        app.processEvents()
+
+        row.set_finished(False)
+        app.processEvents()
+        row.update_content("hello world", finished=False)
+        app.processEvents()
+        app.processEvents()
+
+        browser = row._stream_live_browser
+        self.assertIsNotNone(browser)
+        self.assertTrue(browser.property("streamingHold"))
+        self.assertLessEqual(browser.height(), 40)
+        self.assertLessEqual(int(browser.property("_fitHeight") or 0), 40)
+        self.assertNotEqual(browser.height(), host.height())
+
+        row.update_content("hello world", finished=True)
+        app.processEvents()
+        app.processEvents()
+
+        browser = next(row._iter_active_assistant_browsers())
+        self.assertFalse(browser.property("streamingHold"))
+        self.assertLessEqual(browser.height(), 40)
+
+        host.close()
+        host.deleteLater()
+        app.processEvents()
 
     def test_hidden_floating_window_skips_full_sync_when_not_visible(self):
         class DummyFloating:
@@ -148,6 +338,333 @@ class LauncherUiPerformanceGuardTests(unittest.TestCase):
         self.assertEqual(dummy._floating_chat_window.refreshed, 1)
         self.assertEqual(dummy._floating_chat_window.sync_payload["stream_text"], "partial")
         self.assertEqual(dummy.calls, ["sync_llm", "refresh_tray"])
+
+    def test_scroll_row_to_top_can_preserve_stream_auto_follow_state(self):
+        class DummyBar:
+            def __init__(self):
+                self.value_set = None
+
+            def maximum(self):
+                return 400
+
+            def setValue(self, value):
+                self.value_set = int(value)
+
+        class DummyScroll:
+            def __init__(self, bar):
+                self._bar = bar
+
+            def verticalScrollBar(self):
+                return self._bar
+
+        class DummyRow:
+            def y(self):
+                return 180
+
+        class DummyView:
+            _scroll_row_to_top = chat_view_mod.ChatViewMixin._scroll_row_to_top
+
+            def __init__(self):
+                self.scroll = DummyScroll(DummyBar())
+                self._user_scrolled_up = True
+                self.jump_refreshes = 0
+
+            def _refresh_jump_latest_button(self):
+                self.jump_refreshes += 1
+
+        dummy = DummyView()
+        with mock.patch.object(chat_view_mod.QTimer, "singleShot", side_effect=lambda _ms, fn: fn()):
+            dummy._scroll_row_to_top(DummyRow(), preserve_scroll_state=True)
+
+        self.assertFalse(dummy._user_scrolled_up)
+        self.assertEqual(dummy.scroll.verticalScrollBar().value_set, 162)
+        self.assertEqual(dummy.jump_refreshes, 1)
+
+    def test_sync_current_turn_view_prefers_tracked_current_turn_user_row(self):
+        class DummyRow:
+            def __init__(self, label):
+                self.label = str(label)
+
+        class DummyView:
+            _sync_current_turn_view = chat_view_mod.ChatViewMixin._sync_current_turn_view
+            _tracked_current_turn_user_row = chat_view_mod.ChatViewMixin._tracked_current_turn_user_row
+            _latest_user_row = chat_view_mod.ChatViewMixin._latest_user_row
+
+            def __init__(self):
+                self._follow_latest_user_message = True
+                self._current_turn_user_row = DummyRow("current")
+                self._rendered_message_rows = [DummyRow("history"), self._current_turn_user_row]
+                self.scroll_calls = []
+                self.bottom_calls = 0
+
+            def _scroll_row_to_top(self, row, preserve_scroll_state=False):
+                self.scroll_calls.append((row.label, bool(preserve_scroll_state)))
+
+            def _set_follow_latest_user(self, enabled):
+                self._follow_latest_user_message = bool(enabled)
+
+            def _scroll_to_bottom(self, force=False):
+                self.bottom_calls += 1
+
+        dummy = DummyView()
+        dummy._sync_current_turn_view()
+
+        self.assertEqual(dummy.scroll_calls, [("current", True)])
+        self.assertEqual(dummy.bottom_calls, 0)
+        self.assertFalse(dummy._follow_latest_user_message)
+
+    def test_chat_view_tail_spacer_survives_clear_and_keeps_insert_slot(self):
+        class DummyWidget:
+            def __init__(self, label):
+                self.label = str(label)
+                self.deleted = 0
+
+            def deleteLater(self):
+                self.deleted += 1
+
+        class DummyLayoutItem:
+            def __init__(self, widget=None, spacer=False):
+                self._widget = widget
+                self._spacer = object() if spacer else None
+
+            def widget(self):
+                return self._widget
+
+            def spacerItem(self):
+                return self._spacer
+
+        class DummyLayout:
+            def __init__(self):
+                self.items = [DummyLayoutItem(DummyWidget("row")), DummyLayoutItem(spacer=True)]
+                self.alignment = None
+
+            def count(self):
+                return len(self.items)
+
+            def itemAt(self, index):
+                return self.items[int(index)]
+
+            def takeAt(self, index):
+                return self.items.pop(int(index))
+
+            def insertWidget(self, index, widget):
+                self.items.insert(int(index), DummyLayoutItem(widget))
+
+            def setAlignment(self, alignment):
+                self.alignment = alignment
+
+        class DummyView:
+            _message_row_insert_index = chat_view_mod.ChatViewMixin._message_row_insert_index
+            _clear_messages = chat_view_mod.ChatViewMixin._clear_messages
+            _sync_message_layout_alignment = chat_view_mod.ChatViewMixin._sync_message_layout_alignment
+
+            def __init__(self):
+                self.msg_layout = DummyLayout()
+                self.msg_root = object()
+                self._stream_row = object()
+                self._current_stream_text = "live"
+                self._pending_stream_text = "pending"
+                self._rendered_message_rows = [object()]
+                self.jump_refreshes = 0
+                self.floating_refreshes = 0
+
+            def _refresh_jump_latest_button(self):
+                self.jump_refreshes += 1
+
+            def _refresh_floating_chat_window(self):
+                self.floating_refreshes += 1
+
+        dummy = DummyView()
+        row_widget = dummy.msg_layout.itemAt(0).widget()
+        dummy._clear_messages()
+
+        self.assertEqual(row_widget.deleted, 1)
+        self.assertEqual(dummy.msg_layout.count(), 1)
+        self.assertIsNotNone(dummy.msg_layout.itemAt(0).spacerItem())
+        self.assertEqual(dummy._message_row_insert_index(), 0)
+        self.assertEqual(dummy.jump_refreshes, 1)
+        self.assertEqual(dummy.floating_refreshes, 1)
+
+    def test_floating_orb_stream_updates_reuse_live_row_when_bubbles_do_not_change(self):
+        class DummyLayoutItem:
+            def __init__(self, widget):
+                self._widget = widget
+
+            def widget(self):
+                return self._widget
+
+        class DummyLayout:
+            def __init__(self):
+                self.widgets = []
+                self.alignment = None
+
+            def count(self):
+                return len(self.widgets) + 1
+
+            def insertWidget(self, index, widget):
+                idx = max(0, min(int(index), len(self.widgets)))
+                self.widgets.insert(idx, widget)
+
+            def takeAt(self, index):
+                if 0 <= int(index) < len(self.widgets):
+                    return DummyLayoutItem(self.widgets.pop(int(index)))
+                return DummyLayoutItem(None)
+
+            def indexOf(self, widget):
+                try:
+                    return self.widgets.index(widget)
+                except ValueError:
+                    return -1
+
+            def setAlignment(self, alignment):
+                self.alignment = alignment
+
+        class DummyRow:
+            instances = []
+
+            def __init__(self, text, role, _parent, on_resend=None):
+                self._text = str(text)
+                self._role = str(role)
+                self._finished = True
+                self._on_resend = on_resend
+                self.updates = []
+                DummyRow.instances.append(self)
+
+            def set_finished(self, value):
+                self._finished = bool(value)
+
+            def update_content(self, text, *, finished):
+                self._text = str(text)
+                self._finished = bool(finished)
+                self.updates.append((self._text, self._finished))
+
+            def parent(self):
+                return object()
+
+            def deleteLater(self):
+                return None
+
+        class DummyHost:
+            def __init__(self):
+                self._busy = True
+                self._follow_latest_user_message = False
+
+        class DummyOrb:
+            _render_rows = launcher_window.FloatingOrbWindow._render_rows
+            _sync_stream_row = launcher_window.FloatingOrbWindow._sync_stream_row
+            _clear_stream_row = launcher_window.FloatingOrbWindow._clear_stream_row
+            _sync_message_layout_alignment = launcher_window.FloatingOrbWindow._sync_message_layout_alignment
+
+            def __init__(self):
+                self._host = DummyHost()
+                self._last_signature = None
+                self._last_bubble_signature = None
+                self._rendered_rows = []
+                self._stream_row = None
+                self._focus_latest_user_after_refresh = False
+                self.msg_layout = DummyLayout()
+                self.msg_root = object()
+                self.clear_calls = 0
+                self.scroll_calls = []
+
+            def _clear_rows(self):
+                self.clear_calls += 1
+                self._stream_row = None
+                self._last_bubble_signature = None
+                self._rendered_rows = []
+                self.msg_layout.widgets = []
+
+            def _scroll_to_latest_dialogue(self):
+                self.scroll_calls.append("latest")
+
+            def _scroll_to_bottom(self):
+                self.scroll_calls.append("bottom")
+
+        dummy = DummyOrb()
+        bubbles = [{"role": "user", "text": "hello"}]
+        with mock.patch.object(launcher_window, "MessageRow", DummyRow), mock.patch.object(
+            launcher_window.QTimer, "singleShot", side_effect=lambda _ms, fn: fn()
+        ):
+            dummy._render_rows(bubbles, "part 1")
+            first_user_row = dummy._rendered_rows[0]
+            first_stream_row = dummy._stream_row
+            dummy._render_rows(bubbles, "part 2")
+
+        self.assertEqual(dummy.clear_calls, 1)
+        self.assertIs(dummy._rendered_rows[0], first_user_row)
+        self.assertIs(dummy._stream_row, first_stream_row)
+        self.assertEqual(len(DummyRow.instances), 2)
+        self.assertEqual(first_stream_row.updates, [("part 1", False), ("part 2", False)])
+        self.assertEqual(dummy.scroll_calls, ["bottom", "bottom"])
+
+    def test_streaming_browser_height_skips_sub_line_growth_jitter(self):
+        class DummyDoc:
+            def __init__(self, height):
+                self.height = height
+                self.width = None
+
+            def setTextWidth(self, width):
+                self.width = width
+
+            def size(self):
+                return types.SimpleNamespace(height=lambda: self.height)
+
+        class DummyBar:
+            def isVisible(self):
+                return False
+
+        class DummyBrowser:
+            def __init__(self, *, doc_height, height, fit_height):
+                self.doc = DummyDoc(doc_height)
+                self.current_height = height
+                self.props = {
+                    "streamingHold": True,
+                    "_fitForce": True,
+                    "_fitHeight": fit_height,
+                    "_fitWidth": 560,
+                }
+                self.fixed_heights = []
+
+            def document(self):
+                return self.doc
+
+            def viewport(self):
+                return types.SimpleNamespace(width=lambda: 560)
+
+            def property(self, key):
+                return self.props.get(key)
+
+            def setProperty(self, key, value):
+                self.props[key] = value
+
+            def height(self):
+                return self.current_height
+
+            def horizontalScrollBar(self):
+                return DummyBar()
+
+            def frameShape(self):
+                return 0
+
+            def frameWidth(self):
+                return 0
+
+            def setFixedHeight(self, value):
+                self.fixed_heights.append(int(value))
+                self.current_height = int(value)
+
+        small_growth = DummyBrowser(doc_height=94, height=100, fit_height=100)
+        chat_common._fit_browser_height(small_growth)
+
+        self.assertEqual(small_growth.fixed_heights, [])
+        self.assertFalse(small_growth.property("_fitForce"))
+        self.assertEqual(small_growth.property("_fitHeight"), 100)
+
+        line_growth = DummyBrowser(doc_height=110, height=100, fit_height=100)
+        chat_common._fit_browser_height(line_growth)
+
+        self.assertEqual(line_growth.fixed_heights, [112])
+        self.assertEqual(line_growth.property("_fitHeight"), 112)
 
     def test_cached_local_settings_category_switch_skips_redundant_reload(self):
         class DummyStack:
@@ -525,8 +1042,9 @@ class LauncherUiPerformanceGuardTests(unittest.TestCase):
             def _refresh_channel_source_actions(self):
                 self.calls.append("refresh_actions")
 
-            def _refresh_wechat_external_running(self):
-                self.calls.append("refresh_wechat")
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                self.calls.append("refresh_local")
+                return {}
 
             def _channel_status(self, channel_id, values, *, target_ctx=None):
                 self.calls.append(("channel_status", channel_id))

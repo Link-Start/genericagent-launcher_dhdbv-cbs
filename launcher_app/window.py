@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpacerItem,
     QSpinBox,
     QSizePolicy,
     QSplitter,
@@ -134,6 +135,8 @@ class FloatingOrbWindow(QWidget):
         self._ignore_llm_change = False
         self._ignore_reasoning_effort_change = False
         self._rendered_rows = []
+        self._stream_row = None
+        self._last_bubble_signature = None
         self._focus_latest_user_after_refresh = False
         self._orb_hover = False
         self._orb_pressed = False
@@ -220,7 +223,8 @@ class FloatingOrbWindow(QWidget):
         self.msg_layout = QVBoxLayout(self.msg_root)
         self.msg_layout.setContentsMargins(0, 12, 0, 12)
         self.msg_layout.setSpacing(4)
-        self.msg_layout.addStretch(1)
+        self.msg_layout.setAlignment(Qt.AlignTop)
+        self.msg_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed))
         self.scroll.setWidget(self.msg_root)
         panel_layout.addWidget(self.scroll, 1)
 
@@ -667,12 +671,68 @@ class FloatingOrbWindow(QWidget):
         self.setMask(region)
 
     def _clear_rows(self):
+        self._stream_row = None
+        self._last_bubble_signature = None
         self._rendered_rows = []
         while self.msg_layout.count() > 1:
             item = self.msg_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self._sync_message_layout_alignment()
+
+    def _sync_message_layout_alignment(self):
+        layout = getattr(self, "msg_layout", None)
+        if layout is None:
+            return
+        rows = getattr(self, "_rendered_rows", None) or []
+        layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)
+
+    def _clear_stream_row(self):
+        row = getattr(self, "_stream_row", None)
+        if row is None:
+            return
+        try:
+            self._rendered_rows.remove(row)
+        except ValueError:
+            pass
+        idx = -1
+        try:
+            idx = self.msg_layout.indexOf(row)
+        except Exception:
+            idx = -1
+        if idx >= 0:
+            item = self.msg_layout.takeAt(idx)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        else:
+            try:
+                row.deleteLater()
+            except Exception:
+                pass
+        self._stream_row = None
+
+    def _sync_stream_row(self, stream_text: str, busy: bool):
+        if not busy:
+            self._clear_stream_row()
+            self._sync_message_layout_alignment()
+            return
+        text = str(stream_text or "")
+        row = getattr(self, "_stream_row", None)
+        try:
+            row_ok = row is not None and row.parent() is not None
+        except Exception:
+            row_ok = row is not None
+        if not row_ok:
+            row = MessageRow(text, "assistant", self.msg_root)
+            row.update_content(text, finished=False)
+            self.msg_layout.insertWidget(self.msg_layout.count() - 1, row)
+            self._rendered_rows.append(row)
+            self._stream_row = row
+            self._sync_message_layout_alignment()
+            return
+        row.update_content(text, finished=False)
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
@@ -740,23 +800,42 @@ class FloatingOrbWindow(QWidget):
         self._handle_send()
 
     def _render_rows(self, bubbles, stream_text: str):
+        bubble_signature = tuple((str(item.get("role") or ""), str(item.get("text") or "")) for item in (bubbles or []))
+        busy = bool(getattr(self._host, "_busy", False))
         signature = (
-            tuple((str(item.get("role") or ""), str(item.get("text") or "")) for item in (bubbles or [])),
+            bubble_signature,
             str(stream_text or ""),
-            bool(getattr(self._host, "_busy", False)),
+            busy,
         )
         if signature == self._last_signature:
+            return
+        host_follow_latest = bool(getattr(self._host, "_follow_latest_user_message", False))
+        keep_latest_user = self._focus_latest_user_after_refresh or host_follow_latest
+        if bubble_signature == self._last_bubble_signature:
+            self._last_signature = signature
+            self._sync_stream_row(str(stream_text or ""), busy)
+            if keep_latest_user:
+                self._focus_latest_user_after_refresh = False
+                if host_follow_latest:
+                    follower = getattr(self._host, "_set_follow_latest_user", None)
+                    if callable(follower):
+                        follower(False)
+                QTimer.singleShot(0, self._scroll_to_latest_dialogue)
+            else:
+                QTimer.singleShot(0, self._scroll_to_bottom)
             return
         self._last_signature = signature
         self._clear_rows()
         rows = list(bubbles or [])
-        if not rows and not stream_text and not getattr(self._host, "_busy", False):
+        if not rows and not stream_text and not busy:
             empty = QLabel("点击悬浮球即可快速发送消息，当前会话内容会在这里同步显示。")
             empty.setWordWrap(True)
             empty.setAlignment(Qt.AlignCenter)
             empty.setObjectName("mutedText")
             empty.setStyleSheet(f"color: {C['muted']}; padding: 24px 18px;")
             self.msg_layout.insertWidget(0, empty)
+            self._last_bubble_signature = bubble_signature
+            self._sync_message_layout_alignment()
             return
         insert_index = self.msg_layout.count() - 1
         for bubble in rows:
@@ -766,14 +845,16 @@ class FloatingOrbWindow(QWidget):
             row.set_finished(True)
             self.msg_layout.insertWidget(insert_index, row)
             self._rendered_rows.append(row)
+            self._sync_message_layout_alignment()
             insert_index += 1
-        if getattr(self._host, "_busy", False):
+        if busy:
             row = MessageRow(str(stream_text or ""), "assistant", self.msg_root)
             row.update_content(str(stream_text or ""), finished=False)
             self.msg_layout.insertWidget(insert_index, row)
             self._rendered_rows.append(row)
-        host_follow_latest = bool(getattr(self._host, "_follow_latest_user_message", False))
-        keep_latest_user = self._focus_latest_user_after_refresh or host_follow_latest
+            self._stream_row = row
+            self._sync_message_layout_alignment()
+        self._last_bubble_signature = bubble_signature
         if keep_latest_user:
             self._focus_latest_user_after_refresh = False
             if host_follow_latest:
@@ -1158,9 +1239,6 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain_events)
         self._drain_timer.start(40)
-        self._channel_snapshot_timer = QTimer(self)
-        self._channel_snapshot_timer.timeout.connect(self._sync_all_channel_process_sessions)
-        self._channel_snapshot_timer.start(2000)
         self._server_status_timer = QTimer(self)
         self._server_status_timer.timeout.connect(self._request_server_connection_probe)
         self._server_status_timer.start(15000)
@@ -1185,6 +1263,8 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._pending_reasoning_effort_override = None
         self._user_scrolled_up = False
         self._follow_latest_user_message = False
+        self._current_turn_user_row = None
+        self._reply_done_popups = []
         self._state_request_seq = 0
         self._active_token_event_ts = None
         self._current_stream_text = ""
@@ -1682,7 +1762,8 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self.msg_layout = QVBoxLayout(self.msg_root)
         self.msg_layout.setContentsMargins(0, 12, 0, 12)
         self.msg_layout.setSpacing(4)
-        self.msg_layout.addStretch(1)
+        self.msg_layout.setAlignment(Qt.AlignTop)
+        self.msg_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed))
         self.scroll.setWidget(self.msg_root)
         main_layout.addWidget(self.scroll, 1)
 
@@ -1843,6 +1924,59 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             output_tokens,
             live=bool(live and summary.get("live_output_tokens", 0)),
         )
+
+    def _close_reply_done_popups(self):
+        popups = list(getattr(self, "_reply_done_popups", None) or [])
+        self._reply_done_popups = []
+        for box in popups:
+            if box is None:
+                continue
+            try:
+                box.hide()
+            except Exception:
+                pass
+            try:
+                box.close()
+            except Exception:
+                pass
+            try:
+                box.deleteLater()
+            except Exception:
+                pass
+
+    def _show_reply_done_popup(self, text: str, *, title: str = "GenericAgent 启动器"):
+        message = str(text or "").strip()
+        if not message or bool(getattr(self, "_closing_in_progress", False)):
+            return None
+        self._close_reply_done_popups()
+        box = QMessageBox(QMessageBox.Information, str(title or "GenericAgent 启动器"), message, QMessageBox.Ok, None)
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.setWindowModality(Qt.NonModal)
+        icon = self.windowIcon()
+        if icon is not None and (not icon.isNull()):
+            try:
+                box.setWindowIcon(icon)
+            except Exception:
+                pass
+        self._reply_done_popups.append(box)
+
+        def _drop_popup(*_args):
+            current = getattr(self, "_reply_done_popups", None)
+            if not isinstance(current, list):
+                return
+            try:
+                current.remove(box)
+            except ValueError:
+                pass
+
+        try:
+            box.destroyed.connect(_drop_popup)
+        except Exception:
+            pass
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        return box
 
     def _ensure_launcher_tray_icon(self):
         tray = self._launcher_tray_icon or getattr(self, "_reply_notify_tray", None)
@@ -2472,18 +2606,28 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 self._show_floating_chat_window()
 
     def _close_tray_helpers(self):
+        self._close_reply_done_popups()
         win = getattr(self, "_floating_chat_window", None)
         if win is not None:
             win.hide()
             win.deleteLater()
             self._floating_chat_window = None
         tray = getattr(self, "_launcher_tray_icon", None)
-        if tray is not None:
+        reply_tray = getattr(self, "_reply_notify_tray", None)
+        seen = set()
+        for candidate in (tray, reply_tray):
+            if candidate is None:
+                continue
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
             try:
-                tray.hide()
+                candidate.hide()
             except Exception:
                 pass
         self._launcher_tray_icon = None
+        self._reply_notify_tray = None
         self._launcher_tray_menu = None
         self._tray_restore_main_action = None
         self._tray_show_floating_action = None
@@ -2523,9 +2667,24 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 def main(agent_dir: str | None = None) -> int:
     from launcher_app import theme as qt_theme
 
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GenericAgentLauncher")
+        except Exception:
+            pass
     target = agent_dir if agent_dir is not None else (sys.argv[1] if len(sys.argv) > 1 else None)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("GenericAgent Launcher")
+    setter = getattr(app, "setApplicationDisplayName", None)
+    if callable(setter):
+        try:
+            setter("GenericAgent Launcher")
+        except Exception:
+            pass
+    try:
+        app.setOrganizationName("GenericAgent")
+    except Exception:
+        pass
     try:
         app.setWindowIcon(launcher_icon())
     except Exception:

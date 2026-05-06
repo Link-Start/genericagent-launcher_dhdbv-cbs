@@ -2,13 +2,17 @@
 通过 stdin/stdout 收发 JSON 行与启动器通信。
 """
 import ast
+import base64
 import json
+import mimetypes
 import os
+import queue
 import re
 import sys
 import threading
 import time
 import traceback
+import types
 
 
 def _strip_incompatible_pyinstaller_runtime_from_sys_path():
@@ -736,6 +740,277 @@ def _mykey_hint_path(agent_dir):
         return py_path
     return os.path.join(agent_dir, "mykey.json")
 
+
+def _collect_existing_image_paths(raw_images):
+    images = []
+    if not isinstance(raw_images, list):
+        return images
+    for item in raw_images:
+        path = str(item or "").strip()
+        if path and os.path.isfile(path):
+            images.append(path)
+    return images
+
+
+def _image_mime_type(path):
+    mime, _encoding = mimetypes.guess_type(str(path or ""))
+    if isinstance(mime, str) and mime.startswith("image/"):
+        return mime
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }.get(ext, "image/png")
+
+
+def _image_data_url(path):
+    with open(path, "rb") as f:
+        raw = f.read()
+    return f"data:{_image_mime_type(path)};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _build_prompt_with_images(prompt_text, image_paths):
+    prompt = str(prompt_text or "")
+    images = _collect_existing_image_paths(image_paths)
+    if not images:
+        return prompt
+
+    count = len(images)
+    intro = f"用户发送了 {count} 张图片，请结合这些图片回答。"
+    attachment_chunks = ["[用户上传图片附件]"]
+
+    for idx, path in enumerate(images, start=1):
+        name = os.path.basename(path) or f"image_{idx}"
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            encoded = base64.b64encode(raw).decode("ascii")
+            attachment_chunks.append(
+                f"- [图片附件 {idx}] {name} ({len(raw)} bytes)\n"
+                f"  磁盘路径: {path}\n"
+                f"  data:{_image_mime_type(path)};base64,{encoded}"
+            )
+        except Exception as exc:
+            attachment_chunks.append(
+                f"- [图片附件 {idx}] {name}\n"
+                f"  磁盘路径: {path}\n"
+                f"  [读取失败] {exc}"
+            )
+
+    attachment_text = "\n".join(attachment_chunks)
+    if prompt.strip():
+        return f"{prompt.rstrip()}\n\n{intro}\n{attachment_text}"
+    return f"{intro}\n{attachment_text}"
+
+
+def _build_turn_history_text(prompt_text, image_paths):
+    prompt = str(prompt_text or "").strip()
+    count = len(_collect_existing_image_paths(image_paths))
+    if prompt:
+        return prompt
+    if count > 0:
+        return f"[用户发送了 {count} 张图片]"
+    return ""
+
+
+def _clone_content_blocks(content):
+    if isinstance(content, list):
+        return [dict(item) if isinstance(item, dict) else item for item in content]
+    return content
+
+
+def _build_scrubbed_user_content(prompt_text, image_paths):
+    clean_text = _build_turn_history_text(prompt_text, image_paths)
+    if not clean_text:
+        return []
+    return [{"type": "text", "text": clean_text}]
+
+
+def _build_multimodal_user_content(prompt_text, image_paths):
+    prompt = str(prompt_text or "").strip()
+    images = _collect_existing_image_paths(image_paths)
+    if not images:
+        return None
+    parts = []
+    if prompt:
+        parts.append({"type": "text", "text": prompt})
+    else:
+        parts.append({"type": "text", "text": "请结合图片内容回答。"})
+    for path in images:
+        try:
+            parts.append({"type": "image_url", "image_url": {"url": _image_data_url(path)}})
+        except Exception:
+            continue
+    return parts or None
+
+
+def _supports_native_multimodal(llmclient):
+    return type(llmclient).__name__ == "NativeToolClient"
+
+
+def _content_has_image_payload(content):
+    if isinstance(content, str):
+        return "data:image/" in content or "[用户上传图片附件]" in content
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).strip().lower()
+        if item_type in {"image", "image_url", "input_image"}:
+            return True
+        if item_type == "text" and "data:image/" in str(item.get("text") or ""):
+            return True
+    return False
+
+
+def _scrub_last_user_history(llmclient, replacement_content, *, start_len=0):
+    backend = _llm_backend(llmclient)
+    history = getattr(backend, "history", None) if backend is not None else None
+    if not isinstance(history, list):
+        return False
+    replacement = _clone_content_blocks(replacement_content)
+    if not replacement:
+        return False
+    begin = max(0, int(start_len or 0))
+    for idx in range(begin, len(history)):
+        item = history[idx]
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).strip().lower() != "user":
+            continue
+        if not _content_has_image_payload(item.get("content")):
+            continue
+        history[idx] = {**item, "content": replacement}
+        return True
+    return False
+
+
+def _patch_agent_launcher_multimodal(agent, agentmain_mod):
+    if getattr(agent, "_ga_launcher_multimodal_patched", False):
+        return agent
+
+    def put_task_patched(
+        self,
+        query,
+        source="user",
+        images=None,
+        *,
+        initial_user_content=None,
+        history_text=None,
+        scrub_user_content=None,
+    ):
+        display_queue = queue.Queue()
+        self.task_queue.put(
+            {
+                "query": query,
+                "source": source,
+                "images": images or [],
+                "output": display_queue,
+                "initial_user_content": _clone_content_blocks(initial_user_content),
+                "history_text": history_text,
+                "scrub_user_content": _clone_content_blocks(scrub_user_content),
+            }
+        )
+        return display_queue
+
+    def run_patched(self):
+        while True:
+            task = self.task_queue.get()
+            raw_query = task["query"]
+            source = task["source"]
+            images = task.get("images") or []
+            display_queue = task["output"]
+            initial_user_content = _clone_content_blocks(task.get("initial_user_content"))
+            history_text = str(task.get("history_text") or raw_query or "")
+            scrub_user_content = _clone_content_blocks(task.get("scrub_user_content"))
+            raw_query = self._handle_slash_cmd(raw_query, display_queue)
+            if raw_query is None:
+                self.task_queue.task_done()
+                continue
+            self.is_running = True
+            rquery = agentmain_mod.smart_format(history_text.replace("\n", " "), max_str_len=200)
+            self.history.append(f"[USER]: {rquery}")
+
+            sys_prompt = agentmain_mod.get_system_prompt() + getattr(self.llmclient.backend, "extra_sys_prompt", "")
+            script_dir = os.path.dirname(os.path.abspath(agentmain_mod.__file__))
+            handler = agentmain_mod.GenericAgentHandler(self, self.history, os.path.join(script_dir, "temp"))
+            if self.handler and "key_info" in self.handler.working:
+                ki = re.sub(r"\n\[SYSTEM\] 此为.*?工作记忆[。\n]*", "", self.handler.working["key_info"])
+                handler.working["key_info"] = ki
+                handler.working["passed_sessions"] = ps = self.handler.working.get("passed_sessions", 0) + 1
+                if ps > 0:
+                    handler.working["key_info"] += f"\n[SYSTEM] 此为 {ps} 个对话前设置的key_info，若已在新任务，先更新或清除工作记忆。\n"
+            self.handler = handler
+            user_input = raw_query
+            rich_content = initial_user_content
+            if source == "feishu" and len(self.history) > 1:
+                user_input = handler._get_anchor_prompt() + f"\n\n### 用户当前消息\n{raw_query}"
+                rich_content = None
+            history_start_len = len(_copy_backend_history(getattr(self, "llmclient", None)))
+            gen = agentmain_mod.agent_runner_loop(
+                self.llmclient,
+                sys_prompt,
+                user_input,
+                handler,
+                agentmain_mod.TOOLS_SCHEMA,
+                max_turns=70,
+                verbose=self.verbose,
+                initial_user_content=rich_content,
+            )
+            try:
+                full_resp = ""
+                last_pos = 0
+                for chunk in gen:
+                    if agentmain_mod.consume_file(self.task_dir, "_stop"):
+                        self.abort()
+                    if self.stop_sig:
+                        break
+                    full_resp += chunk
+                    if len(full_resp) - last_pos > 50 or "LLM Running" in chunk:
+                        display_queue.put({"next": full_resp[last_pos:] if self.inc_out else full_resp, "source": source})
+                        last_pos = len(full_resp)
+                if self.inc_out and last_pos < len(full_resp):
+                    display_queue.put({"next": full_resp[last_pos:], "source": source})
+                if "</summary>" in full_resp:
+                    full_resp = full_resp.replace("</summary>", "</summary>\n\n")
+                if "</file_content>" in full_resp:
+                    full_resp = re.sub(r"<file_content>\s*(.*?)\s*</file_content>", r"\n````\n<file_content>\n\1\n</file_content>\n````", full_resp, flags=re.DOTALL)
+                _scrub_last_user_history(
+                    getattr(self, "llmclient", None),
+                    scrub_user_content,
+                    start_len=history_start_len,
+                )
+                display_queue.put({"done": full_resp, "source": source})
+                self.history = handler.history_info
+            except Exception as e:
+                _scrub_last_user_history(
+                    getattr(self, "llmclient", None),
+                    scrub_user_content,
+                    start_len=history_start_len,
+                )
+                print(f"Backend Error: {agentmain_mod.format_error(e)}")
+                display_queue.put({"done": full_resp + f"\n```\n{agentmain_mod.format_error(e)}\n```", "source": source})
+            finally:
+                if self.stop_sig:
+                    print("User aborted the task.")
+                _scrub_last_user_history(
+                    getattr(self, "llmclient", None),
+                    scrub_user_content,
+                    start_len=history_start_len,
+                )
+                self.is_running = self.stop_sig = False
+                self.task_queue.task_done()
+
+    agent.put_task = types.MethodType(put_task_patched, agent)
+    agent.run = types.MethodType(run_patched, agent)
+    agent._ga_launcher_multimodal_patched = True
+    return agent
+
 def main():
     if len(sys.argv) < 2:
         send({"event": "error", "msg": "缺少 agent_dir 参数"}); return
@@ -778,6 +1053,7 @@ def main():
                         "或回到启动器的「设置 → API」添加 API 卡片。")
             })
             return
+        _patch_agent_launcher_multimodal(agent, agentmain)
         ok, setup_msg = _sanitize_agent_llmclients(agent)
         if not ok:
             send({"event": "error", "msg": setup_msg})
@@ -844,14 +1120,25 @@ def main():
         try:
             if c == "send":
                 backend = _reset_backend_usage(getattr(agent, "llmclient", None))
-                raw_images = cmd.get("images") or []
-                images = []
-                if isinstance(raw_images, list):
-                    for item in raw_images:
-                        path = str(item or "").strip()
-                        if path and os.path.isfile(path):
-                            images.append(path)
-                dq = agent.put_task(cmd.get("text", ""), source="user", images=images)
+                images = _collect_existing_image_paths(cmd.get("images") or [])
+                prompt_text = str(cmd.get("text", "") or "")
+                scrub_user_content = _build_scrubbed_user_content(prompt_text, images)
+                history_text = _build_turn_history_text(prompt_text, images)
+                rich_content = None
+                task_text = prompt_text
+                if images and _supports_native_multimodal(getattr(agent, "llmclient", None)):
+                    rich_content = _build_multimodal_user_content(prompt_text, images)
+                    task_text = history_text
+                elif images:
+                    task_text = _build_prompt_with_images(prompt_text, images)
+                dq = agent.put_task(
+                    task_text,
+                    source="user",
+                    images=images,
+                    initial_user_content=rich_content,
+                    history_text=history_text,
+                    scrub_user_content=scrub_user_content,
+                )
                 threading.Thread(target=relay, args=(dq, backend, cmd.get("session_id")), daemon=True).start()
             elif c == "abort":
                 agent.abort()

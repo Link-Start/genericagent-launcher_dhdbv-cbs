@@ -49,7 +49,7 @@ class BuildMacOSReleaseTests(unittest.TestCase):
             with mock.patch.dict(self.mod.os.environ, {"GA_MACOS_RUNNER_LABEL": "macos-15-intel"}, clear=False):
                 payload = self.mod._install_metadata(
                     "1.2.3",
-                    dmg_name="GenericAgentLauncher-macos-1.2.3.dmg",
+                    dmg_name="GenericAgentLauncher-macos-x86_64-1.2.3.dmg",
                     version_meta={"version": "1.2.3", "channel": "stable", "commit": "abc123", "build_time": "2026-04-27T12:34:56+00:00"},
                 )
         self.assertEqual(payload["platform"], "macos")
@@ -69,7 +69,8 @@ class BuildMacOSReleaseTests(unittest.TestCase):
         self.assertFalse(payload["apple_developer_signed"])
         self.assertFalse(payload["notarized"])
         self.assertTrue(payload["pyinstaller_may_ad_hoc_sign"])
-        self.assertEqual(payload["artifact_names"]["sha256"], "GenericAgentLauncher-macos-1.2.3.sha256")
+        self.assertEqual(payload["artifact_names"]["dmg"], "GenericAgentLauncher-macos-x86_64-1.2.3.dmg")
+        self.assertEqual(payload["artifact_names"]["sha256"], "GenericAgentLauncher-macos-x86_64-1.2.3.sha256")
         self.assertEqual(payload["artifact_names"]["readme"], "README-macOS.txt")
         self.assertEqual(payload["artifact_names"]["metadata"], "install-metadata.json")
         self.assertEqual(payload["artifact_names"]["version_json"], "Contents/Resources/version.json")
@@ -109,7 +110,7 @@ class BuildMacOSReleaseTests(unittest.TestCase):
             readme_path, metadata_path = self.mod._write_release_support_files(
                 td,
                 version="9.9.9-test",
-                dmg_name="GenericAgentLauncher-macos-9.9.9-test.dmg",
+                dmg_name="GenericAgentLauncher-macos-arm64-9.9.9-test.dmg",
                 version_meta={"version": "9.9.9-test", "channel": "stable", "commit": "deadbeef", "build_time": "2026-04-27T12:00:00+00:00"},
             )
             self.assertTrue(os.path.isfile(readme_path))
@@ -122,7 +123,7 @@ class BuildMacOSReleaseTests(unittest.TestCase):
             self.assertIn("Commit: deadbeef", readme)
             self.assertEqual(metadata["version"], "9.9.9-test")
             self.assertEqual(metadata["commit"], "deadbeef")
-            self.assertEqual(metadata["artifact_names"]["dmg"], "GenericAgentLauncher-macos-9.9.9-test.dmg")
+            self.assertEqual(metadata["artifact_names"]["dmg"], "GenericAgentLauncher-macos-arm64-9.9.9-test.dmg")
 
     def test_write_bundle_info_plist_versions_updates_finder_version_fields(self):
         with tempfile.TemporaryDirectory() as td:

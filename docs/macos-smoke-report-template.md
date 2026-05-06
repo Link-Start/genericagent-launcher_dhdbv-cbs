@@ -12,8 +12,8 @@
 
 ## 安装验证
 
-- [ ] 下载到 `GenericAgentLauncher-macos-<version>.dmg`
-- [ ] `.sha256 / README-macOS.txt / install-metadata.json` 齐全
+- [ ] 下载到 `GenericAgentLauncher-macos-<arch>-<version>.dmg`
+- [ ] `.sha256 / README-macOS-<arch>.txt / install-metadata-<arch>.json` 齐全
 - [ ] Finder 中打开 dmg
 - [ ] dmg 内看到 `GenericAgent Launcher.app`
 - [ ] dmg 内看到 `Applications` 别名

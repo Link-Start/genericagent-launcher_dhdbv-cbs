@@ -242,7 +242,17 @@ class NavigationMixin:
                 pass
             self._settings_top_back_btn.clicked.connect(self._show_chat_page if valid else self._show_welcome)
         self._refresh_welcome_state()
-        self._settings_reload(categories=[getattr(self, "_current_settings_category", "api")], force=True)
+
+        def _reload_after_switch():
+            self._settings_reload(categories=[getattr(self, "_current_settings_category", "api")], force=True)
+
+        try:
+            QTimer.singleShot(0, self, _reload_after_switch)
+        except Exception:
+            try:
+                QTimer.singleShot(0, _reload_after_switch)
+            except Exception:
+                _reload_after_switch()
 
     def _show_chat_page(self):
         self.setWindowTitle("GenericAgent 启动器")

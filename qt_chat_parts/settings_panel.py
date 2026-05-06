@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from launcher_core_parts.upstream_dependencies import LAUNCHER_BOOTSTRAP_DEPENDENCIES
 from launcher_app import core as lz
 from launcher_app.theme import C, F, preferred_theme_font_families
 
@@ -49,6 +50,8 @@ from .common import (
     normalize_remote_agent_dir,
     normalize_ssh_error_text,
     remote_agent_dir_default,
+    remote_device_agent_dir,
+    strip_auto_docker_name_suffix,
 )
 
 _SCROLLBAR_STYLE = """
@@ -69,9 +72,6 @@ _VPS_DUPLICATED_PROMPT_RE = re.compile(
     r"(?P<userhost>[A-Za-z0-9_.-]+@[^:\s]+): (?P<titlecwd>[^\n#$]*?)(?P=userhost):(?P<promptcwd>[^\n#$]*?)(?P<suffix>[#$])"
 )
 _VPS_PROMPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+@[^:\s]+:[^\n]*?[#$] ?")
-_DOCKER_REGISTRY_RE = re.compile(r"^(?:localhost|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::[0-9]+)?$")
-_DOCKER_REPOSITORY_SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$")
-_DOCKER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 _SSH_DISCONNECT_HINTS = (
     "10054",
     "远程主机强迫关闭了一个现有的连接",
@@ -388,6 +388,34 @@ class SettingsPanelMixin:
         last = float(stamps.get(category, 0.0) or 0.0)
         min_interval = float(getattr(self, "_SETTINGS_LIVE_RELOAD_MIN_INTERVAL_SECONDS", 1.2) or 1.2)
         return (float(time.time()) - last) >= max(0.0, min_interval)
+
+    def _strip_auto_docker_name_suffix(self, value: str) -> str:
+        return strip_auto_docker_name_suffix(value)
+
+    def _vps_profile_uses_docker_takeover(self, raw, *, takeover_cfg=None) -> bool:
+        item = raw if isinstance(raw, dict) else {}
+        legacy_remote_mode = str(item.get("remote_mode") or "").strip().lower() == "docker_container"
+        legacy_agent_mode = str(item.get("agent_mode") or "").strip().lower() == "docker"
+        return bool(
+            str(
+                item.get("docker_takeover_container")
+                or item.get("takeover_docker_container")
+                or item.get("takeover_container")
+                or ""
+            ).strip()
+            or str(item.get("docker_takeover_agent_dir") or item.get("takeover_docker_agent_dir") or "").strip()
+            or legacy_remote_mode
+            or legacy_agent_mode
+        )
+
+    def _vps_profile_name_needs_cleanup(self, raw, *, takeover_cfg=None) -> bool:
+        item = raw if isinstance(raw, dict) else {}
+        if not self._vps_profile_uses_docker_takeover(item, takeover_cfg=takeover_cfg):
+            return False
+        raw_name = str(item.get("name") or "").strip()
+        if not raw_name:
+            return False
+        return self._strip_auto_docker_name_suffix(raw_name) != raw_name
 
     def _settings_should_reload_on_switch(self, key: str) -> bool:
         category = str(key or "").strip().lower()
@@ -708,7 +736,7 @@ class SettingsPanelMixin:
         self.settings_channels_save_btn = channel_save_btn
         channel_refresh_btn = QPushButton("刷新状态")
         channel_refresh_btn.setStyleSheet(self._action_button_style())
-        channel_refresh_btn.clicked.connect(self._reload_channels_editor_state)
+        channel_refresh_btn.clicked.connect(self._request_channel_status_refresh)
         channel_toolbar.addWidget(channel_refresh_btn, 0)
         self.settings_channels_refresh_btn = channel_refresh_btn
         channel_stop_btn = QPushButton("停止全部")
@@ -987,10 +1015,10 @@ class SettingsPanelMixin:
         deploy_box = QVBoxLayout(deploy_card)
         deploy_box.setContentsMargins(20, 18, 20, 18)
         deploy_box.setSpacing(10)
-        deploy_title = QLabel("一键 Docker 部署")
+        deploy_title = QLabel("一键直接部署")
         deploy_title.setObjectName("cardTitle")
         deploy_box.addWidget(deploy_title)
-        deploy_desc = QLabel("可选择上传本地 agant 项目，或在服务器拉取原始 agant 仓库，然后自动执行 Docker 部署。")
+        deploy_desc = QLabel("可选择上传本地 agant 项目，或在服务器拉取原始 agant 仓库，然后直接在远端目录准备可通过 SSH 使用的运行环境。")
         deploy_desc.setWordWrap(True)
         deploy_desc.setObjectName("cardDesc")
         deploy_box.addWidget(deploy_desc)
@@ -1050,30 +1078,6 @@ class SettingsPanelMixin:
         deploy_box.addLayout(remote_row)
         self._refresh_vps_remote_dir_placeholder()
 
-        image_row = QHBoxLayout()
-        image_row.setSpacing(8)
-        image_label = QLabel("镜像名称")
-        image_label.setMinimumWidth(92)
-        image_label.setObjectName("bodyText")
-        image_row.addWidget(image_label, 0)
-        self.settings_vps_docker_image_edit = QLineEdit()
-        self.settings_vps_docker_image_edit.setPlaceholderText("请填写你自己的镜像名；不要留空，也不会再自动改名")
-        self._fluent_input(self.settings_vps_docker_image_edit)
-        image_row.addWidget(self.settings_vps_docker_image_edit, 1)
-        deploy_box.addLayout(image_row)
-
-        container_row = QHBoxLayout()
-        container_row.setSpacing(8)
-        container_label = QLabel("容器名称")
-        container_label.setMinimumWidth(92)
-        container_label.setObjectName("bodyText")
-        container_row.addWidget(container_label, 0)
-        self.settings_vps_docker_container_edit = QLineEdit()
-        self.settings_vps_docker_container_edit.setPlaceholderText("请填写你自己的容器名；同名时会做同步重建")
-        self._fluent_input(self.settings_vps_docker_container_edit)
-        container_row.addWidget(self.settings_vps_docker_container_edit, 1)
-        deploy_box.addLayout(container_row)
-
         install_mode_row = QHBoxLayout()
         install_mode_row.setSpacing(8)
         install_mode_label = QLabel("依赖策略")
@@ -1120,13 +1124,52 @@ class SettingsPanelMixin:
 
         deploy_toolbar = QHBoxLayout()
         deploy_toolbar.setSpacing(8)
-        self.settings_vps_deploy_btn = QPushButton("一键部署 Docker")
+        self.settings_vps_deploy_btn = QPushButton("直接部署")
         self.settings_vps_deploy_btn.setStyleSheet(self._action_button_style(primary=True))
-        self.settings_vps_deploy_btn.clicked.connect(self._deploy_vps_agent_docker)
+        self.settings_vps_deploy_btn.clicked.connect(self._deploy_vps_agent_direct)
         deploy_toolbar.addWidget(self.settings_vps_deploy_btn, 0)
         deploy_toolbar.addStretch(1)
         deploy_box.addLayout(deploy_toolbar)
         vps_layout.addWidget(deploy_card)
+
+        takeover_card = self._panel_card()
+        takeover_box = QVBoxLayout(takeover_card)
+        takeover_box.setContentsMargins(20, 18, 20, 18)
+        takeover_box.setSpacing(10)
+        takeover_title = QLabel("接管 agant")
+        takeover_title.setObjectName("cardTitle")
+        takeover_box.addWidget(takeover_title)
+        takeover_desc = QLabel("复用当前 VPS 的 SSH 配置，校验远端 agant 路径，并把它注册为启动器可用的远程设备。")
+        takeover_desc.setWordWrap(True)
+        takeover_desc.setObjectName("cardDesc")
+        takeover_box.addWidget(takeover_desc)
+
+        takeover_dir_row = QHBoxLayout()
+        takeover_dir_row.setSpacing(8)
+        takeover_dir_label = QLabel("agant 路径")
+        takeover_dir_label.setMinimumWidth(92)
+        takeover_dir_label.setObjectName("bodyText")
+        takeover_dir_row.addWidget(takeover_dir_label, 0)
+        self.settings_vps_takeover_agent_dir_edit = QLineEdit()
+        self.settings_vps_takeover_agent_dir_edit.setPlaceholderText("例如 /root/agant 或 /srv/agant")
+        self._fluent_input(self.settings_vps_takeover_agent_dir_edit)
+        takeover_dir_row.addWidget(self.settings_vps_takeover_agent_dir_edit, 1)
+        takeover_box.addLayout(takeover_dir_row)
+
+        self.settings_vps_takeover_notice = QLabel("")
+        self.settings_vps_takeover_notice.setWordWrap(True)
+        self.settings_vps_takeover_notice.setObjectName("mutedText")
+        takeover_box.addWidget(self.settings_vps_takeover_notice)
+
+        takeover_toolbar = QHBoxLayout()
+        takeover_toolbar.setSpacing(8)
+        self.settings_vps_takeover_btn = QPushButton("接管并注册 agant")
+        self.settings_vps_takeover_btn.setStyleSheet(self._action_button_style(primary=True))
+        self.settings_vps_takeover_btn.clicked.connect(self._takeover_vps_agent)
+        takeover_toolbar.addWidget(self.settings_vps_takeover_btn, 0)
+        takeover_toolbar.addStretch(1)
+        takeover_box.addLayout(takeover_toolbar)
+        vps_layout.addWidget(takeover_card)
 
         vps_layout.addStretch(1)
 
@@ -1699,13 +1742,25 @@ class SettingsPanelMixin:
             "label": label,
         }
 
+    def _settings_target_remote_agent_dir(self, device) -> str:
+        dev = device if isinstance(device, dict) else {}
+        return remote_device_agent_dir(dev, username=dev.get("username"))
+
+    def _settings_target_remote_stage_dir(self, device) -> str:
+        dev = device if isinstance(device, dict) else {}
+        raw = str(dev.get("id") or dev.get("host") or "remote-device").strip() or "remote-device"
+        safe = "".join(ch for ch in raw if (ch.isalnum() or ch in ("_", "-")))
+        if not safe:
+            safe = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"/tmp/genericagent_launcher_remote/{safe}/settings_target"
+
     def _settings_target_display_path(self, file_name: str):
         ctx = self._settings_target_context()
         if not bool(ctx.get("is_remote")):
             return os.path.join(self.agent_dir, str(file_name or "").strip())
         dev = ctx.get("device") or {}
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
-        return remote_dir.rstrip("/") + "/" + str(file_name or "").strip()
+        remote_dir = self._settings_target_remote_agent_dir(dev).rstrip("/")
+        return remote_dir + "/" + str(file_name or "").strip()
 
     def _settings_target_supports_remote(self):
         return bool(self._settings_remote_devices_for_config())
@@ -1879,8 +1934,8 @@ class SettingsPanelMixin:
         )
         if current["scope"] == "remote":
             dev = self._settings_remote_device_by_id(current["device_id"]) or {}
-            remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
-            notice.setText(f"当前目标：远程设备。API/渠道配置会写入 `{remote_dir}/mykey.py`。")
+            path_text = self._settings_target_display_path("mykey.py")
+            notice.setText(f"当前目标：远程设备（SSH 宿主机）。API/渠道配置会写入 `{path_text}`。")
         else:
             notice.setText("当前目标：本机目录。API/渠道配置会写入当前目录下的 `mykey.py`。")
 
@@ -2117,9 +2172,9 @@ class SettingsPanelMixin:
 
     def _settings_target_ensure_remote_mykey(self, client, device):
         dev = device if isinstance(device, dict) else {}
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+        remote_dir = self._settings_target_remote_agent_dir(dev)
         q_dir = shlex.quote(remote_dir)
-        cmd = (
+        inner = (
             "set -e; "
             f"mkdir -p {q_dir}; "
             f"cd {q_dir}; "
@@ -2128,9 +2183,11 @@ class SettingsPanelMixin:
             "else printf '%s\\n' '# mykey.py' > mykey.py; fi; "
             "fi"
         )
+        cmd = inner
         rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
         if rc != 0:
-            return False, str(err or "远程初始化 mykey.py 失败。").strip() or "远程初始化 mykey.py 失败。"
+            base_err = "远程初始化 mykey.py 失败。"
+            return False, str(err or base_err).strip() or base_err
         return True, ""
 
     def _settings_target_read_mykey_text(self):
@@ -2162,7 +2219,7 @@ class SettingsPanelMixin:
             ok, detail = self._settings_target_ensure_remote_mykey(client, dev)
             if not ok:
                 return False, "", self._settings_target_display_path("mykey.py"), detail
-            remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+            remote_dir = self._settings_target_remote_agent_dir(dev)
             remote_fp = remote_dir.rstrip("/") + "/mykey.py"
             sftp = client.open_sftp()
             try:
@@ -2174,7 +2231,7 @@ class SettingsPanelMixin:
                 except Exception:
                     pass
             text = raw.decode("utf-8", errors="replace") if raw else "# mykey.py\n"
-            return True, text, remote_fp, ""
+            return True, text, self._settings_target_display_path("mykey.py"), ""
         except Exception as e:
             return False, "", self._settings_target_display_path("mykey.py"), str(e)
         finally:
@@ -2199,24 +2256,25 @@ class SettingsPanelMixin:
             ok, detail = self._settings_target_ensure_remote_mykey(client, dev)
             if not ok:
                 return False, self._settings_target_display_path("mykey.py"), detail
-            remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+            remote_dir = self._settings_target_remote_agent_dir(dev)
             remote_fp = remote_dir.rstrip("/") + "/mykey.py"
             tmp_name = f"mykey.py.tmp.{int(time.time() * 1000)}"
-            remote_tmp = remote_dir.rstrip("/") + "/" + tmp_name
+            write_fp = remote_dir.rstrip("/") + "/" + tmp_name
             sftp = client.open_sftp()
             try:
-                with sftp.open(remote_tmp, "wb") as fp:
+                with sftp.open(write_fp, "wb") as fp:
                     fp.write(body.encode("utf-8"))
             finally:
                 try:
                     sftp.close()
                 except Exception:
                     pass
-            mv_cmd = f"mv -f {shlex.quote(remote_tmp)} {shlex.quote(remote_fp)}"
+            mv_cmd = f"mv -f {shlex.quote(write_fp)} {shlex.quote(remote_fp)}"
             rc, _out, mv_err = self._vps_exec_remote(client, mv_cmd, timeout=20)
             if rc != 0:
-                return False, remote_fp, str(mv_err or "写入远端 mykey.py 失败。").strip() or "写入远端 mykey.py 失败。"
-            return True, remote_fp, ""
+                base_err = "写入远端 mykey.py 失败。"
+                return False, self._settings_target_display_path("mykey.py"), str(mv_err or base_err).strip() or base_err
+            return True, self._settings_target_display_path("mykey.py"), ""
         except Exception as e:
             return False, self._settings_target_display_path("mykey.py"), str(e)
         finally:
@@ -2356,6 +2414,7 @@ class SettingsPanelMixin:
         item = raw if isinstance(raw, dict) else {}
         conn = self._normalize_vps_connection_cfg(item)
         deploy = self._normalize_vps_deploy_cfg(item, username=conn.get("username"))
+        takeover = self._normalize_vps_takeover_cfg(item)
         profile_id = str(item.get("id") or "").strip()
         if not profile_id:
             host = str(conn.get("host") or "").strip()
@@ -2363,7 +2422,8 @@ class SettingsPanelMixin:
             port = int(conn.get("port") or 22)
             seed = f"{username}@{host}:{port}" if host and username else f"profile-{time.time_ns()}"
             profile_id = self._make_vps_profile_id(seed)
-        name = str(item.get("name") or "").strip()
+        raw_name = str(item.get("name") or "").strip()
+        name = self._strip_auto_docker_name_suffix(raw_name) if self._vps_profile_uses_docker_takeover(item, takeover_cfg=takeover) else raw_name
         if not name:
             name = str(conn.get("host") or "未命名服务器").strip() or "未命名服务器"
         python_cmd = str(item.get("python_cmd") or "python3").strip() or "python3"
@@ -2375,6 +2435,10 @@ class SettingsPanelMixin:
             last_deploy_at = float(item.get("last_deploy_at") or 0)
         except Exception:
             last_deploy_at = 0.0
+        try:
+            last_takeover_at = float(item.get("last_takeover_at") or 0)
+        except Exception:
+            last_takeover_at = 0.0
         return {
             "id": profile_id,
             "name": name,
@@ -2387,9 +2451,14 @@ class SettingsPanelMixin:
             "last_deploy_message": str(item.get("last_deploy_message") or "").strip(),
             "last_deploy_detail": str(item.get("last_deploy_detail") or "").strip(),
             "last_deploy_at": last_deploy_at if last_deploy_at > 0 else 0.0,
+            "last_takeover_status": str(item.get("last_takeover_status") or "").strip().lower(),
+            "last_takeover_message": str(item.get("last_takeover_message") or "").strip(),
+            "last_takeover_detail": str(item.get("last_takeover_detail") or "").strip(),
+            "last_takeover_at": last_takeover_at if last_takeover_at > 0 else 0.0,
             "auto_ssh": self._settings_normalize_remote_auto_ssh_value(item.get("auto_ssh", True), default=True),
             **conn,
             **deploy,
+            **takeover,
         }
 
     def _vps_profile_to_remote_device(self, raw):
@@ -2398,22 +2467,42 @@ class SettingsPanelMixin:
         username = str(profile.get("username") or "").strip()
         if not host or not username:
             return None
+        remote_mode = str(profile.get("remote_mode") or "ssh").strip().lower()
+        agent_dir = normalize_remote_agent_dir(profile.get("remote_dir"), username=username)
+        python_cmd = str(profile.get("python_cmd") or "python3").strip() or "python3"
+        device_name = str(profile.get("name") or "").strip() or host
+        takeover_mode = str(profile.get("takeover_mode") or "").strip().lower()
+        takeover_agent_dir = str(profile.get("takeover_agent_dir") or "").strip()
+        takeover_python_cmd = str(profile.get("takeover_python_cmd") or "").strip() or "python3"
+        if remote_mode == "docker_container":
+            remote_mode = "ssh"
+        if takeover_mode == "path" and takeover_agent_dir:
+            agent_dir = takeover_agent_dir
+            python_cmd = takeover_python_cmd
         return {
             "id": str(profile.get("id") or "").strip(),
-            "name": str(profile.get("name") or "").strip() or host,
+            "name": device_name,
             "host": host,
             "username": username,
             "port": int(profile.get("port") or 22),
             "ssh_key_path": str(profile.get("ssh_key_path") or "").strip(),
             "password": str(profile.get("password") or "").strip(),
-            "agent_dir": normalize_remote_agent_dir(profile.get("remote_dir"), username=username),
-            "python_cmd": str(profile.get("python_cmd") or "python3").strip() or "python3",
+            "agent_dir": agent_dir,
+            "agent_mode": "host",
+            "python_cmd": python_cmd,
             "auto_ssh": self._settings_normalize_remote_auto_ssh_value(profile.get("auto_ssh", True), default=True),
+            "remote_mode": "ssh",
+            "takeover_mode": "path" if remote_mode == "ssh" and takeover_mode == "path" and takeover_agent_dir else "",
+            "takeover_agent_dir": takeover_agent_dir if remote_mode == "ssh" and takeover_mode == "path" else "",
+            "takeover_python_cmd": takeover_python_cmd if remote_mode == "ssh" and takeover_mode == "path" else "",
+            "docker_container": "",
+            "docker_agent_dir": "",
         }
 
     def _legacy_vps_profile_from_config(self):
         conn = self._normalize_vps_connection_cfg(self.cfg.get("vps_connection"))
         deploy = self._normalize_vps_deploy_cfg(self.cfg.get("vps_deploy"), username=conn.get("username"))
+        takeover = self._normalize_vps_takeover_cfg(self.cfg.get("vps_takeover"))
         meaningful = any(
             [
                 str(conn.get("host") or "").strip(),
@@ -2423,6 +2512,7 @@ class SettingsPanelMixin:
                 str(deploy.get("local_agent_dir") or "").strip(),
                 str(deploy.get("repo_url") or "").strip(),
                 str(deploy.get("remote_dir") or "").strip(),
+                str(takeover.get("takeover_agent_dir") or "").strip(),
             ]
         )
         if not meaningful:
@@ -2438,12 +2528,14 @@ class SettingsPanelMixin:
                 "name": "默认服务器",
                 **conn,
                 **deploy,
+                **takeover,
             }
         )
 
     def _vps_profiles(self):
         merged = {}
         order = []
+        writeback_required = False
 
         def upsert(raw):
             if not isinstance(raw, dict):
@@ -2461,9 +2553,28 @@ class SettingsPanelMixin:
             for key, value in profile.items():
                 if key == "id":
                     continue
-                if key in ("name", "host", "username", "ssh_key_path", "password", "remote_dir", "python_cmd"):
+                if key in (
+                    "name",
+                    "host",
+                    "username",
+                    "ssh_key_path",
+                    "password",
+                    "remote_dir",
+                    "python_cmd",
+                ):
                     if str(value or "").strip():
                         updated[key] = value
+                    continue
+                if key in (
+                    "takeover_mode",
+                    "takeover_agent_dir",
+                    "takeover_python_cmd",
+                    "docker_takeover_container",
+                    "docker_takeover_agent_dir",
+                    "docker_takeover_python_cmd",
+                    "remote_mode",
+                ):
+                    updated[key] = value
                     continue
                 if key == "port":
                     try:
@@ -2478,12 +2589,22 @@ class SettingsPanelMixin:
         raw_profiles = self.cfg.get("vps_profiles")
         if isinstance(raw_profiles, list):
             for raw in raw_profiles:
+                takeover_cfg = self._normalize_vps_takeover_cfg(raw)
+                if self._vps_profile_name_needs_cleanup(raw, takeover_cfg=takeover_cfg):
+                    writeback_required = True
                 upsert(raw)
         raw_devices = self.cfg.get("remote_devices")
         if isinstance(raw_devices, list):
             for raw in raw_devices:
                 if not isinstance(raw, dict):
                     continue
+                remote_dir = remote_device_agent_dir(raw, username=raw.get("username"))
+                raw_takeover_dir = str(raw.get("takeover_agent_dir") or "").strip()
+                takeover_agent_dir = (
+                    normalize_remote_agent_dir(raw_takeover_dir, username=raw.get("username"))
+                    if raw_takeover_dir
+                    else str(remote_dir or "").strip()
+                )
                 item = {
                     "id": str(raw.get("id") or "").strip()
                     or self._make_vps_profile_id(f"{raw.get('username') or ''}@{raw.get('host') or ''}:{int(raw.get('port') or 22)}"),
@@ -2493,15 +2614,36 @@ class SettingsPanelMixin:
                     "port": int(raw.get("port") or 22),
                     "ssh_key_path": str(raw.get("ssh_key_path") or "").strip(),
                     "password": str(raw.get("password") or "").strip(),
-                    "remote_dir": normalize_remote_agent_dir(raw.get("agent_dir"), username=raw.get("username")),
+                    "remote_dir": remote_dir,
                     "python_cmd": str(raw.get("python_cmd") or "python3").strip() or "python3",
                     "auto_ssh": self._settings_normalize_remote_auto_ssh_value(raw.get("auto_ssh", True), default=True),
+                    "remote_mode": "ssh",
+                    "takeover_mode": "path" if takeover_agent_dir else "",
+                    "takeover_agent_dir": takeover_agent_dir if takeover_agent_dir else "",
+                    "takeover_python_cmd": str(raw.get("takeover_python_cmd") or raw.get("python_cmd") or "python3").strip() or "python3",
+                    "docker_takeover_container": "",
+                    "docker_takeover_agent_dir": "",
+                    "docker_takeover_python_cmd": "python3",
                 }
+                if str(raw.get("remote_mode") or "").strip().lower() != "ssh":
+                    writeback_required = True
+                if str(raw.get("docker_container") or "").strip() or str(raw.get("docker_agent_dir") or "").strip():
+                    writeback_required = True
+                if self._vps_profile_name_needs_cleanup(raw):
+                    writeback_required = True
                 upsert(item)
         legacy = self._legacy_vps_profile_from_config()
         if legacy and not merged:
             upsert(legacy)
-        return [dict(merged[pid]) for pid in order if pid in merged]
+        rows = [dict(merged[pid]) for pid in order if pid in merged]
+        if rows and writeback_required and not bool(getattr(self, "_vps_profiles_cleanup_in_progress", False)):
+            try:
+                self._vps_profiles_cleanup_in_progress = True
+                saved = self._save_vps_profiles(rows, selected_id=str(self.cfg.get("vps_current_profile_id") or "").strip())
+            finally:
+                self._vps_profiles_cleanup_in_progress = False
+            return [dict(item) for item in (saved or rows)]
+        return rows
 
     def _current_vps_profile_id(self):
         current = str(self.cfg.get("vps_current_profile_id") or "").strip()
@@ -2546,6 +2688,11 @@ class SettingsPanelMixin:
             badges.append("部署通过")
         elif deploy_status == "fail":
             badges.append("部署失败")
+        takeover_status = str(item.get("last_takeover_status") or "").strip().lower()
+        if takeover_status == "success":
+            badges.append("已接管")
+        elif takeover_status == "fail":
+            badges.append("接管失败")
         return badges
 
     def _vps_profile_combo_label(self, raw):
@@ -2563,12 +2710,19 @@ class SettingsPanelMixin:
             return "idle", "这台服务器的连接信息还没填完整。"
         deploy_status = str(item.get("last_deploy_status") or "").strip().lower()
         test_status = str(item.get("last_test_status") or "").strip().lower()
+        takeover_status = str(item.get("last_takeover_status") or "").strip().lower()
+        if takeover_status == "fail":
+            detail = str(item.get("last_takeover_message") or "最近一次接管失败。").strip()
+            return "error", detail
         if deploy_status == "fail":
             detail = str(item.get("last_deploy_message") or "最近一次部署失败。").strip()
             return "error", detail
         if test_status == "fail":
             detail = str(item.get("last_test_message") or "最近一次连接测试失败。").strip()
             return "error", detail
+        if takeover_status == "success":
+            detail = str(item.get("last_takeover_message") or "最近一次接管成功。").strip()
+            return "ok", detail
         if deploy_status == "success":
             detail = str(item.get("last_deploy_message") or "最近一次部署成功。").strip()
             return "ok", detail
@@ -2594,13 +2748,26 @@ class SettingsPanelMixin:
             stamp = time.strftime("%m-%d %H:%M", time.localtime(deploy_at)) if deploy_at > 0 else ""
             prefix = "最近部署成功" if deploy_status == "success" else "最近部署失败"
             rows.append(f"{prefix}：{deploy_msg}" + (f"（{stamp}）" if stamp else ""))
+        takeover_status = str(item.get("last_takeover_status") or "").strip().lower()
+        takeover_msg = str(item.get("last_takeover_message") or "").strip()
+        takeover_at = float(item.get("last_takeover_at") or 0)
+        if takeover_status and takeover_msg:
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(takeover_at)) if takeover_at > 0 else ""
+            prefix = "最近接管成功" if takeover_status == "success" else "最近接管失败"
+            rows.append(f"{prefix}：{takeover_msg}" + (f"（{stamp}）" if stamp else ""))
         return "\n".join(rows)
 
     def _update_vps_profile_runtime_summary(self, *, kind: str, ok: bool, message: str, detail: str = "", profile_id: str = ""):
         pid = str(profile_id or self._current_vps_profile_id() or "").strip()
         if not pid:
             return
-        kind_key = "deploy" if str(kind or "").strip().lower() == "deploy" else "test"
+        kind_text = str(kind or "").strip().lower()
+        if kind_text == "deploy":
+            kind_key = "deploy"
+        elif kind_text == "takeover":
+            kind_key = "takeover"
+        else:
+            kind_key = "test"
         rows = self._vps_profiles()
         changed = False
         for item in rows:
@@ -2650,9 +2817,11 @@ class SettingsPanelMixin:
         if current is not None:
             self.cfg["vps_connection"] = self._normalize_vps_connection_cfg(current)
             self.cfg["vps_deploy"] = self._normalize_vps_deploy_cfg(current)
+            self.cfg["vps_takeover"] = self._normalize_vps_takeover_cfg(current)
         else:
             self.cfg["vps_connection"] = self._normalize_vps_connection_cfg({})
             self.cfg["vps_deploy"] = self._normalize_vps_deploy_cfg({})
+            self.cfg["vps_takeover"] = self._normalize_vps_takeover_cfg({})
         lz.save_config(self.cfg)
         return payload
 
@@ -2670,10 +2839,15 @@ class SettingsPanelMixin:
             "last_deploy_message": str(current.get("last_deploy_message") or "").strip(),
             "last_deploy_detail": str(current.get("last_deploy_detail") or "").strip(),
             "last_deploy_at": float(current.get("last_deploy_at") or 0) if str(current.get("last_deploy_at") or "").strip() else 0.0,
+            "last_takeover_status": str(current.get("last_takeover_status") or "").strip().lower(),
+            "last_takeover_message": str(current.get("last_takeover_message") or "").strip(),
+            "last_takeover_detail": str(current.get("last_takeover_detail") or "").strip(),
+            "last_takeover_at": float(current.get("last_takeover_at") or 0) if str(current.get("last_takeover_at") or "").strip() else 0.0,
             "auto_ssh": self._settings_normalize_remote_auto_ssh_value(current.get("auto_ssh", True), default=True),
         }
         payload.update(self._collect_vps_form_data())
         payload.update(self._collect_vps_deploy_form_data())
+        payload.update(self._collect_vps_takeover_form_data(preserve_legacy=True, current_profile=current))
         host = str(payload.get("host") or "").strip()
         if name:
             payload["name"] = str(name or "").strip()
@@ -2772,8 +2946,6 @@ class SettingsPanelMixin:
         repo_url = str(item.get("repo_url") or str(getattr(lz, "REPO_URL", "") or "")).strip()
         remote_user = str(username or item.get("username") or item.get("user") or "").strip()
         remote_dir = normalize_remote_agent_dir(item.get("remote_dir") or item.get("agent_dir"), username=remote_user)
-        docker_image = str(item.get("docker_image") or "").strip()
-        docker_container = str(item.get("docker_container") or "").strip()
         pip_mirror_url = str(item.get("pip_mirror_url") or "").strip()
         upload_excludes = str(
             item.get("upload_excludes")
@@ -2785,10 +2957,24 @@ class SettingsPanelMixin:
             "local_agent_dir": local_dir,
             "repo_url": repo_url,
             "remote_dir": remote_dir,
-            "docker_image": docker_image,
-            "docker_container": docker_container,
             "pip_mirror_url": pip_mirror_url,
             "upload_excludes": upload_excludes,
+        }
+
+    def _normalize_vps_takeover_cfg(self, raw):
+        item = raw if isinstance(raw, dict) else {}
+        agent_dir = str(item.get("takeover_agent_dir") or item.get("docker_takeover_agent_dir") or "").strip()
+        python_cmd = str(item.get("takeover_python_cmd") or item.get("docker_takeover_python_cmd") or item.get("python_cmd") or "").strip() or "python3"
+        remote_mode = "ssh"
+        takeover_mode = "path" if agent_dir else ""
+        return {
+            "remote_mode": remote_mode,
+            "takeover_mode": takeover_mode,
+            "takeover_agent_dir": agent_dir,
+            "takeover_python_cmd": python_cmd,
+            "docker_takeover_container": "",
+            "docker_takeover_agent_dir": "",
+            "docker_takeover_python_cmd": "python3",
         }
 
     def _vps_dep_install_mode_label(self, mode: str):
@@ -2804,20 +2990,39 @@ class SettingsPanelMixin:
         }
         return labels.get(key, labels["offline"])
 
+    def _combo_current_data_value(self, combo, default=""):
+        if combo is None:
+            return str(default or "").strip()
+        value = None
+        try:
+            value = combo.currentData()
+        except Exception:
+            value = None
+        if value in (None, ""):
+            try:
+                index = int(combo.currentIndex())
+            except Exception:
+                index = -1
+            if index >= 0:
+                try:
+                    value = combo.itemData(index)
+                except Exception:
+                    value = None
+        text = str(value if value not in (None, "") else default).strip()
+        return text or str(default or "").strip()
+
     def _collect_vps_deploy_form_data(self):
         source_combo = getattr(self, "settings_vps_deploy_source_combo", None)
         local_edit = getattr(self, "settings_vps_local_agent_dir_edit", None)
         repo_edit = getattr(self, "settings_vps_repo_url_edit", None)
         remote_edit = getattr(self, "settings_vps_remote_dir_edit", None)
-        image_edit = getattr(self, "settings_vps_docker_image_edit", None)
-        container_edit = getattr(self, "settings_vps_docker_container_edit", None)
         dep_mode_combo = getattr(self, "settings_vps_dep_install_mode_combo", None)
         mirror_edit = getattr(self, "settings_vps_pip_mirror_edit", None)
         excludes_edit = getattr(self, "settings_vps_upload_excludes_edit", None)
-        source = str(source_combo.currentData() if source_combo is not None else "upload").strip().lower()
+        source = self._combo_current_data_value(source_combo, "upload").lower()
         if source not in ("upload", "git"):
             source = "upload"
-        dep_mode = str(dep_mode_combo.currentData() if dep_mode_combo is not None else "offline").strip().lower()
+        dep_mode = self._combo_current_data_value(dep_mode_combo, "offline").lower()
         if dep_mode == "online":
             dep_mode = "global"
         if dep_mode not in ("offline", "global", "mirror"):
@@ -2833,12 +3038,30 @@ class SettingsPanelMixin:
                 "local_agent_dir": local_dir,
                 "repo_url": repo_edit.text().strip() if repo_edit is not None else "",
                 "remote_dir": remote_edit.text().strip() if remote_edit is not None else "",
-                "docker_image": image_edit.text().strip() if image_edit is not None else "",
-                "docker_container": container_edit.text().strip() if container_edit is not None else "",
                 "pip_mirror_url": mirror_edit.text().strip() if mirror_edit is not None else "",
                 "upload_excludes": excludes_edit.text().strip() if excludes_edit is not None else "",
             },
             username=username,
+        )
+
+    def _collect_vps_takeover_form_data(self, *, preserve_legacy: bool = False, current_profile=None):
+        agent_dir_edit = getattr(self, "settings_vps_takeover_agent_dir_edit", None)
+        current = self._normalize_vps_takeover_cfg(
+            current_profile if isinstance(current_profile, dict) else (self._current_vps_profile() or {})
+        )
+        payload = {
+            "takeover_mode": current.get("takeover_mode") or "",
+            "takeover_agent_dir": current.get("takeover_agent_dir") or "",
+            "takeover_python_cmd": current.get("takeover_python_cmd") or "python3",
+            "docker_takeover_container": "",
+            "docker_takeover_agent_dir": "",
+            "docker_takeover_python_cmd": "python3",
+        }
+        if agent_dir_edit is not None:
+            payload["takeover_mode"] = "path"
+            payload["takeover_agent_dir"] = agent_dir_edit.text().strip()
+        return self._normalize_vps_takeover_cfg(
+            payload
         )
 
     def _apply_vps_deploy_form_data(self, data):
@@ -2863,18 +3086,18 @@ class SettingsPanelMixin:
         if remote_edit is not None:
             remote_edit.setText(payload["remote_dir"])
             self._refresh_vps_remote_dir_placeholder()
-        image_edit = getattr(self, "settings_vps_docker_image_edit", None)
-        if image_edit is not None:
-            image_edit.setText(payload["docker_image"])
-        container_edit = getattr(self, "settings_vps_docker_container_edit", None)
-        if container_edit is not None:
-            container_edit.setText(payload["docker_container"])
         mirror_edit = getattr(self, "settings_vps_pip_mirror_edit", None)
         if mirror_edit is not None:
             mirror_edit.setText(payload["pip_mirror_url"])
         excludes_edit = getattr(self, "settings_vps_upload_excludes_edit", None)
         if excludes_edit is not None:
             excludes_edit.setText(payload["upload_excludes"])
+
+    def _apply_vps_takeover_form_data(self, data):
+        payload = self._normalize_vps_takeover_cfg(data)
+        agent_dir_edit = getattr(self, "settings_vps_takeover_agent_dir_edit", None)
+        if agent_dir_edit is not None:
+            agent_dir_edit.setText(payload["takeover_agent_dir"])
 
     def _apply_vps_form_data(self, data):
         item = self._normalize_vps_connection_cfg(data)
@@ -2926,6 +3149,10 @@ class SettingsPanelMixin:
         self._vps_deploy_running = bool(running)
         self._refresh_vps_action_buttons()
 
+    def _set_vps_takeover_running(self, running: bool):
+        self._vps_takeover_running = bool(running)
+        self._refresh_vps_action_buttons()
+
     def _vps_task_result_stale(self, profile_id: str = "") -> bool:
         expected = str(profile_id or "").strip()
         if expected:
@@ -2952,7 +3179,9 @@ class SettingsPanelMixin:
         if bool(getattr(self, "_vps_terminal_connecting", False)):
             return "正在连接远程终端，请等待当前任务完成。"
         if bool(getattr(self, "_vps_deploy_running", False)):
-            return "正在执行 VPS Docker 部署，请等待当前任务完成。"
+            return "正在执行 VPS 直接部署，请等待当前任务完成。"
+        if bool(getattr(self, "_vps_takeover_running", False)):
+            return "正在接管 agant，请等待当前任务完成。"
         return ""
 
     def _vps_connection_incomplete_reason(self, payload=None):
@@ -3016,8 +3245,6 @@ class SettingsPanelMixin:
     def _vps_deploy_validation_error(self, deploy_cfg=None):
         payload = self._normalize_vps_deploy_cfg(deploy_cfg or self._collect_vps_deploy_form_data())
         remote_dir = str(payload.get("remote_dir") or "").strip()
-        docker_image = str(payload.get("docker_image") or "").strip()
-        docker_container = str(payload.get("docker_container") or "").strip()
         source = str(payload.get("source") or "upload").strip().lower()
         local_rel = str(payload.get("local_agent_dir") or "").strip()
         local_abs = lz._resolve_config_path(local_rel) if local_rel else ""
@@ -3028,11 +3255,6 @@ class SettingsPanelMixin:
         pip_mirror_url = str(payload.get("pip_mirror_url") or "").strip()
         if not remote_dir:
             return "请填写远端部署目录。"
-        image_error = self._validate_vps_docker_image_name(docker_image)
-        if image_error:
-            return image_error
-        if not docker_container:
-            return "请先填写容器名称。"
         if source == "upload":
             if not local_abs or not os.path.isdir(local_abs):
                 return "上传模式下，本地 agant 目录不存在。"
@@ -3057,6 +3279,24 @@ class SettingsPanelMixin:
             return connection_reason
         return self._vps_deploy_validation_error(deploy_cfg)
 
+    def _vps_takeover_validation_error(self, takeover_cfg=None):
+        payload = self._normalize_vps_takeover_cfg(takeover_cfg or self._collect_vps_takeover_form_data())
+        agent_dir = str(payload.get("takeover_agent_dir") or "").strip()
+        if not agent_dir:
+            return "请先填写要接管的 agant 路径。"
+        return ""
+
+    def _vps_takeover_disabled_reason(self, *, payload=None, takeover_cfg=None, has_profiles=False):
+        busy_reason = self._vps_busy_reason()
+        if busy_reason:
+            return busy_reason
+        if not has_profiles:
+            return "请先新建至少一个服务器配置。"
+        connection_reason = self._vps_runtime_connection_disabled_reason(payload)
+        if connection_reason:
+            return connection_reason
+        return self._vps_takeover_validation_error(takeover_cfg)
+
     def _vps_profile_action_disabled_reason(self, action: str, *, has_profiles=False):
         kind = str(action or "").strip().lower()
         busy_reason = self._vps_busy_reason()
@@ -3079,6 +3319,7 @@ class SettingsPanelMixin:
         has_profiles = bool(profiles)
         conn_payload = self._collect_vps_form_data()
         deploy_cfg = self._collect_vps_deploy_form_data()
+        takeover_cfg = self._collect_vps_takeover_form_data()
         save_btn = getattr(self, "settings_vps_save_btn", None)
         if save_btn is not None:
             disabled_reason = self._vps_profile_action_disabled_reason("save", has_profiles=has_profiles)
@@ -3149,7 +3390,7 @@ class SettingsPanelMixin:
             )
         deploy_btn = getattr(self, "settings_vps_deploy_btn", None)
         if deploy_btn is not None:
-            deploy_btn.setText("部署中…" if deploy_running else "一键部署 Docker")
+            deploy_btn.setText("部署中…" if deploy_running else "直接部署")
             disabled_reason = self._vps_deploy_disabled_reason(
                 payload=conn_payload,
                 deploy_cfg=deploy_cfg,
@@ -3159,6 +3400,20 @@ class SettingsPanelMixin:
                 deploy_btn,
                 not bool(disabled_reason),
                 enabled_tooltip="把当前部署配置执行到目标服务器。",
+                disabled_tooltip=disabled_reason,
+            )
+        takeover_btn = getattr(self, "settings_vps_takeover_btn", None)
+        if takeover_btn is not None:
+            takeover_btn.setText("接管中…" if bool(getattr(self, "_vps_takeover_running", False)) else "接管并注册 agant")
+            disabled_reason = self._vps_takeover_disabled_reason(
+                payload=conn_payload,
+                takeover_cfg=takeover_cfg,
+                has_profiles=has_profiles,
+            )
+            self._apply_vps_button_state(
+                takeover_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="校验 agant 路径并把它注册为启动器可用的远程设备。",
                 disabled_tooltip=disabled_reason,
             )
         profile_combo = getattr(self, "settings_vps_profile_combo", None)
@@ -3221,6 +3476,8 @@ class SettingsPanelMixin:
         self._apply_vps_form_data(payload)
         deploy_cfg = self._normalize_vps_deploy_cfg(profile or {}, username=payload.get("username"))
         self._apply_vps_deploy_form_data(deploy_cfg)
+        takeover_cfg = self._normalize_vps_takeover_cfg(profile or {})
+        self._apply_vps_takeover_form_data(takeover_cfg)
         self._on_vps_deploy_source_changed()
         self._on_vps_dep_install_mode_changed()
         key_rel = str(payload.get("ssh_key_path") or "").strip()
@@ -3280,8 +3537,16 @@ class SettingsPanelMixin:
             source_text = "上传本地项目" if deploy_cfg.get("source") == "upload" else "服务器拉取仓库"
             dep_text = self._vps_dep_install_mode_label(deploy_cfg.get("dep_install_mode"))
             deploy_label.setText(
-                f"部署偏好：{source_text}；依赖策略 {dep_text}；远端目录 {deploy_cfg.get('remote_dir')}；镜像 {deploy_cfg.get('docker_image')}。"
+                f"部署偏好：{source_text}；依赖策略 {dep_text}；远端目录 {deploy_cfg.get('remote_dir')}；模式 SSH 直部署。"
             )
+        takeover_label = getattr(self, "settings_vps_takeover_notice", None)
+        if takeover_label is not None:
+            takeover_cfg = self._normalize_vps_takeover_cfg(profile or {})
+            agent_dir = str(takeover_cfg.get("takeover_agent_dir") or "").strip()
+            if str(takeover_cfg.get("takeover_mode") or "").strip().lower() == "path" and agent_dir:
+                takeover_label.setText(f"接管偏好：agant 路径 {agent_dir}。")
+            else:
+                takeover_label.setText("尚未配置 agant 接管路径。")
         self._refresh_vps_terminal_meta()
         self._refresh_vps_action_buttons()
 
@@ -3465,8 +3730,6 @@ class SettingsPanelMixin:
                     "id": new_id,
                     "name": name,
                     "remote_dir": remote_agent_dir_default(""),
-                    "docker_image": "",
-                    "docker_container": "",
                     "source": "upload",
                     "dep_install_mode": "offline",
                     "repo_url": str(getattr(lz, "REPO_URL", "") or "").strip(),
@@ -3783,43 +4046,6 @@ class SettingsPanelMixin:
             last_blank = False
         return "\n".join(compact).strip()
 
-    def _validate_vps_docker_image_name(self, value: str) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return "请先填写镜像名称。启动器不会再替你自动改名。"
-        if any(ch.isspace() for ch in text):
-            return "镜像名称不能包含空白字符。"
-        if "@" in text:
-            return "部署镜像名称暂不支持 digest，请填写普通镜像名，例如 genericagent:latest。"
-        slash_idx = text.rfind("/")
-        colon_idx = text.rfind(":")
-        repo = text
-        tag = ""
-        if colon_idx > slash_idx:
-            repo = text[:colon_idx]
-            tag = text[colon_idx + 1 :]
-        repo = str(repo or "").strip()
-        if not repo:
-            return "镜像名称缺少仓库名。"
-        if any("A" <= ch <= "Z" for ch in repo):
-            return "镜像名称的仓库部分必须全小写，例如 `genericagent` 或 `registry.example.com/team/genericagent:latest`。"
-        parts = [str(part or "").strip() for part in repo.split("/")]
-        if any(not part for part in parts):
-            return "镜像名称格式无效，请检查 `/` 是否连续或结尾是否多余。"
-        repo_parts = list(parts)
-        if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
-            if not _DOCKER_REGISTRY_RE.fullmatch(parts[0]):
-                return "镜像名称中的仓库地址格式无效。"
-            repo_parts = parts[1:]
-        if not repo_parts:
-            return "镜像名称缺少仓库路径。"
-        for seg in repo_parts:
-            if not _DOCKER_REPOSITORY_SEGMENT_RE.fullmatch(seg):
-                return "镜像名称格式无效。仓库路径只能使用小写字母、数字，以及 `.`、`_`、`-`。"
-        if tag and (not _DOCKER_TAG_RE.fullmatch(tag)):
-            return "镜像标签格式无效。标签只能使用字母、数字、下划线、点和短横线。"
-        return ""
-
     def _append_vps_terminal_output(self, text: str):
         box = getattr(self, "settings_vps_terminal_output", None)
         msg = self._sanitize_vps_terminal_text(text)
@@ -3890,7 +4116,7 @@ class SettingsPanelMixin:
 
     def _on_vps_deploy_source_changed(self):
         source_combo = getattr(self, "settings_vps_deploy_source_combo", None)
-        source = str(source_combo.currentData() if source_combo is not None else "upload").strip().lower()
+        source = self._combo_current_data_value(source_combo, "upload").lower()
         is_upload = source != "git"
         local_edit = getattr(self, "settings_vps_local_agent_dir_edit", None)
         local_btn = getattr(self, "settings_vps_local_agent_browse_btn", None)
@@ -3901,15 +4127,17 @@ class SettingsPanelMixin:
             local_btn.setEnabled(is_upload)
         if repo_edit is not None:
             repo_edit.setEnabled(not is_upload)
+        self._refresh_vps_action_buttons()
 
     def _on_vps_dep_install_mode_changed(self):
         combo = getattr(self, "settings_vps_dep_install_mode_combo", None)
-        mode = str(combo.currentData() if combo is not None else "offline").strip().lower()
+        mode = self._combo_current_data_value(combo, "offline").lower()
         if mode == "online":
             mode = "global"
         mirror_edit = getattr(self, "settings_vps_pip_mirror_edit", None)
         if mirror_edit is not None:
             mirror_edit.setEnabled(mode == "mirror")
+        self._refresh_vps_action_buttons()
 
     def _split_vps_upload_excludes(self, raw: str):
         text = str(raw or "").strip()
@@ -4048,65 +4276,86 @@ class SettingsPanelMixin:
         except Exception as e:
             return 1, "", normalize_ssh_error_text(str(e), context="SSH 命令执行")
 
-    def _vps_default_docker_requirements(self):
-        return [
+    def _vps_default_direct_requirements(self):
+        items = []
+        seen = set()
+        for dep in LAUNCHER_BOOTSTRAP_DEPENDENCIES:
+            spec = str(dep.get("package") or "").strip()
+            if spec and spec not in seen:
+                seen.add(spec)
+                items.append(spec)
+        for spec in (
             "streamlit>=1.37",
-            "requests>=2.32",
-            "simplejson>=3.19",
-            "charset-normalizer>=3.3",
             "markdown>=3.6",
             "qrcode>=8.0",
             "pycryptodome>=3.20",
             "bottle>=0.12",
             "simple-websocket-server>=0.4.4",
             "beautifulsoup4>=4.12",
-        ]
+        ):
+            if spec not in seen:
+                seen.add(spec)
+                items.append(spec)
+        return items
 
     def _vps_render_bootstrap_requirements(self):
-        return "\n".join(self._vps_default_docker_requirements()) + "\n"
+        return "\n".join(self._vps_default_direct_requirements()) + "\n"
 
-    def _vps_render_bootstrap_dockerfile(self, dep_install_mode: str, pip_mirror_url: str):
+    def _vps_dep_install_source(self, dep_install_mode: str, pip_mirror_url: str = ""):
         mode = str(dep_install_mode or "offline").strip().lower()
-        if mode not in ("offline", "global", "online", "mirror"):
+        if mode == "online":
+            mode = "global"
+        if mode not in ("offline", "global", "mirror"):
             mode = "offline"
-        mirror_url = str(pip_mirror_url or "").strip()
-        default_index = "https://pypi.tuna.tsinghua.edu.cn/simple"
-        trusted_host = "pypi.tuna.tsinghua.edu.cn"
-        if mode in ("online", "global"):
-            default_index = "https://pypi.org/simple"
-            trusted_host = "pypi.org"
-        elif mode == "mirror" and mirror_url:
-            parsed = urlparse(mirror_url)
+        source = {
+            "mode": mode,
+            "label": self._vps_dep_install_mode_label(mode),
+            "index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+            "trusted_host": "pypi.tuna.tsinghua.edu.cn",
+            "probe_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+        }
+        if mode == "global":
+            source.update(
+                {
+                    "index_url": "https://pypi.org/simple",
+                    "trusted_host": "pypi.org",
+                    "probe_url": "https://pypi.org/simple",
+                }
+            )
+        elif mode == "mirror":
+            parsed = urlparse(str(pip_mirror_url or "").strip())
             host = str(getattr(parsed, "hostname", "") or "").strip()
-            if host:
-                default_index = mirror_url
-                trusted_host = host
+            source.update(
+                {
+                    "index_url": str(pip_mirror_url or "").strip(),
+                    "trusted_host": host,
+                    "probe_url": str(pip_mirror_url or "").strip(),
+                }
+            )
+        return source
+
+    def _vps_render_remote_requirement_install_cmd(self, python_cmd: str, requirements_path: str, dep_install_mode: str, pip_mirror_url: str):
+        source = self._vps_dep_install_source(dep_install_mode, pip_mirror_url)
+        q_py = shlex.quote(str(python_cmd or "python3").strip() or "python3")
+        q_req = shlex.quote(str(requirements_path or "").strip())
+        base = (
+            "set -e; "
+            f"PY_BIN={q_py}; "
+            f"REQ_FILE={q_req}; "
+            "\"$PY_BIN\" -m ensurepip --upgrade >/dev/null 2>&1 || true; "
+            "\"$PY_BIN\" -m pip --version >/dev/null 2>&1 || { echo '__NO_PIP__'; exit 71; }; "
+            "[ -f \"$REQ_FILE\" ] || { echo '__REQ_MISSING__'; exit 72; }; "
+            "export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1; "
+        )
+        if str(source.get("mode") or "").strip() == "global":
+            return base + "\"$PY_BIN\" -m pip install --default-timeout=180 --retries=6 -r \"$REQ_FILE\""
+        q_index = shlex.quote(str(source.get("index_url") or "").strip())
+        q_host = shlex.quote(str(source.get("trusted_host") or "").strip())
         return (
-            "FROM python:3.12-slim\n\n"
-            f"ARG PIP_INDEX_URL={default_index}\n"
-            f"ARG PIP_TRUSTED_HOST={trusted_host}\n\n"
-            "ENV PYTHONDONTWRITEBYTECODE=1 \\\n"
-            "    PYTHONUNBUFFERED=1 \\\n"
-            "    PIP_DISABLE_PIP_VERSION_CHECK=1 \\\n"
-            "    PIP_NO_CACHE_DIR=1 \\\n"
-            "    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \\\n"
-            "    STREAMLIT_SERVER_HEADLESS=true\n\n"
-            "WORKDIR /app\n\n"
-            "RUN apt-get update \\\n"
-            "    && apt-get install -y --no-install-recommends ca-certificates curl \\\n"
-            "    && rm -rf /var/lib/apt/lists/*\n\n"
-            "COPY requirements.docker.txt /tmp/requirements.docker.txt\n"
-            "RUN python -m pip install --default-timeout=180 --retries=8 "
-            "-i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST} -r /tmp/requirements.docker.txt \\\n"
-            "    || python -m pip install --default-timeout=180 --retries=8 -r /tmp/requirements.docker.txt\n\n"
-            "COPY . /app\n\n"
-            "EXPOSE 8501\n\n"
-            "HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 \\\n"
-            "  CMD python -c \"import urllib.request,sys; "
-            "urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4); "
-            "sys.exit(0)\" || exit 1\n\n"
-            "CMD [\"python\", \"-m\", \"streamlit\", \"run\", \"frontends/stapp.py\", "
-            "\"--server.address=0.0.0.0\", \"--server.port=8501\", \"--server.headless=true\"]\n"
+            base
+            + "\"$PY_BIN\" -m pip install --default-timeout=180 --retries=6 "
+            + f"-i {q_index} --trusted-host {q_host} -r \"$REQ_FILE\" "
+            + "|| \"$PY_BIN\" -m pip install --default-timeout=180 --retries=6 -r \"$REQ_FILE\""
         )
 
     def _connect_vps_terminal(self):
@@ -4369,7 +4618,7 @@ class SettingsPanelMixin:
 
         QTimer.singleShot(120, pump)
 
-    def _deploy_vps_agent_docker(self):
+    def _deploy_vps_agent_direct(self):
         if bool(getattr(self, "_vps_deploy_running", False)):
             QMessageBox.information(self, "请稍候", "部署任务正在执行，请等待完成。")
             return
@@ -4385,34 +4634,25 @@ class SettingsPanelMixin:
         local_abs = lz._resolve_config_path(local_rel) if local_rel else ""
         repo_url = str(deploy_cfg.get("repo_url") or "").strip()
         remote_dir = str(deploy_cfg.get("remote_dir") or "").strip()
-        docker_image = str(deploy_cfg.get("docker_image") or "").strip()
-        docker_container = str(deploy_cfg.get("docker_container") or "").strip()
         dep_install_mode = str(deploy_cfg.get("dep_install_mode") or "offline").strip().lower()
         if dep_install_mode == "online":
             dep_install_mode = "global"
         if dep_install_mode not in ("offline", "global", "mirror"):
             dep_install_mode = "offline"
         pip_mirror_url = str(deploy_cfg.get("pip_mirror_url") or "").strip()
+        dep_source = self._vps_dep_install_source(dep_install_mode, pip_mirror_url)
         upload_excludes_raw = str(deploy_cfg.get("upload_excludes") or "").strip()
         upload_excludes = self._split_vps_upload_excludes(upload_excludes_raw)
         if not remote_dir:
             QMessageBox.warning(self, "无法部署", "请填写远端部署目录。")
             return
-        image_error = self._validate_vps_docker_image_name(docker_image)
-        if image_error:
-            QMessageBox.warning(self, "无法部署", image_error)
-            return
-        if not docker_container:
-            QMessageBox.warning(self, "无法部署", "请先填写容器名称。")
-            return
         if source == "upload":
             if not local_abs or not os.path.isdir(local_abs):
                 QMessageBox.warning(self, "无法部署", "上传模式下，本地 agant 目录不存在。")
                 return
-        else:
-            if not repo_url:
-                QMessageBox.warning(self, "无法部署", "拉取模式下，仓库地址不能为空。")
-                return
+        elif not repo_url:
+            QMessageBox.warning(self, "无法部署", "拉取模式下，仓库地址不能为空。")
+            return
         if dep_install_mode == "mirror":
             if not pip_mirror_url:
                 QMessageBox.warning(self, "无法部署", "自定义镜像策略要求填写 pip 镜像地址。")
@@ -4422,12 +4662,13 @@ class SettingsPanelMixin:
                 QMessageBox.warning(self, "无法部署", "pip 镜像地址格式无效，请填写 http(s) URL。")
                 return
         self._set_vps_deploy_running(True)
-        self._set_status("正在执行 VPS 一键 Docker 部署…")
-        self.settings_vps_deploy_notice.setText(f"部署任务已启动，正在连接服务器… 当前目标：{target_name}")
+        self._set_status("正在执行 VPS 直接部署…")
+        self.settings_vps_deploy_notice.setText(f"直接部署任务已启动，正在连接服务器… 当前目标：{target_name}")
         self._append_vps_terminal_deploy_output(f"部署任务开始：{target_name}", banner=True)
         profile_id = str(current.get("id") or "").strip()
+        profile_python = str(current.get("python_cmd") or "python3").strip() or "python3"
         log_queue: queue.Queue = queue.Queue()
-        holder = {"ok": False, "message": "", "detail": ""}
+        holder = {"ok": False, "message": "", "detail": "", "python_cmd": profile_python}
 
         def push(msg: str):
             text = str(msg or "").strip()
@@ -4447,23 +4688,27 @@ class SettingsPanelMixin:
                         holder["message"] = err_msg or "SSH 连接失败。"
                         holder["detail"] = detail
                     return
-                push("SSH 连接成功，开始部署前预检。")
+                push("SSH 连接成功，开始直部署前预检。")
                 preflight_rows = []
 
                 def _add_preflight(name: str, ok: bool, detail_text: str, *, critical: bool):
                     preflight_rows.append({"name": name, "ok": bool(ok), "detail": str(detail_text or "").strip(), "critical": bool(critical)})
 
-                rc, out, err = self._vps_exec_remote(client, "docker --version", timeout=30)
-                if rc == 0:
-                    _add_preflight("Docker CLI", True, (out or err).strip() or "可用", critical=True)
+                py_probe_cmd = (
+                    "set -e; "
+                    f"PY_BIN={shlex.quote(profile_python)}; "
+                    "if command -v \"$PY_BIN\" >/dev/null 2>&1; then printf '__PY__|%s' \"$PY_BIN\"; "
+                    "elif command -v python3 >/dev/null 2>&1; then printf '__PY__|python3'; "
+                    "elif command -v python >/dev/null 2>&1; then printf '__PY__|python'; "
+                    "else echo '__NO_PY__'; exit 41; fi"
+                )
+                rc, out, err = self._vps_exec_remote(client, py_probe_cmd, timeout=20)
+                py_probe_text = str(out or err or "").strip()
+                if rc == 0 and "__PY__|" in py_probe_text:
+                    holder["python_cmd"] = py_probe_text.split("|", 1)[1].strip() or profile_python
+                    _add_preflight("远端 Python", True, f"可用：{holder['python_cmd']}", critical=True)
                 else:
-                    _add_preflight("Docker CLI", False, (err or out).strip() or "未安装", critical=True)
-
-                rc, out, err = self._vps_exec_remote(client, "docker info --format '{{.ServerVersion}}'", timeout=30)
-                if rc == 0:
-                    _add_preflight("Docker Daemon", True, "ServerVersion=" + ((out or err).strip() or "unknown"), critical=True)
-                else:
-                    _add_preflight("Docker Daemon", False, (err or out).strip() or "daemon 不可用", critical=True)
+                    _add_preflight("远端 Python", False, "未检测到 python3 / python", critical=True)
 
                 parent_dir = os.path.dirname(remote_dir.rstrip("/")) or "/"
                 rc, out, err = self._vps_exec_remote(client, f"test -w {shlex.quote(parent_dir)} && echo OK || echo FAIL", timeout=12)
@@ -4498,13 +4743,7 @@ class SettingsPanelMixin:
                         mem_text = mem_text or "读取失败"
                 _add_preflight("可用内存", mem_ok, mem_text or "读取失败", critical=False)
 
-                probe_url = ""
-                if dep_install_mode == "mirror":
-                    probe_url = pip_mirror_url
-                elif dep_install_mode == "global":
-                    probe_url = "https://pypi.org/simple"
-                else:
-                    probe_url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+                probe_url = str(dep_source.get("probe_url") or "").strip()
                 if probe_url:
                     q_probe = shlex.quote(probe_url)
                     rc, out, err = self._vps_exec_remote(
@@ -4647,132 +4886,127 @@ class SettingsPanelMixin:
                         return
                     push("仓库同步完成。")
 
-                push("开始执行 Docker 部署。")
-                q_img = shlex.quote(docker_image)
-                q_container = shlex.quote(docker_container)
-                if dep_install_mode == "mirror":
-                    push("依赖安装策略：自定义源。")
-                elif dep_install_mode == "global":
+                push("开始执行远端直部署。")
+                if dep_source.get("mode") == "mirror":
+                    push(f"依赖安装策略：{dep_source.get('label')}。")
+                elif dep_source.get("mode") == "global":
                     push("依赖安装策略：国际源（PyPI）。")
                 else:
                     push("依赖安装策略：内置源（清华）。")
-                detect_cmd = (
+
+                verify_cmd = (
                     "set -e; "
-                    f"cd {q_remote_dir}; "
-                    "if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ] || [ -f compose.yml ] || [ -f compose.yaml ]; then "
-                    "echo '__HAS_COMPOSE__'; "
-                    "elif [ -f Dockerfile ] || [ -f dockerfile ]; then "
-                    "echo '__HAS_DOCKERFILE__'; "
-                    "else "
-                    "echo '__NO_DOCKER_SPEC__'; "
-                    "fi"
+                    f"TARGET={q_remote_dir}; "
+                    "[ -d \"$TARGET\" ] || { echo '__MISSING_DIR__'; exit 61; }; "
+                    "[ -f \"$TARGET/agentmain.py\" ] || { echo '__MISSING_AGENTMAIN__'; exit 62; }; "
+                    "[ -d \"$TARGET/frontends\" ] || { echo '__MISSING_FRONTENDS__'; exit 63; }; "
+                    f"PY_BIN={shlex.quote(holder['python_cmd'])}; "
+                    "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
+                    "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
+                    "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
+                    "else echo '__NO_PY__'; exit 64; fi; "
+                    "fi; "
+                    "mkdir -p \"$TARGET/temp/launcher_runtime\" \"$TARGET/temp/launcher_sessions\"; "
+                    "printf '__READY__|%s|%s' \"$TARGET\" \"$PY_BIN\""
                 )
-                rc, out, err = self._vps_exec_remote(client, detect_cmd, timeout=30)
-                if rc != 0:
-                    holder["message"] = "检查远端 Docker 描述文件失败。"
-                    holder["detail"] = (err or out or "").strip()
+                rc, out, err = self._vps_exec_remote(client, verify_cmd, timeout=40)
+                verify_text = str(out or err or "").strip()
+                if rc != 0 or "__READY__|" not in verify_text:
+                    if "__MISSING_DIR__" in verify_text:
+                        holder["message"] = "远端部署目录不存在。"
+                        holder["detail"] = remote_dir
+                    elif "__MISSING_AGENTMAIN__" in verify_text:
+                        holder["message"] = "远端项目缺少 agentmain.py。"
+                        holder["detail"] = remote_dir
+                    elif "__MISSING_FRONTENDS__" in verify_text:
+                        holder["message"] = "远端项目缺少 frontends 目录。"
+                        holder["detail"] = remote_dir
+                    elif "__NO_PY__" in verify_text:
+                        holder["message"] = "服务器未检测到可用 Python。"
+                        holder["detail"] = "请确认服务器至少存在 python3 或 python。"
+                    else:
+                        holder["message"] = "远端项目预检失败。"
+                        holder["detail"] = verify_text or "请检查目录结构与权限。"
                     return
-                detect_text = (out or err or "").strip()
-                has_compose = "__HAS_COMPOSE__" in detect_text
-                has_dockerfile = "__HAS_DOCKERFILE__" in detect_text
-                if (not has_compose) and (not has_dockerfile):
-                    if source == "upload":
-                        push("未检测到 Dockerfile/compose，自动生成生产级 Docker 模板（SSH 管理模式，无端口映射）。")
+                _prefix, ready_dir, ready_py = verify_text.split("|", 2)
+                ready_dir = str(ready_dir or remote_dir).strip() or remote_dir
+                holder["python_cmd"] = str(ready_py or holder["python_cmd"]).strip() or holder["python_cmd"]
+
+                remote_req_path = ready_dir.rstrip("/") + "/requirements.txt"
+                req_probe_cmd = (
+                    "set -e; "
+                    f"TARGET={shlex.quote(remote_req_path)}; "
+                    "if [ -f \"$TARGET\" ]; then echo '__REQ__'; else echo '__NO_REQ__'; fi"
+                )
+                rc, out, err = self._vps_exec_remote(client, req_probe_cmd, timeout=20)
+                if rc != 0:
+                    holder["message"] = "检查远端 requirements.txt 失败。"
+                    holder["detail"] = (err or out).strip()
+                    return
+                req_probe_text = str(out or err or "").strip()
+                used_fallback_requirements = "__REQ__" not in req_probe_text
+                if used_fallback_requirements:
+                    remote_req_path = ready_dir.rstrip("/") + "/temp/launcher_runtime/requirements.launcher_bootstrap.txt"
+                    push("上游未提供 requirements.txt；当前改用启动器维护的上游依赖表。")
+                    try:
+                        req_text = self._vps_render_bootstrap_requirements()
+                        sftp = client.open_sftp()
                         try:
-                            dockerfile_text = self._vps_render_bootstrap_dockerfile(dep_install_mode, pip_mirror_url)
-                            req_text = self._vps_render_bootstrap_requirements()
-                            remote_dockerfile = remote_dir.rstrip("/") + "/Dockerfile"
-                            remote_req = remote_dir.rstrip("/") + "/requirements.docker.txt"
-                            sftp = client.open_sftp()
+                            with sftp.open(remote_req_path, "wb") as fp:
+                                fp.write(req_text.encode("utf-8"))
+                        finally:
                             try:
-                                with sftp.open(remote_dockerfile, "wb") as fp:
-                                    fp.write(dockerfile_text.encode("utf-8"))
-                                with sftp.open(remote_req, "wb") as fp:
-                                    fp.write(req_text.encode("utf-8"))
-                            finally:
-                                try:
-                                    sftp.close()
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            holder["message"] = "自动生成 Docker 模板失败。"
-                            holder["detail"] = str(e)
-                            return
-                        rc, out, err = self._vps_exec_remote(client, detect_cmd, timeout=30)
-                        if rc != 0:
-                            holder["message"] = "自动生成模板后再次校验失败。"
-                            holder["detail"] = (err or out or "").strip()
-                            return
-                        detect_text = (out or err or "").strip()
-                        has_compose = "__HAS_COMPOSE__" in detect_text
-                        has_dockerfile = "__HAS_DOCKERFILE__" in detect_text
-                        if (not has_compose) and (not has_dockerfile):
-                            holder["message"] = "自动生成 Docker 模板后仍未检测到 Dockerfile/compose。"
-                            holder["detail"] = detect_text or "请检查远端目录权限。"
-                            return
-                        push("已自动生成 Dockerfile 与 requirements.docker.txt。")
-                    else:
-                        holder["message"] = "远端项目未检测到 Dockerfile/compose，已停止部署。"
-                        holder["detail"] = "请切换为“上传本地项目”，或在仓库补齐 Docker 描述文件。"
+                                sftp.close()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        holder["message"] = "写入远端 fallback requirements 失败。"
+                        holder["detail"] = str(e)
                         return
-                docker_cmd = (
-                    "set -e; "
-                    f"cd {q_remote_dir}; "
-                    "if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ] || [ -f compose.yml ] || [ -f compose.yaml ]; then "
-                    "if docker compose version >/dev/null 2>&1; then docker compose up -d --build; "
-                    "elif command -v docker-compose >/dev/null 2>&1; then docker-compose up -d --build; "
-                    "else echo '__NO_COMPOSE_CMD__'; exit 45; fi; "
-                    "elif [ -f Dockerfile ] || [ -f dockerfile ]; then "
-                    f"docker build -t {q_img} .; "
-                    f"target_container={q_container}; "
-                    f"target_image={q_img}; "
-                    "current_image=$(docker inspect -f '{{.Config.Image}}' \"$target_container\" 2>/dev/null || true); "
-                    "if [ -n \"$current_image\" ] && [ \"$current_image\" = \"$target_image\" ]; then "
-                    "echo '__SYNC_REBUILD__'; "
-                    "backup_container=\"${target_container}_bak_$(date +%s)\"; "
-                    "docker rm -f \"$backup_container\" >/dev/null 2>&1 || true; "
-                    "docker rename \"$target_container\" \"$backup_container\"; "
-                    "if docker run -d --name \"$target_container\" --restart unless-stopped \"$target_image\"; then "
-                    "docker rm -f \"$backup_container\" >/dev/null 2>&1 || true; "
-                    "else "
-                    "docker rm -f \"$target_container\" >/dev/null 2>&1 || true; "
-                    "docker rename \"$backup_container\" \"$target_container\" >/dev/null 2>&1 || true; "
-                    "docker start \"$target_container\" >/dev/null 2>&1 || true; "
-                    "echo '__SYNC_ROLLBACK__'; exit 47; "
-                    "fi; "
-                    "else "
-                    "docker rm -f \"$target_container\" >/dev/null 2>&1 || true; "
-                    "docker run -d --name \"$target_container\" --restart unless-stopped \"$target_image\"; "
-                    "fi; "
-                    "else "
-                    "echo '__NO_DOCKERFILE__'; "
-                    "exit 46; "
-                    "fi"
+                    push("已写入 fallback requirements 到 temp/launcher_runtime。")
+                else:
+                    push("检测到远端 requirements.txt，优先使用仓库自带依赖表。")
+
+                install_cmd = self._vps_render_remote_requirement_install_cmd(
+                    holder["python_cmd"],
+                    remote_req_path,
+                    dep_install_mode,
+                    pip_mirror_url,
                 )
-                rc, out, err = self._vps_exec_remote(client, docker_cmd, timeout=900)
-                text = (out or err or "").strip()
+                rc, out, err = self._vps_exec_remote(client, install_cmd, timeout=1200)
+                install_text = str(out or err or "").strip()
                 if rc != 0:
-                    if "__NO_COMPOSE_CMD__" in text:
-                        holder["message"] = "检测到 compose 文件，但服务器缺少 docker compose 命令。"
-                        holder["detail"] = "请安装 Docker Compose 插件后重试。"
-                    elif "__NO_DOCKERFILE__" in text:
-                        holder["message"] = "未检测到 Dockerfile/compose，已停止部署。"
-                        holder["detail"] = "请在本地 agant 项目根目录提供生产可用的 Dockerfile 或 compose 文件后重试。"
-                    elif "__SYNC_ROLLBACK__" in text:
-                        holder["message"] = "同名镜像同步重建失败，已自动回滚到旧容器。"
-                        holder["detail"] = "请检查镜像启动日志后重试。"
+                    if "__NO_PIP__" in install_text:
+                        holder["message"] = "服务器上的 Python 缺少 pip。"
+                        holder["detail"] = f"Python：{holder['python_cmd']}"
+                    elif "__REQ_MISSING__" in install_text:
+                        holder["message"] = "远端依赖文件不存在。"
+                        holder["detail"] = remote_req_path
                     else:
-                        holder["message"] = "Docker 部署失败。"
-                        holder["detail"] = text
+                        holder["message"] = "依赖安装失败。"
+                        holder["detail"] = install_text
                     return
-                if "__SYNC_REBUILD__" in text:
-                    push("检测到同名镜像，已执行同步重建。")
-                push("Docker 部署命令执行完成。")
-                rc, out, err = self._vps_exec_remote(client, f"docker ps --filter name={q_container} --format '{{{{.Names}}}} {{{{.Status}}}}'", timeout=30)
-                status_text = (out or err).strip()
+                push("依赖安装完成。")
+
+                python_check_cmd = (
+                    "set -e; "
+                    f"cd {shlex.quote(ready_dir)}; "
+                    f"PY_BIN={shlex.quote(holder['python_cmd'])}; "
+                    "\"$PY_BIN\" -c \"import sys; print('__PY_OK__|' + sys.executable)\"; "
+                    "\"$PY_BIN\" -m py_compile agentmain.py; "
+                    "if [ -f frontends/stapp.py ]; then \"$PY_BIN\" -m py_compile frontends/stapp.py; fi"
+                )
+                rc, out, err = self._vps_exec_remote(client, python_check_cmd, timeout=120)
+                python_check_text = str(out or err or "").strip()
+                if rc != 0 or "__PY_OK__|" not in python_check_text:
+                    holder["message"] = "远端 Python 校验失败。"
+                    holder["detail"] = python_check_text or "请检查依赖安装与项目目录。"
+                    return
                 holder["ok"] = True
-                holder["message"] = "一键部署完成。"
-                holder["detail"] = status_text or "容器已启动（若使用 compose，请在服务器上执行 docker compose ps 查看详情）。"
+                holder["message"] = "直接部署完成。"
+                req_label = "requirements.txt" if not used_fallback_requirements else "temp/launcher_runtime/requirements.launcher_bootstrap.txt"
+                py_exec = python_check_text.split("|", 1)[1].splitlines()[0].strip() if "__PY_OK__|" in python_check_text else holder["python_cmd"]
+                holder["detail"] = f"远端目录：{ready_dir}；Python：{py_exec or holder['python_cmd']}；依赖文件：{req_label}"
             except Exception as e:
                 holder["ok"] = False
                 holder["message"] = "部署过程中出现异常。"
@@ -4790,7 +5024,7 @@ class SettingsPanelMixin:
                         pass
                 log_queue.put({"event": "done"})
 
-        thread = threading.Thread(target=worker, name="vps-oneclick-deploy", daemon=True)
+        thread = threading.Thread(target=worker, name="vps-direct-deploy", daemon=True)
         thread.start()
 
         logs = []
@@ -4814,12 +5048,25 @@ class SettingsPanelMixin:
                     msg = str(holder.get("message") or "部署结束。")
                     detail = self._sanitize_vps_feedback_text(holder.get("detail") or "")
                     if holder.get("ok"):
+                        ready_py = str(holder.get("python_cmd") or "").strip()
+                        if ready_py:
+                            rows = self._vps_profiles()
+                            changed = False
+                            for item in rows:
+                                if str(item.get("id") or "").strip() != profile_id:
+                                    continue
+                                if str(item.get("python_cmd") or "").strip() != ready_py:
+                                    item["python_cmd"] = ready_py
+                                    changed = True
+                                break
+                            if changed:
+                                self._save_vps_profiles(rows, selected_id=profile_id)
                         self._update_vps_profile_runtime_summary(kind="deploy", ok=True, message=msg, detail=detail)
                         self.settings_vps_deploy_notice.setText(msg + (f"\n{detail}" if detail else ""))
                         self._append_vps_terminal_deploy_output(msg, banner=True)
                         if detail:
                             self._append_vps_terminal_deploy_output(detail)
-                        self._set_status("VPS 一键 Docker 部署完成。")
+                        self._set_status("VPS 直接部署完成。")
                         self._reload_vps_panel()
                         if not stale:
                             QMessageBox.information(self, "部署完成", msg if not detail else f"{msg}\n\n{detail}")
@@ -4829,7 +5076,7 @@ class SettingsPanelMixin:
                         self._append_vps_terminal_deploy_output(msg, banner=True)
                         if detail:
                             self._append_vps_terminal_deploy_output(detail)
-                        self._set_status("VPS 一键 Docker 部署失败。")
+                        self._set_status("VPS 直接部署失败。")
                         self._reload_vps_panel()
                         if not stale:
                             QMessageBox.warning(self, "部署失败", msg if not detail else f"{msg}\n\n{detail}")
@@ -4838,6 +5085,148 @@ class SettingsPanelMixin:
                 QTimer.singleShot(140, poll)
 
         QTimer.singleShot(140, poll)
+
+    def _takeover_vps_agent(self):
+        if bool(getattr(self, "_vps_takeover_running", False)):
+            QMessageBox.information(self, "请稍候", "agant 接管任务正在执行，请等待完成。")
+            return
+        payload, error = self._resolve_vps_runtime_connection_payload()
+        if error:
+            QMessageBox.warning(self, "无法接管", error)
+            return
+        takeover_cfg = self._collect_vps_takeover_form_data()
+        validation_error = self._vps_takeover_validation_error(takeover_cfg)
+        if validation_error:
+            QMessageBox.warning(self, "无法接管", validation_error)
+            return
+        current = self._current_vps_profile() or {}
+        profile_id = str(current.get("id") or self._current_vps_profile_id() or "").strip()
+        target_name = self._vps_profile_display_name(current)
+        requested_dir = str(takeover_cfg.get("takeover_agent_dir") or "").strip()
+        profile_python = str(current.get("python_cmd") or "python3").strip() or "python3"
+        holder = {"ok": False, "message": "", "detail": "", "agent_dir": requested_dir, "python_cmd": profile_python}
+        self._persist_current_vps_profile_from_form(validate_pair=False, silent=True)
+        self._set_vps_takeover_running(True)
+        self._set_status("正在接管 agant…")
+        notice = getattr(self, "settings_vps_takeover_notice", None)
+        if notice is not None:
+            notice.setText(f"正在校验 agant 路径 {requested_dir}，请稍候… 当前目标：{target_name}")
+
+        def worker():
+            client = None
+            try:
+                client, err_msg, detail, missing = self._open_vps_ssh_client(payload, timeout=10)
+                if client is None:
+                    holder["message"] = "当前环境缺少 paramiko，无法执行 agant 接管。" if missing else (err_msg or "SSH 连接失败。")
+                    holder["detail"] = str(detail or "").strip()
+                    return
+                verify_inner = (
+                    "set -e; "
+                    f"TARGET={shlex.quote(requested_dir)}; "
+                    "[ -d \"$TARGET\" ] || { echo '__MISSING_DIR__'; exit 61; }; "
+                    "( [ -f \"$TARGET/agentmain.py\" ] || [ -d \"$TARGET/frontends\" ] ) || { echo '__INVALID_DIR__'; exit 62; }; "
+                    "cd \"$TARGET\"; "
+                    f"PY_BIN={shlex.quote(profile_python)}; "
+                    "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
+                    "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
+                    "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
+                    "else echo '__NO_PY__'; exit 63; fi; "
+                    "fi; "
+                    "mkdir -p \"$TARGET/temp/launcher_runtime\" \"$TARGET/temp/launcher_sessions\"; "
+                    "REAL_TARGET=$(pwd -P 2>/dev/null || pwd); "
+                    "printf '__READY__|%s|%s' \"$REAL_TARGET\" \"$PY_BIN\""
+                )
+                rc, out, err = self._vps_exec_remote(
+                    client,
+                    f"sh -lc {shlex.quote(verify_inner)}",
+                    timeout=40,
+                )
+                verify_text = str(out or err or "").strip()
+                if rc != 0 or "__READY__|" not in verify_text:
+                    if "__MISSING_DIR__" in verify_text:
+                        holder["message"] = "agant 路径不存在。"
+                        holder["detail"] = requested_dir
+                    elif "__INVALID_DIR__" in verify_text:
+                        holder["message"] = "该路径不像 agant 根目录。"
+                        holder["detail"] = requested_dir
+                    elif "__NO_PY__" in verify_text:
+                        holder["message"] = "远端未检测到可用 Python。"
+                        holder["detail"] = "请确认目标机器至少存在 python3 或 python。"
+                    else:
+                        holder["message"] = "agant 接管预检失败。"
+                        holder["detail"] = verify_text or "请检查路径状态与目录权限。"
+                    return
+                _prefix, ready_dir, ready_py = verify_text.split("|", 2)
+                holder["ok"] = True
+                holder["agent_dir"] = str(ready_dir or requested_dir).strip() or requested_dir
+                holder["python_cmd"] = str(ready_py or profile_python).strip() or profile_python
+                holder["message"] = "已接管 agant。"
+                holder["detail"] = f"路径：{holder['agent_dir']}；Python：{holder['python_cmd']}"
+            except Exception as e:
+                holder["message"] = "agant 接管失败。"
+                holder["detail"] = str(e)
+            finally:
+                try:
+                    if client is not None:
+                        client.close()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=worker, name="vps-agent-takeover", daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                QTimer.singleShot(120, poll)
+                return
+            self._set_vps_takeover_running(False)
+            stale = self._vps_task_result_stale(profile_id)
+            msg = self._sanitize_vps_feedback_text(holder.get("message") or "")
+            detail = self._sanitize_vps_feedback_text(holder.get("detail") or "")
+            if holder.get("ok"):
+                rows = self._vps_profiles()
+                changed = False
+                for idx, item in enumerate(rows):
+                    if str(item.get("id") or "").strip() != profile_id:
+                        continue
+                    updated = dict(item)
+                    updated["remote_mode"] = "ssh"
+                    updated["python_cmd"] = holder.get("python_cmd") or profile_python
+                    updated["remote_dir"] = holder.get("agent_dir") or requested_dir
+                    updated["takeover_mode"] = "path"
+                    updated["takeover_agent_dir"] = holder.get("agent_dir") or requested_dir
+                    updated["takeover_python_cmd"] = holder.get("python_cmd") or profile_python
+                    updated["docker_takeover_container"] = ""
+                    updated["docker_takeover_agent_dir"] = ""
+                    updated["docker_takeover_python_cmd"] = "python3"
+                    rows[idx] = self._normalize_vps_profile(updated)
+                    changed = True
+                    break
+                if changed:
+                    self._save_vps_profiles(rows, selected_id=profile_id)
+                self._update_vps_profile_runtime_summary(kind="takeover", ok=True, message=msg, detail=detail, profile_id=profile_id)
+                if notice is not None:
+                    notice.setText(msg + (f"\n{detail}" if detail else ""))
+                self._set_status("agant 已接管并注册。")
+                self._reload_vps_panel()
+                sync_remote = getattr(self, "_sync_remote_device_launcher_sessions", None)
+                if callable(sync_remote):
+                    try:
+                        sync_remote(force=True, device_id=profile_id)
+                    except Exception:
+                        pass
+                if not stale:
+                    QMessageBox.information(self, "接管完成", msg if not detail else f"{msg}\n\n{detail}")
+                return
+            self._update_vps_profile_runtime_summary(kind="takeover", ok=False, message=msg, detail=detail, profile_id=profile_id)
+            if notice is not None:
+                notice.setText(msg + (f"\n{detail}" if detail else ""))
+            self._set_status("agant 接管失败。")
+            self._reload_vps_panel()
+            if not stale:
+                QMessageBox.warning(self, "接管失败", msg if not detail else f"{msg}\n\n{detail}")
+
+        QTimer.singleShot(120, poll)
 
     def _browse_vps_ssh_key(self):
         selected, _ = QFileDialog.getOpenFileName(

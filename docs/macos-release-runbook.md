@@ -13,7 +13,7 @@
 2. `macos-validate` workflow 通过
 3. 至少一份真实 mac 设备 smoke 记录通过
 4. 公开资产合同完整：
-   `.dmg`、`.sha256`、`README-macOS.txt`、`install-metadata.json`
+   双架构 `.dmg`、`.sha256`、`README-macOS-<arch>.txt`、`install-metadata-<arch>.json`
 
 ## 发版步骤
 
@@ -60,12 +60,16 @@ python -m pytest tests -q
 
 Release 页面必须出现：
 
-- `GenericAgentLauncher-macos-<version>.dmg`
-- `GenericAgentLauncher-macos-<version>.sha256`
-- `README-macOS.txt`
-- `install-metadata.json`
+- `GenericAgentLauncher-macos-arm64-<version>.dmg`
+- `GenericAgentLauncher-macos-arm64-<version>.sha256`
+- `README-macOS-arm64.txt`
+- `install-metadata-arm64.json`
+- `GenericAgentLauncher-macos-x86_64-<version>.dmg`
+- `GenericAgentLauncher-macos-x86_64-<version>.sha256`
+- `README-macOS-x86_64.txt`
+- `install-metadata-x86_64.json`
 
-其中 `install-metadata.json` 必须反映：
+其中每个 `install-metadata-<arch>.json` 都必须反映：
 
 - `platform = macos`
 - `install_mode = manual_dmg`
@@ -73,8 +77,8 @@ Release 页面必须出现：
 - `user_install_target = ~/Applications/GenericAgent Launcher.app`
 - `supports_internal_updater = false`
 - `requires_system_python = true`
-- `build_arch = x86_64`（当前 GitHub `macos-15-intel` 发布合同）
-- `runner_label = macos-15-intel`
+- `build_arch = arm64` 对应 `runner_label = macos-15`
+- `build_arch = x86_64` 对应 `runner_label = macos-15-intel`
 - `developer_id_signed = false`
 - `apple_developer_signed = false`
 - `notarized = false`

@@ -9,6 +9,13 @@ from .common import MessageRow, _session_source_label
 
 
 class ChatViewMixin:
+    def _sync_message_layout_alignment(self):
+        layout = getattr(self, "msg_layout", None)
+        if layout is None:
+            return
+        rows = getattr(self, "_rendered_message_rows", None) or []
+        layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)
+
     def _message_row_insert_index(self) -> int:
         return max(0, self.msg_layout.count() - 1)
 
@@ -16,12 +23,14 @@ class ChatViewMixin:
         self._stream_row = None
         self._current_stream_text = ""
         self._pending_stream_text = None
+        self._current_turn_user_row = None
         self._rendered_message_rows = []
         while self.msg_layout.count() > 1:
             item = self.msg_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self._sync_message_layout_alignment()
         self._refresh_jump_latest_button()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
@@ -48,9 +57,47 @@ class ChatViewMixin:
         row.set_finished(finished)
         self.msg_layout.insertWidget(self._message_row_insert_index(), row)
         self._rendered_message_rows.append(row)
+        self._sync_message_layout_alignment()
         if auto_scroll:
             self._scroll_to_bottom()
         return row
+
+    def _discard_stream_row(self, row=None):
+        target = row if row is not None else getattr(self, "_stream_row", None)
+        if target is None:
+            return
+        rows = getattr(self, "_rendered_message_rows", None)
+        if isinstance(rows, list):
+            try:
+                rows.remove(target)
+            except ValueError:
+                pass
+        layout = getattr(self, "msg_layout", None)
+        if layout is not None:
+            idx = -1
+            try:
+                idx = layout.indexOf(target)
+            except Exception:
+                idx = -1
+            if idx >= 0:
+                item = layout.takeAt(idx)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            else:
+                try:
+                    target.deleteLater()
+                except Exception:
+                    pass
+        else:
+            try:
+                target.deleteLater()
+            except Exception:
+                pass
+        if getattr(self, "_stream_row", None) is target:
+            self._stream_row = None
+        self._sync_message_layout_alignment()
+        self._refresh_jump_latest_button()
 
     def _regenerate_from_row(self, row):
         if getattr(self, "_busy", False):
@@ -260,7 +307,7 @@ class ChatViewMixin:
         self._user_scrolled_up = value < bar.maximum() - 40
         self._refresh_jump_latest_button()
 
-    def _scroll_row_to_top(self, row, *, top_margin: int = 18):
+    def _scroll_row_to_top(self, row, *, top_margin: int = 18, preserve_scroll_state: bool = False):
         if row is None:
             return
 
@@ -269,6 +316,8 @@ class ChatViewMixin:
                 bar = self.scroll.verticalScrollBar()
                 target_y = max(0, row.y() - int(top_margin or 0))
                 bar.setValue(min(target_y, bar.maximum()))
+                if preserve_scroll_state:
+                    self._user_scrolled_up = False
             finally:
                 self._refresh_jump_latest_button()
 
@@ -280,14 +329,33 @@ class ChatViewMixin:
                 return row
         return None
 
+    def _set_current_turn_user_row(self, row):
+        self._current_turn_user_row = row
+
+    def _clear_current_turn_user_row(self, row=None):
+        current = getattr(self, "_current_turn_user_row", None)
+        if row is None or current is row:
+            self._current_turn_user_row = None
+
+    def _tracked_current_turn_user_row(self):
+        row = getattr(self, "_current_turn_user_row", None)
+        if row is None:
+            return None
+        if row in (getattr(self, "_rendered_message_rows", None) or []):
+            return row
+        self._current_turn_user_row = None
+        return None
+
     def _set_follow_latest_user(self, enabled: bool):
         self._follow_latest_user_message = bool(enabled)
 
     def _sync_current_turn_view(self, *, force: bool = False):
         if getattr(self, "_follow_latest_user_message", False):
-            latest_user_row = self._latest_user_row()
-            if latest_user_row is not None:
-                self._scroll_row_to_top(latest_user_row)
+            target_user_row = self._tracked_current_turn_user_row()
+            if target_user_row is None:
+                target_user_row = self._latest_user_row()
+            if target_user_row is not None:
+                self._scroll_row_to_top(target_user_row, preserve_scroll_state=True)
                 self._set_follow_latest_user(False)
                 return
             self._set_follow_latest_user(False)

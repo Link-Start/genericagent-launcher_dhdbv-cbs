@@ -17,6 +17,7 @@ from launcher_app import window as launcher_window
 from launcher_core_parts import constants
 from launcher_core_parts import model_api, runtime
 from qt_chat_parts import api_editor
+from qt_chat_parts import common as chat_common
 from qt_chat_parts import bridge_runtime
 from qt_chat_parts.api_editor import ApiEditorMixin
 from qt_chat_parts.bridge_runtime import BridgeRuntimeMixin
@@ -24,6 +25,7 @@ from qt_chat_parts import channel_runtime
 from qt_chat_parts import personal_usage
 from qt_chat_parts import schedule_runtime
 from qt_chat_parts import settings_panel
+from qt_chat_parts import navigation
 from qt_chat_parts import sidebar_sessions
 from qt_chat_parts.downloads import DownloadMixin
 from qt_chat_parts.navigation import NavigationMixin
@@ -219,28 +221,28 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             "assets": [
                 {"name": "GenericAgentLauncher-Setup-1.2.4.exe", "browser_download_url": "https://example.com/Setup.exe"},
                 {
-                    "name": "GenericAgentLauncher-macos-1.2.4.dmg",
-                    "browser_download_url": "https://example.com/GenericAgentLauncher-macos-1.2.4.dmg",
+                    "name": "GenericAgentLauncher-macos-arm64-1.2.4.dmg",
+                    "browser_download_url": "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.dmg",
                 },
                 {
-                    "name": "GenericAgentLauncher-macos-1.2.4.sha256",
-                    "browser_download_url": "https://example.com/GenericAgentLauncher-macos-1.2.4.sha256",
+                    "name": "GenericAgentLauncher-macos-arm64-1.2.4.sha256",
+                    "browser_download_url": "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.sha256",
                 },
-                {"name": "README-macOS.txt", "browser_download_url": "https://example.com/README-macOS.txt"},
-                {"name": "install-metadata.json", "browser_download_url": "https://example.com/install-metadata.json"},
+                {"name": "README-macOS-arm64.txt", "browser_download_url": "https://example.com/README-macOS-arm64.txt"},
+                {"name": "install-metadata-arm64.json", "browser_download_url": "https://example.com/install-metadata-arm64.json"},
             ],
         }
         dummy = DummyUsage()
-        with mock.patch.object(personal_usage.lz, "IS_MACOS", True):
+        with mock.patch.object(personal_usage.lz, "IS_MACOS", True), mock.patch.object(personal_usage.platform, "machine", return_value="arm64"):
             info = dummy._build_launcher_external_update_info(release, local_version="1.2.3")
 
         self.assertIsInstance(info, dict)
         self.assertEqual(info["install_mode"], "external")
-        self.assertEqual(info["external_asset_name"], "GenericAgentLauncher-macos-1.2.4.dmg")
-        self.assertEqual(info["external_url"], "https://example.com/GenericAgentLauncher-macos-1.2.4.dmg")
-        self.assertEqual(info["readme_url"], "https://example.com/README-macOS.txt")
-        self.assertEqual(info["sha256_url"], "https://example.com/GenericAgentLauncher-macos-1.2.4.sha256")
-        self.assertEqual(info["metadata_url"], "https://example.com/install-metadata.json")
+        self.assertEqual(info["external_asset_name"], "GenericAgentLauncher-macos-arm64-1.2.4.dmg")
+        self.assertEqual(info["external_url"], "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.dmg")
+        self.assertEqual(info["readme_url"], "https://example.com/README-macOS-arm64.txt")
+        self.assertEqual(info["sha256_url"], "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.sha256")
+        self.assertEqual(info["metadata_url"], "https://example.com/install-metadata-arm64.json")
 
     def test_set_agent_dir_triggers_scheduler_autostart_for_valid_agent(self):
         class DummyList:
@@ -330,7 +332,106 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(_args[3], "All Files (*)")
         dummy.locate_python_edit.setText.assert_called_once_with("/usr/local/bin/python3")
 
-    def test_notify_reply_done_falls_back_to_status_on_macos_without_tray(self):
+    def test_bridge_build_multimodal_user_content_supports_image_only_send(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(b"\x89PNG\r\n\x1a\nlauncher-image")
+            image_path = tmp.name
+        self.addCleanup(lambda: os.path.exists(image_path) and os.remove(image_path))
+
+        content = bridge._build_multimodal_user_content("", [image_path])
+        content_with_text = bridge._build_multimodal_user_content("hello", [image_path])
+
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn("请结合图片内容回答", content[0]["text"])
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertIn("data:image/png;base64,", content[1]["image_url"]["url"])
+        self.assertEqual(content_with_text[0], {"type": "text", "text": "hello"})
+
+    def test_bridge_scrub_last_user_history_replaces_image_rich_content_with_text_only_content(self):
+        class DummyBackend:
+            def __init__(self):
+                self.history = [
+                    {"role": "user", "content": [{"type": "text", "text": "older"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        ],
+                    },
+                ]
+
+        class DummyClient:
+            def __init__(self):
+                self.backend = DummyBackend()
+
+        client = DummyClient()
+        replaced = bridge._scrub_last_user_history(client, [{"type": "text", "text": "hello"}], start_len=2)
+
+        self.assertTrue(replaced)
+        self.assertEqual(client.backend.history[-1], {"role": "user", "content": [{"type": "text", "text": "hello"}]})
+
+    def test_bridge_scrub_last_user_history_only_replaces_current_turn_image_message(self):
+        class DummyBackend:
+            def __init__(self):
+                self.history = [
+                    {"role": "user", "content": [{"type": "text", "text": "older"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "older reply"}]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "done"}],
+                    },
+                ]
+
+        class DummyClient:
+            def __init__(self):
+                self.backend = DummyBackend()
+
+        client = DummyClient()
+        replaced = bridge._scrub_last_user_history(client, [{"type": "text", "text": "look"}], start_len=2)
+
+        self.assertTrue(replaced)
+        self.assertEqual(client.backend.history[2]["content"], [{"type": "text", "text": "look"}])
+        self.assertEqual(
+            client.backend.history[3]["content"],
+            [{"type": "tool_result", "tool_use_id": "call_1", "content": "done"}],
+        )
+
+    def test_bridge_scrub_last_user_history_uses_image_only_placeholder(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(b"fake-image-bytes")
+            image_path = tmp.name
+        self.addCleanup(lambda: os.path.exists(image_path) and os.remove(image_path))
+
+        class DummyBackend:
+            def __init__(self):
+                self.history = [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "用户发送了 1 张图片\n[用户上传图片附件]\ndata:image/png;base64,AAAA"}],
+                    }
+                ]
+
+        class DummyClient:
+            def __init__(self):
+                self.backend = DummyBackend()
+
+        client = DummyClient()
+        replacement = bridge._build_scrubbed_user_content("", [image_path])
+        replaced = bridge._scrub_last_user_history(client, replacement, start_len=0)
+
+        self.assertTrue(replaced)
+        self.assertEqual(client.backend.history[0]["content"], [{"type": "text", "text": "[用户发送了 1 张图片]"}])
+
+    def test_notify_reply_done_prefers_launcher_tray_icon(self):
         class DummyBridge(BridgeRuntimeMixin):
             _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
 
@@ -338,80 +439,172 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 self.cfg = {}
                 self.statuses = []
                 self.sound_calls = 0
+                self.launcher_tray_calls = 0
+                self.reply_tray_calls = 0
 
             def _play_reply_done_sound(self):
                 self.sound_calls += 1
 
+            def _ensure_launcher_tray_icon(self):
+                self.launcher_tray_calls += 1
+                return tray
+
             def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
                 return None
 
             def _set_status(self, text):
                 self.statuses.append(str(text))
 
+        tray = mock.Mock()
         dummy = DummyBridge()
-        with mock.patch.object(bridge_runtime.lz, "IS_MACOS", True):
-            dummy._notify_reply_done("hello\nworld")
-
-        self.assertEqual(dummy.sound_calls, 1)
-        self.assertEqual(dummy.statuses, ["AI 回复已完成：hello world"])
-
-    def test_notify_reply_done_without_tray_keeps_windows_path_unchanged(self):
-        class DummyBridge(BridgeRuntimeMixin):
-            _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
-
-            def __init__(self):
-                self.cfg = {}
-                self.statuses = []
-                self.sound_calls = 0
-
-            def _play_reply_done_sound(self):
-                self.sound_calls += 1
-
-            def _ensure_reply_notify_tray(self):
-                return None
-
-            def _set_status(self, text):
-                self.statuses.append(str(text))
-
-        dummy = DummyBridge()
-        with mock.patch.object(bridge_runtime.lz, "IS_MACOS", False):
-            dummy._notify_reply_done("windows stays silent")
+        dummy._notify_reply_done("hello\nworld")
 
         self.assertEqual(dummy.sound_calls, 1)
         self.assertEqual(dummy.statuses, [])
+        self.assertEqual(dummy.launcher_tray_calls, 1)
+        self.assertEqual(dummy.reply_tray_calls, 0)
+        tray.show.assert_called_once()
+        tray.showMessage.assert_called_once()
+        args = tray.showMessage.call_args.args
+        self.assertEqual(args[0], "GenericAgent 启动器")
+        self.assertEqual(args[1], "AI 回复已完成：hello world")
 
-    def test_notify_reply_done_skips_status_when_message_notification_disabled(self):
+    def test_notify_reply_done_falls_back_to_reply_notify_tray(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
+
+            def __init__(self):
+                self.cfg = {}
+                self.statuses = []
+                self.sound_calls = 0
+                self.launcher_tray_calls = 0
+                self.reply_tray_calls = 0
+
+            def _play_reply_done_sound(self):
+                self.sound_calls += 1
+
+            def _ensure_launcher_tray_icon(self):
+                self.launcher_tray_calls += 1
+                return None
+
+            def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
+                return tray
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        tray = mock.Mock()
+        dummy = DummyBridge()
+        dummy._notify_reply_done("tray preview")
+
+        self.assertEqual(dummy.sound_calls, 1)
+        self.assertEqual(dummy.statuses, [])
+        self.assertEqual(dummy.launcher_tray_calls, 1)
+        self.assertEqual(dummy.reply_tray_calls, 1)
+        tray.show.assert_called_once()
+        tray.showMessage.assert_called_once()
+        args = tray.showMessage.call_args.args
+        self.assertEqual(args[0], "GenericAgent 启动器")
+        self.assertEqual(args[1], "AI 回复已完成：tray preview")
+
+    def test_notify_reply_done_skips_system_notification_when_message_disabled(self):
         class DummyBridge(BridgeRuntimeMixin):
             _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
 
             def __init__(self):
                 self.cfg = {"disable_reply_message": True}
-                self.statuses = []
                 self.sound_calls = 0
+                self.launcher_tray_calls = 0
+                self.reply_tray_calls = 0
 
             def _play_reply_done_sound(self):
                 self.sound_calls += 1
 
-            def _ensure_reply_notify_tray(self):
-                return None
+            def _ensure_launcher_tray_icon(self):
+                self.launcher_tray_calls += 1
+                return mock.Mock()
 
-            def _set_status(self, text):
-                self.statuses.append(str(text))
+            def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
+                return mock.Mock()
 
         dummy = DummyBridge()
-        with mock.patch.object(bridge_runtime.lz, "IS_MACOS", True):
-            dummy._notify_reply_done("ignored")
+        dummy._notify_reply_done("ignored")
 
         self.assertEqual(dummy.sound_calls, 1)
-        self.assertEqual(dummy.statuses, [])
+        self.assertEqual(dummy.launcher_tray_calls, 0)
+        self.assertEqual(dummy.reply_tray_calls, 0)
 
-    def test_notify_reply_done_prefers_tray_message_when_available(self):
+    def test_notify_reply_done_without_tray_keeps_sound_independent_on_non_windows(self):
         class DummyBridge(BridgeRuntimeMixin):
             _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
 
             def __init__(self):
                 self.cfg = {}
                 self.statuses = []
+                self.sound_calls = 0
+                self.launcher_tray_calls = 0
+                self.reply_tray_calls = 0
+
+            def _play_reply_done_sound(self):
+                self.sound_calls += 1
+
+            def _ensure_launcher_tray_icon(self):
+                self.launcher_tray_calls += 1
+                return None
+
+            def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
+                return None
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyBridge()
+        with mock.patch.object(bridge_runtime.os, "name", "posix"):
+            dummy._notify_reply_done("windows stays silent")
+
+        self.assertEqual(dummy.sound_calls, 1)
+        self.assertEqual(dummy.statuses, [])
+        self.assertEqual(dummy.launcher_tray_calls, 1)
+        self.assertEqual(dummy.reply_tray_calls, 1)
+
+    def test_notify_reply_done_uses_tray_on_non_windows(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
+
+            def __init__(self):
+                self.cfg = {}
+                self.sound_calls = 0
+                self.reply_tray_calls = 0
+
+            def _play_reply_done_sound(self):
+                self.sound_calls += 1
+
+            def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
+                return tray
+
+        tray = mock.Mock()
+        dummy = DummyBridge()
+        with mock.patch.object(bridge_runtime.os, "name", "posix"):
+            dummy._notify_reply_done("linux tray")
+
+        self.assertEqual(dummy.sound_calls, 1)
+        self.assertEqual(dummy.reply_tray_calls, 1)
+        tray.showMessage.assert_called_once()
+        args = tray.showMessage.call_args.args
+        self.assertEqual(args[0], "GenericAgent 启动器")
+        self.assertEqual(args[1], "AI 回复已完成：linux tray")
+
+    def test_notify_reply_done_stays_nonfatal_when_tray_raises(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
+
+            def __init__(self):
+                self.cfg = {}
                 self.sound_calls = 0
 
             def _play_reply_done_sound(self):
@@ -420,17 +613,226 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _ensure_reply_notify_tray(self):
                 return tray
 
+        tray = mock.Mock()
+        tray.showMessage.side_effect = RuntimeError("tray failed")
+        dummy = DummyBridge()
+        dummy._notify_reply_done("tray failed")
+
+        self.assertEqual(dummy.sound_calls, 1)
+        tray.showMessage.assert_called_once()
+
+    def test_real_qt_chat_window_notify_reply_done_uses_system_notification_path_when_hidden(self):
+        app = launcher_window.QApplication.instance() or launcher_window.QApplication([])
+        win = None
+        with mock.patch.object(launcher_window.lz, "load_config", return_value={}), mock.patch.object(
+            launcher_window.QtChatWindow, "_build_shell", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_session_index_warmup", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_refresh_welcome_state", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_show_welcome", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_local_channel_autostart", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_start_autostart_scheduler", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_lan_interface_autostart", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_startup_update_check", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_startup_install_hint", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+        ):
+            win = launcher_window.QtChatWindow(r"E:\\GenericAgent")
+            win.hide()
+            win._tray_mode_active = True
+            win._drain_timer.stop()
+            win._server_status_timer.stop()
+            win._stream_flush_timer.stop()
+
+            tray = mock.Mock()
+            with mock.patch.object(
+                win, "_play_reply_done_sound", return_value=None
+            ), mock.patch.object(
+                win,
+                "_ensure_launcher_tray_icon",
+                return_value=tray,
+            ), mock.patch.object(
+                win, "_ensure_reply_notify_tray"
+            ) as fallback_tray:
+                win._notify_reply_done("real window self-test")
+                app.processEvents()
+
+            self.assertFalse(win.isVisible())
+            fallback_tray.assert_not_called()
+            tray.show.assert_called_once()
+            tray.showMessage.assert_called_once()
+            args = tray.showMessage.call_args.args
+            self.assertEqual(args[0], "GenericAgent 启动器")
+            self.assertEqual(args[1], "AI 回复已完成：real window self-test")
+            self.assertEqual(getattr(win, "_reply_done_popups", []), [])
+
+        if win is not None:
+            try:
+                app.removeEventFilter(win)
+            except Exception:
+                pass
+            win.deleteLater()
+            app.processEvents()
+
+    def test_stream_done_triggers_reply_notification_once(self):
+        class Button:
+            def __init__(self):
+                self.values = []
+
+            def setEnabled(self, value):
+                self.values.append(bool(value))
+
+        class Row:
+            def __init__(self):
+                self.updates = []
+
+            def update_content(self, text, *, finished):
+                self.updates.append((text, bool(finished)))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+
+            def __init__(self):
+                self._abort_requested = False
+                self._stream_row = Row()
+                self._busy = True
+                self._current_stream_text = ""
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.statuses = []
+                self.notifications = []
+                self.current_session = None
+
             def _set_status(self, text):
                 self.statuses.append(str(text))
 
-        tray = mock.Mock()
-        dummy = DummyBridge()
-        with mock.patch.object(bridge_runtime.lz, "IS_MACOS", True):
-            dummy._notify_reply_done("tray preview")
+            def _refresh_composer_enabled(self):
+                pass
 
-        self.assertEqual(dummy.sound_calls, 1)
-        self.assertEqual(dummy.statuses, [])
-        tray.showMessage.assert_called_once()
+            def _clear_active_turn_attachments(self):
+                pass
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, final_text):
+                self.notifications.append(str(final_text))
+
+        dummy = DummyBridge()
+        row = dummy._stream_row
+        dummy._stream_done("final answer")
+
+        self.assertEqual(row.updates, [("final answer", True)])
+        self.assertEqual(dummy.notifications, ["final answer"])
+        self.assertFalse(dummy._busy)
+        self.assertEqual(dummy.statuses[-1], "已完成。")
+
+    def test_stream_done_skips_reply_notification_after_abort(self):
+        class Button:
+            def setEnabled(self, _value):
+                pass
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+            _format_interrupted_text = BridgeRuntimeMixin._format_interrupted_text
+
+            def __init__(self):
+                self._abort_requested = True
+                self._stream_row = None
+                self._busy = True
+                self._current_stream_text = "partial"
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.notifications = []
+                self.current_session = None
+
+            def _set_status(self, _text):
+                pass
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _clear_active_turn_attachments(self):
+                pass
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, final_text):
+                self.notifications.append(str(final_text))
+
+        dummy = DummyBridge()
+        dummy._stream_done("")
+
+        self.assertEqual(dummy.notifications, [])
+        self.assertFalse(dummy._abort_requested)
+
+    def test_stream_done_clears_active_turn_attachments(self):
+        class Button:
+            def setEnabled(self, _value):
+                pass
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+            _clear_active_turn_attachments = BridgeRuntimeMixin._clear_active_turn_attachments
+            _active_turn_attachments = BridgeRuntimeMixin._active_turn_attachments
+
+            def __init__(self):
+                self._abort_requested = False
+                self._stream_row = None
+                self._busy = True
+                self._current_stream_text = ""
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.current_session = None
+                self._active_turn_attachments_data = [{"path": "done.png", "name": "done", "owned": True}]
+                self.released = []
+                self.anchor_clear_calls = 0
+
+            def _set_status(self, _text):
+                pass
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _release_attachment_files(self, items):
+                self.released = [dict(item) for item in list(items or [])]
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, _final_text):
+                pass
+
+            def _clear_current_turn_user_row(self):
+                self.anchor_clear_calls += 1
+
+        dummy = DummyBridge()
+        dummy._stream_done("done")
+
+        self.assertEqual(dummy._active_turn_attachments_data, [])
+        self.assertEqual(dummy.released, [{"path": "done.png", "name": "done", "owned": True}])
+        self.assertEqual(dummy.anchor_clear_calls, 1)
 
     def test_bridge_runtime_state_helpers_explain_attachment_and_llm_disable_reasons(self):
         class DummyBridge(BridgeRuntimeMixin):
@@ -489,6 +891,20 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(ready_dummy.llm_combo.current_index, 0)
         self.assertTrue(ready_dummy.llm_combo.enabled)
         self.assertEqual(ready_dummy.llm_combo.tooltip, "切换当前会话使用的模型。")
+
+    def test_attachment_bar_display_items_only_use_pending_attachments(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _attachment_bar_display_items = BridgeRuntimeMixin._attachment_bar_display_items
+            _pending_input_attachments = BridgeRuntimeMixin._pending_input_attachments
+
+            def __init__(self):
+                self._pending_input_attachments_data = [{"path": "pending.png", "name": "pending"}]
+                self._active_turn_attachments_data = [{"path": "active.png", "name": "active"}]
+
+        dummy = DummyBridge()
+
+        self.assertEqual(dummy._attachment_bar_display_items(), [{"path": "pending.png", "name": "pending"}])
+        self.assertEqual(dummy._active_turn_attachments_data, [{"path": "active.png", "name": "active"}])
 
     def test_bridge_runtime_sync_reasoning_effort_combo_tracks_runtime_state(self):
         class DummyCombo:
@@ -741,6 +1157,348 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(editor.cleared, 1)
         self.assertEqual(dummy.new_session_calls, [(False, "local", "local", False)])
         info_box.assert_not_called()
+
+    def test_submit_user_message_sends_images_and_clears_input_attachment_display_state(self):
+        class DummyEditor:
+            def __init__(self, text="hello"):
+                self.text = str(text)
+                self.cleared = 0
+
+            def clear(self):
+                self.text = ""
+                self.cleared += 1
+
+        class DummyButton:
+            def __init__(self):
+                self.values = []
+
+            def setEnabled(self, value):
+                self.values.append(bool(value))
+
+        class DummyRow:
+            def __init__(self, role, text, finished, auto_scroll):
+                self.role = str(role)
+                self.text = str(text)
+                self.finished = bool(finished)
+                self.auto_scroll = bool(auto_scroll)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _submit_user_message = BridgeRuntimeMixin._submit_user_message
+            _attachment_bar_display_items = BridgeRuntimeMixin._attachment_bar_display_items
+            _pending_input_attachments = BridgeRuntimeMixin._pending_input_attachments
+
+            def __init__(self):
+                self.current_session = {"id": "sess-1", "bubbles": [], "channel_id": "launcher"}
+                self._pending_input_attachments_data = []
+                self._active_turn_attachments_data = []
+                self._current_turn_user_row = None
+                self._busy = False
+                self._abort_requested = False
+                self._bridge_ready = True
+                self.send_btn = DummyButton()
+                self.stop_btn = DummyButton()
+                self.sent = []
+                self.statuses = []
+                self.rows = []
+                self.scroll_calls = []
+                self.persisted = []
+                self.token_updates = []
+                self.attachment_refreshes = 0
+                self.floating_refreshes = 0
+
+            def _handle_local_slash_command(self, *_args, **_kwargs):
+                return False
+
+            def _is_channel_process_session(self):
+                return False
+
+            def _is_remote_session(self, _session=None):
+                return False
+
+            def _ensure_session(self, text):
+                self.ensured_text = str(text)
+
+            def _add_message_row(self, role, text, *, finished, auto_scroll):
+                row = DummyRow(role, text, finished, auto_scroll)
+                self.rows.append(row)
+                return row
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _persist_session(self, session):
+                self.persisted.append(dict(session))
+
+            def _refresh_token_label(self):
+                pass
+
+            def _update_stream_row_tokens(self, *, live):
+                self.token_updates.append(bool(live))
+
+            def _current_llm_name(self):
+                return "test-llm"
+
+            def _send_cmd(self, obj):
+                self.sent.append(dict(obj))
+
+            def _scroll_row_to_top(self, row, preserve_scroll_state=False):
+                self.scroll_calls.append((row.role, bool(preserve_scroll_state)))
+
+            def _refresh_input_attachment_bar(self):
+                self.attachment_refreshes += 1
+
+            def _refresh_floating_chat_window(self):
+                self.floating_refreshes += 1
+
+            def _set_current_turn_user_row(self, row):
+                self._current_turn_user_row = row
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            attachment_path = tmp.name
+        self.addCleanup(lambda: os.path.exists(attachment_path) and os.remove(attachment_path))
+
+        attachment = {"path": attachment_path, "name": "demo.png", "owned": False}
+        dummy = DummyBridge()
+        dummy._pending_input_attachments_data = [dict(attachment)]
+        editor = DummyEditor("hello")
+
+        result = dummy._submit_user_message("hello", attachments=[dict(attachment)], source_editor=editor)
+
+        self.assertTrue(result)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.sent, [{"cmd": "send", "text": "hello", "images": [attachment_path], "session_id": "sess-1"}])
+        self.assertEqual(dummy._pending_input_attachments_data, [])
+        self.assertEqual(dummy._active_turn_attachments_data, [attachment])
+        self.assertEqual(dummy._attachment_bar_display_items(), [])
+        self.assertEqual(dummy.attachment_refreshes, 1)
+        self.assertEqual(dummy.floating_refreshes, 1)
+        self.assertEqual(dummy.scroll_calls, [("user", True)])
+        self.assertIs(dummy._current_turn_user_row, dummy.rows[0])
+
+    def test_submit_user_message_with_images_only_keeps_current_turn_anchor(self):
+        class DummyEditor:
+            def __init__(self, text=""):
+                self.text = str(text)
+                self.cleared = 0
+
+            def clear(self):
+                self.text = ""
+                self.cleared += 1
+
+        class DummyButton:
+            def __init__(self):
+                self.values = []
+
+            def setEnabled(self, value):
+                self.values.append(bool(value))
+
+        class DummyRow:
+            def __init__(self, role, text, finished, auto_scroll):
+                self.role = str(role)
+                self.text = str(text)
+                self.finished = bool(finished)
+                self.auto_scroll = bool(auto_scroll)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _submit_user_message = BridgeRuntimeMixin._submit_user_message
+            _attachment_bar_display_items = BridgeRuntimeMixin._attachment_bar_display_items
+            _pending_input_attachments = BridgeRuntimeMixin._pending_input_attachments
+
+            def __init__(self):
+                self.current_session = {"id": "sess-1", "bubbles": [], "channel_id": "launcher"}
+                self._pending_input_attachments_data = []
+                self._active_turn_attachments_data = []
+                self._current_turn_user_row = None
+                self._busy = False
+                self._abort_requested = False
+                self._bridge_ready = True
+                self.send_btn = DummyButton()
+                self.stop_btn = DummyButton()
+                self.sent = []
+                self.rows = []
+                self.scroll_calls = []
+                self.attachment_refreshes = 0
+
+            def _handle_local_slash_command(self, *_args, **_kwargs):
+                return False
+
+            def _is_channel_process_session(self):
+                return False
+
+            def _is_remote_session(self, _session=None):
+                return False
+
+            def _ensure_session(self, _text):
+                return None
+
+            def _add_message_row(self, role, text, *, finished, auto_scroll):
+                row = DummyRow(role, text, finished, auto_scroll)
+                self.rows.append(row)
+                return row
+
+            def _set_status(self, _text):
+                return None
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _persist_session(self, _session):
+                return None
+
+            def _refresh_token_label(self):
+                return None
+
+            def _update_stream_row_tokens(self, *, live):
+                return None
+
+            def _current_llm_name(self):
+                return "test-llm"
+
+            def _send_cmd(self, obj):
+                self.sent.append(dict(obj))
+
+            def _scroll_row_to_top(self, row, preserve_scroll_state=False):
+                self.scroll_calls.append((row.role, bool(preserve_scroll_state)))
+
+            def _refresh_input_attachment_bar(self):
+                self.attachment_refreshes += 1
+
+            def _set_current_turn_user_row(self, row):
+                self._current_turn_user_row = row
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            attachment_path = tmp.name
+        self.addCleanup(lambda: os.path.exists(attachment_path) and os.remove(attachment_path))
+
+        attachment = {"path": attachment_path, "name": "demo.png", "owned": False}
+        dummy = DummyBridge()
+        dummy._pending_input_attachments_data = [dict(attachment)]
+        editor = DummyEditor("")
+
+        result = dummy._submit_user_message("", attachments=[dict(attachment)], source_editor=editor)
+
+        self.assertTrue(result)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.sent, [{"cmd": "send", "text": "", "images": [attachment_path], "session_id": "sess-1"}])
+        self.assertEqual(dummy.current_session["bubbles"][-1]["text"], "[已发送 1 张图片]")
+        self.assertEqual(dummy._attachment_bar_display_items(), [])
+        self.assertEqual(dummy.attachment_refreshes, 1)
+        self.assertEqual(dummy.scroll_calls, [("user", True)])
+        self.assertIs(dummy._current_turn_user_row, dummy.rows[0])
+
+    def test_remote_exec_chat_turn_sends_uploaded_remote_image_paths(self):
+        class DummyStdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8", errors="replace")
+                self.writes.append(str(data))
+
+            def flush(self):
+                return None
+
+        class DummyChannel:
+            def __init__(self, owner):
+                self._owner = owner
+
+            def settimeout(self, _value):
+                return None
+
+            def exit_status_ready(self):
+                return bool(getattr(self._owner, "done", False))
+
+        class DummyStdout:
+            def __init__(self, lines):
+                self._lines = [str(line) + "\n" for line in lines]
+                self.done = False
+                self.channel = DummyChannel(self)
+
+            def __iter__(self):
+                for line in self._lines:
+                    yield line
+                self.done = True
+
+        class DummyStderr:
+            def __iter__(self):
+                return iter(())
+
+        class DummyClient:
+            def __init__(self, stdin, stdout, stderr):
+                self.stdin = stdin
+                self.stdout = stdout
+                self.stderr = stderr
+                self.closed = False
+
+            def exec_command(self, *_args, **_kwargs):
+                return self.stdin, self.stdout, self.stderr
+
+            def close(self):
+                self.closed = True
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _remote_exec_chat_turn = BridgeRuntimeMixin._remote_exec_chat_turn
+            _remote_parse_bridge_event_text = BridgeRuntimeMixin._remote_parse_bridge_event_text
+
+            def __init__(self, client):
+                self.client = client
+                self.cleaned = []
+                self.emitted = []
+                self.stage_calls = []
+
+            def _remote_device_payload(self, _session):
+                return {"agent_dir": "/srv/agant", "python_cmd": "python3", "username": "root"}, {}
+
+            def _open_vps_ssh_client(self, _payload, timeout=12):
+                return self.client, "", "", False
+
+            def _remote_stage_bridge_runtime(self, _client, _remote_dir):
+                return "/srv/agant/temp/bridge_runtime.py"
+
+            def _remote_stage_chat_images(self, _client, _remote_dir, images):
+                self.stage_calls.append(list(images))
+                return ["/srv/agant/temp/launcher_runtime/chat_uploads/remote-1.png"]
+
+            def _session_reasoning_effort_payload(self, session=None):
+                return False, None
+
+            def _remote_emit_bridge_event(self, ev, *, session_id=""):
+                self.emitted.append((dict(ev), str(session_id or "")))
+
+            def _remote_cleanup_files(self, _client, remote_paths, device=None):
+                self.cleaned.append(list(remote_paths))
+
+        stdin = DummyStdin()
+        stdout = DummyStdout(
+            [
+                json.dumps({"event": "ready"}, ensure_ascii=False),
+                json.dumps({"event": "state_loaded"}, ensure_ascii=False),
+                json.dumps({"event": "done", "text": "ok"}, ensure_ascii=False),
+            ]
+        )
+        client = DummyClient(stdin, stdout, DummyStderr())
+        dummy = DummyBridge(client)
+
+        result = dummy._remote_exec_chat_turn({"id": "sess-remote"}, "hello", ["C:/tmp/demo.png"])
+
+        commands = [
+            json.loads(line)
+            for chunk in stdin.writes
+            for line in str(chunk).splitlines()
+            if str(line).strip()
+        ]
+        send_cmd = next(cmd for cmd in commands if cmd.get("cmd") == "send")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(dummy.stage_calls, [["C:/tmp/demo.png"]])
+        self.assertEqual(send_cmd["text"], "hello")
+        self.assertEqual(send_cmd["images"], ["/srv/agant/temp/launcher_runtime/chat_uploads/remote-1.png"])
+        self.assertEqual(dummy.cleaned, [["/srv/agant/temp/launcher_runtime/chat_uploads/remote-1.png"]])
+        self.assertTrue(client.closed)
 
     def test_local_slash_clear_input_clears_main_and_floating_drafts(self):
         class DummyEditor:
@@ -1468,6 +2226,388 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertTrue(parsed.get("load_failed"))
         self.assertEqual(parsed.get("error"), "SSH 连接失败")
         self.assertEqual(parsed.get("configs"), [])
+
+    def test_settings_target_read_mykey_text_reads_legacy_docker_target_via_direct_ssh_path(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open(self, path, mode):
+                return DummyRemoteFile(self._storage, path, mode)
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open_sftp(self):
+                return DummySFTP(self._storage)
+
+            def close(self):
+                return None
+
+        class DummySettings(SettingsPanelMixin):
+            _settings_target_read_mykey_text = SettingsPanelMixin._settings_target_read_mykey_text
+            _settings_target_ensure_remote_mykey = SettingsPanelMixin._settings_target_ensure_remote_mykey
+            _settings_target_display_path = SettingsPanelMixin._settings_target_display_path
+            _settings_target_remote_agent_dir = SettingsPanelMixin._settings_target_remote_agent_dir
+            _settings_target_remote_stage_dir = SettingsPanelMixin._settings_target_remote_stage_dir
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+                self.commands = []
+                self._device = {
+                    "id": "box-1",
+                    "name": "旧版远端",
+                    "host": "10.0.0.8",
+                    "username": "root",
+                    "agent_mode": "docker",
+                    "remote_mode": "docker_container",
+                    "docker_container": "ga-prod",
+                    "docker_agent_dir": "/opt/agant",
+                    "agent_dir": "/opt/agant",
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device": self._device}
+
+            def _settings_target_open_remote_client(self, device, timeout=10):
+                return DummyClient(self._storage), ""
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, "", ""
+
+        storage = {"/opt/agant/mykey.py": b"host_value = 1\n"}
+        dummy = DummySettings(storage)
+
+        ok, text, display_path, err = dummy._settings_target_read_mykey_text()
+
+        self.assertTrue(ok)
+        self.assertEqual(text, "host_value = 1\n")
+        self.assertEqual(display_path, "/opt/agant/mykey.py")
+        self.assertEqual(err, "")
+        self.assertTrue(any("mkdir -p /opt/agant" in cmd for cmd in dummy.commands))
+        self.assertFalse(any("docker " in cmd for cmd in dummy.commands))
+        self.assertEqual(storage["/opt/agant/mykey.py"], b"host_value = 1\n")
+
+    def test_settings_target_write_mykey_text_writes_legacy_docker_target_via_direct_ssh_path(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open(self, path, mode):
+                return DummyRemoteFile(self._storage, path, mode)
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open_sftp(self):
+                return DummySFTP(self._storage)
+
+            def close(self):
+                return None
+
+        class DummySettings(SettingsPanelMixin):
+            _settings_target_write_mykey_text = SettingsPanelMixin._settings_target_write_mykey_text
+            _settings_target_ensure_remote_mykey = SettingsPanelMixin._settings_target_ensure_remote_mykey
+            _settings_target_display_path = SettingsPanelMixin._settings_target_display_path
+            _settings_target_remote_agent_dir = SettingsPanelMixin._settings_target_remote_agent_dir
+            _settings_target_remote_stage_dir = SettingsPanelMixin._settings_target_remote_stage_dir
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+                self.commands = []
+                self._device = {
+                    "id": "box-1",
+                    "name": "旧版远端",
+                    "host": "10.0.0.8",
+                    "username": "root",
+                    "agent_mode": "docker",
+                    "remote_mode": "docker_container",
+                    "docker_container": "ga-prod",
+                    "docker_agent_dir": "/opt/agant",
+                    "agent_dir": "/opt/agant",
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device": self._device}
+
+            def _settings_target_open_remote_client(self, device, timeout=10):
+                return DummyClient(self._storage), ""
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                text = str(cmd)
+                self.commands.append(text)
+                if text.startswith("mv -f "):
+                    for path in list(self._storage):
+                        if path.startswith("/opt/agant/mykey.py.tmp."):
+                            self._storage["/opt/agant/mykey.py"] = self._storage.pop(path)
+                            break
+                return 0, "", ""
+
+        storage = {}
+        dummy = DummySettings(storage)
+
+        ok, display_path, err = dummy._settings_target_write_mykey_text("docker_write = 1\n")
+
+        self.assertTrue(ok)
+        self.assertEqual(display_path, "/opt/agant/mykey.py")
+        self.assertEqual(err, "")
+        staged_files = [path for path in storage if path.startswith("/opt/agant/mykey.py.tmp.")]
+        self.assertEqual(staged_files, [])
+        self.assertEqual(storage["/opt/agant/mykey.py"], b"docker_write = 1\n")
+        self.assertTrue(any("mv -f " in cmd and "/opt/agant/mykey.py.tmp." in cmd and "/opt/agant/mykey.py" in cmd for cmd in dummy.commands))
+        self.assertFalse(any("docker " in cmd for cmd in dummy.commands))
+
+    def test_settings_target_write_mykey_text_surfaces_move_failure_for_legacy_docker_target_after_ssh_normalization(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open(self, path, mode):
+                return DummyRemoteFile(self._storage, path, mode)
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._storage = storage
+
+            def open_sftp(self):
+                return DummySFTP(self._storage)
+
+            def close(self):
+                return None
+
+        class DummySettings(SettingsPanelMixin):
+            _settings_target_write_mykey_text = SettingsPanelMixin._settings_target_write_mykey_text
+            _settings_target_ensure_remote_mykey = SettingsPanelMixin._settings_target_ensure_remote_mykey
+            _settings_target_display_path = SettingsPanelMixin._settings_target_display_path
+            _settings_target_remote_agent_dir = SettingsPanelMixin._settings_target_remote_agent_dir
+            _settings_target_remote_stage_dir = SettingsPanelMixin._settings_target_remote_stage_dir
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+                self.commands = []
+                self._device = {
+                    "id": "box-1",
+                    "name": "旧版远端",
+                    "host": "10.0.0.8",
+                    "username": "root",
+                    "agent_mode": "docker",
+                    "remote_mode": "docker_container",
+                    "docker_container": "ga-prod",
+                    "docker_agent_dir": "/opt/agant",
+                    "agent_dir": "/opt/agant",
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device": self._device}
+
+            def _settings_target_open_remote_client(self, device, timeout=10):
+                return DummyClient(self._storage), ""
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                text = str(cmd)
+                self.commands.append(text)
+                if text.startswith("mv -f "):
+                    return 1, "", "remote mv failed"
+                return 0, "", ""
+
+        storage = {}
+        dummy = DummySettings(storage)
+
+        ok, display_path, err = dummy._settings_target_write_mykey_text("docker_write = 1\n")
+
+        self.assertFalse(ok)
+        self.assertEqual(display_path, "/opt/agant/mykey.py")
+        self.assertEqual(err, "remote mv failed")
+        self.assertTrue(any(path.startswith("/opt/agant/mykey.py.tmp.") for path in storage))
+        self.assertTrue(any("mv -f " in cmd and "/opt/agant/mykey.py.tmp." in cmd for cmd in dummy.commands))
+        self.assertFalse(any("docker " in cmd for cmd in dummy.commands))
+
+    def test_settings_target_remote_mykey_host_mode_keeps_direct_sftp_behavior(self):
+        class DummyRemoteFile:
+            def __init__(self, storage, path, mode):
+                self._storage = storage
+                self._path = path
+                self._mode = mode
+                if "r" in mode:
+                    self._buffer = io.BytesIO(storage[path])
+                else:
+                    self._buffer = io.BytesIO()
+
+            def read(self):
+                return self._buffer.read()
+
+            def write(self, data):
+                return self._buffer.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if "w" in self._mode and exc_type is None:
+                    self._storage[self._path] = self._buffer.getvalue()
+                self._buffer.close()
+                return False
+
+        class DummySFTP:
+            def __init__(self, storage):
+                self._storage = storage
+                self.opened = []
+
+            def open(self, path, mode):
+                self.opened.append((path, mode))
+                return DummyRemoteFile(self._storage, path, mode)
+
+            def close(self):
+                return None
+
+        class DummyClient:
+            def __init__(self, storage):
+                self._sftp = DummySFTP(storage)
+
+            def open_sftp(self):
+                return self._sftp
+
+            def close(self):
+                return None
+
+        class DummySettings(SettingsPanelMixin):
+            _settings_target_read_mykey_text = SettingsPanelMixin._settings_target_read_mykey_text
+            _settings_target_write_mykey_text = SettingsPanelMixin._settings_target_write_mykey_text
+            _settings_target_ensure_remote_mykey = SettingsPanelMixin._settings_target_ensure_remote_mykey
+            _settings_target_display_path = SettingsPanelMixin._settings_target_display_path
+            _settings_target_remote_agent_dir = SettingsPanelMixin._settings_target_remote_agent_dir
+            _settings_target_remote_stage_dir = SettingsPanelMixin._settings_target_remote_stage_dir
+
+            def __init__(self, storage):
+                self.agent_dir = "C:\\demo"
+                self._storage = storage
+                self.commands = []
+                self.client = DummyClient(storage)
+                self._device = {
+                    "id": "box-ssh",
+                    "name": "SSH 远端",
+                    "host": "10.0.0.9",
+                    "username": "root",
+                    "remote_mode": "ssh",
+                    "agent_dir": "/srv/agant",
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device": self._device}
+
+            def _settings_target_open_remote_client(self, device, timeout=10):
+                return self.client, ""
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, "", ""
+
+        storage = {"/srv/agant/mykey.py": b"host_value = 1\n"}
+        dummy = DummySettings(storage)
+
+        ok, text, display_path, err = dummy._settings_target_read_mykey_text()
+        self.assertTrue(ok)
+        self.assertEqual(text, "host_value = 1\n")
+        self.assertEqual(display_path, "/srv/agant/mykey.py")
+        self.assertEqual(err, "")
+
+        ok, display_path, err = dummy._settings_target_write_mykey_text("host_write = 2\n")
+        self.assertTrue(ok)
+        self.assertEqual(display_path, "/srv/agant/mykey.py")
+        self.assertEqual(err, "")
+        self.assertTrue(any(path == "/srv/agant/mykey.py" and mode == "rb" for path, mode in dummy.client._sftp.opened))
+        self.assertTrue(any(path.startswith("/srv/agant/mykey.py.tmp.") and mode == "wb" for path, mode in dummy.client._sftp.opened))
+        self.assertFalse(any("docker " in cmd for cmd in dummy.commands))
 
     def test_schedule_run_remote_job_drops_stale_context_before_success_callback(self):
         class DummyNotice:
@@ -2422,12 +3562,132 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         )
 
         result = mock.Mock(returncode=0, stdout=fake_output, stderr="")
+        realpath_map = {
+            "/tmp/GenericAgent": "/private/tmp/GenericAgent",
+            "/proc/101/cwd": "/other/place",
+            "/proc/202/cwd": "/private/tmp/GenericAgent",
+            "/proc/303/cwd": "/somewhere",
+        }
         with mock.patch.object(channel_runtime.os, "name", "posix"), mock.patch.object(
             channel_runtime.subprocess, "run", return_value=result
-        ):
+        ), mock.patch.object(channel_runtime.os.path, "realpath", side_effect=lambda path: realpath_map.get(path, path)):
             pids = dummy._find_local_wechat_process_pids()
 
         self.assertEqual(pids, [101, 202])
+
+    def test_iter_local_channel_processes_windows_falls_back_to_wmic_when_cim_has_no_cmdline(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _iter_local_channel_processes = ChannelRuntimeMixin._iter_local_channel_processes
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._channel_procs = {}
+
+        dummy = DummyChannel()
+        wmic_fallback_output = "\n".join(
+            [
+                "12345\tpython -u frontends/tgapp.py",
+                "23456\tpython -m frontends.tgapp",
+            ]
+        )
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args or []))
+            return mock.Mock(returncode=0, stdout=wmic_fallback_output, stderr="")
+
+        with mock.patch.object(channel_runtime.os, "name", "nt"), mock.patch.object(
+            channel_runtime.subprocess,
+            "run",
+            side_effect=fake_run,
+        ):
+            rows = dummy._iter_local_channel_processes()
+
+        self.assertEqual([row["pid"] for row in rows], [12345, 23456])
+        self.assertTrue(any("tgapp.py" in str(row.get("norm_cmd") or "") for row in rows))
+        ps_cmd = " ".join(calls[0]) if calls else ""
+        self.assertIn("powershell", ps_cmd.lower())
+        self.assertIn("wmic", ps_cmd.lower())
+
+    def test_common_process_matcher_accepts_relative_script_when_realpaths_point_to_same_agent_dir(self):
+        self.assertTrue(
+            chat_common.process_cmdline_matches_agent_script(
+                "python3 frontends/wechatapp.py",
+                agent_dir="/tmp/GenericAgent",
+                script_rel="frontends/wechatapp.py",
+                cwd="/private/tmp/GenericAgent",
+                agent_dir_real="/private/tmp/GenericAgent",
+                cwd_real="/private/tmp/GenericAgent",
+            )
+        )
+        self.assertFalse(
+            chat_common.process_cmdline_matches_agent_script(
+                "python3 frontends/wechatapp.py",
+                agent_dir="/tmp/GenericAgent",
+                script_rel="frontends/wechatapp.py",
+                cwd="/srv/other-agent",
+                agent_dir_real="/private/tmp/GenericAgent",
+                cwd_real="/srv/other-agent",
+            )
+        )
+
+    def test_common_process_matcher_accepts_python_module_invocation(self):
+        self.assertTrue(
+            chat_common.process_cmdline_matches_agent_script(
+                "python3 -m frontends.wechatapp",
+                agent_dir="/tmp/GenericAgent",
+                script_rel="frontends/wechatapp.py",
+                cwd="/private/tmp/GenericAgent",
+                agent_dir_real="/private/tmp/GenericAgent",
+                cwd_real="/private/tmp/GenericAgent",
+            )
+        )
+
+    def test_channel_runtime_detects_local_external_processes_for_multiple_channels(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _local_channel_external_pids = ChannelRuntimeMixin._local_channel_external_pids
+
+            def __init__(self):
+                self.agent_dir = "/tmp/GenericAgent"
+                self.cfg = {}
+                self._channel_procs = {"wechat": {"proc": mock.Mock(pid=101)}}
+
+            def _iter_local_channel_processes(self):
+                return [
+                    {
+                        "pid": 101,
+                        "cmdline": "python3 frontends/wechatapp.py",
+                        "norm_cmd": "python3 frontends/wechatapp.py",
+                        "cwd": "/private/tmp/GenericAgent",
+                        "cwd_real": "/private/tmp/GenericAgent",
+                    },
+                    {
+                        "pid": 202,
+                        "cmdline": "python3 -m frontends.telegramapp",
+                        "norm_cmd": "python3 -m frontends.telegramapp",
+                        "cwd": "/private/tmp/GenericAgent",
+                        "cwd_real": "/private/tmp/GenericAgent",
+                    },
+                    {
+                        "pid": 303,
+                        "cmdline": "python3 /srv/other/frontends/wechatapp.py",
+                        "norm_cmd": "python3 /srv/other/frontends/wechatapp.py",
+                        "cwd": "/srv/other",
+                        "cwd_real": "/srv/other",
+                    },
+                ]
+
+        dummy = DummyChannel()
+        specs = [
+            {"id": "wechat", "script": "wechatapp.py"},
+            {"id": "telegram", "script": "telegramapp.py"},
+        ]
+        with mock.patch.object(channel_runtime.os, "name", "posix"), mock.patch.object(
+            channel_runtime.os.path, "realpath", side_effect=lambda path: "/private/tmp/GenericAgent" if path == "/tmp/GenericAgent" else path
+        ), mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", specs):
+            detected = dummy._local_channel_external_pids()
+        self.assertEqual(detected, {"telegram": [202]})
 
     def test_channel_runtime_refreshes_wechat_external_running_from_lock_or_process(self):
         class DummyChannel(ChannelRuntimeMixin):
@@ -2437,7 +3697,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 self._channel_procs = {}
 
         dummy = DummyChannel()
-        with mock.patch.object(dummy, "_find_local_wechat_process_pids", return_value=[321]), mock.patch.object(
+        with mock.patch.object(dummy, "_local_channel_external_pids", return_value={"wechat": [321]}), mock.patch.object(
             dummy, "_wechat_singleton_locked", return_value=False
         ):
             self.assertTrue(dummy._refresh_wechat_external_running())
@@ -2612,6 +3872,334 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
         self.assertEqual(dummy.statuses, ["本地微信未绑定，自动启动已跳过；如需启动请先手动扫码绑定。"])
         self.assertEqual(dummy.done_values, [False])
+
+    def test_start_channel_process_lazy_loads_channel_source_before_save(self):
+        class DummyProc:
+            pid = 1234
+
+            def poll(self):
+                return None
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_channel_process = ChannelRuntimeMixin._start_channel_process
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._runtime_context_generation = 1
+                self._channel_procs = {}
+                self._qt_channel_py_path = ""
+                self._qt_channel_parse_error = ""
+                self._qt_channel_configs = []
+                self._qt_channel_passthrough = []
+                self._qt_channel_extras = {}
+                self.calls = []
+                self._remote_context = {"is_remote": False}
+
+            def _channel_target_context(self):
+                return False, None, dict(self._remote_context)
+
+            def _load_channels_source(self):
+                self.calls.append("load_source")
+                return self.agent_dir, "C:\\demo\\channels\\mykey.py", {"error": "", "configs": [], "extras": {}, "passthrough": []}
+
+            def _qt_channels_save(self, silent=False, apply_running=True):
+                self.calls.append(("save", str(self._qt_channel_py_path)))
+                return True
+
+            def _channel_proc_alive(self, channel_id):
+                return False
+
+            def _channel_conflict_message(self, channel_id):
+                return ""
+
+            def _check_runtime_dependencies(self, **kwargs):
+                self.calls.append("deps_ok")
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _channel_log_path(self, channel_id):
+                return "C:\\demo\\temp\\launcher_channels\\telegram.log"
+
+            def _create_channel_process_session(self, channel_id, proc, log_path):
+                return "sess-1"
+
+            def _sync_channel_process_session(self, channel_id, final=False, exit_code=None):
+                self.calls.append(("sync", str(channel_id), bool(final)))
+
+            def _reload_channels_editor_state(self):
+                self.calls.append("reload")
+
+            def _refresh_sessions(self):
+                self.calls.append("refresh_sessions")
+
+        dummy = DummyChannel()
+        dummy_proc = DummyProc()
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_INDEX", {"telegram": {"id": "telegram", "label": "Telegram", "script": "tgapp.py", "fields": []}}), mock.patch.object(
+            channel_runtime.lz, "is_valid_agent_dir", return_value=True
+        ), mock.patch.object(
+            channel_runtime.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            channel_runtime.lz, "_resolve_config_path", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_find_system_python", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_external_subprocess_env", return_value={}
+        ), mock.patch.object(
+            channel_runtime.lz, "_popen_external_subprocess", return_value=dummy_proc
+        ), mock.patch.object(
+            channel_runtime.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+        ), mock.patch(
+            "builtins.open", mock.mock_open()
+        ):
+            ok = dummy._start_channel_process("telegram", show_errors=False)
+
+        self.assertTrue(ok)
+        self.assertIn("load_source", dummy.calls)
+        self.assertIn(("save", "C:\\demo\\channels\\mykey.py"), dummy.calls)
+
+    def test_start_channel_process_telegram_does_not_open_wechat_qr_dialog(self):
+        class DummyProc:
+            pid = 2234
+
+            def poll(self):
+                return None
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_channel_process = ChannelRuntimeMixin._start_channel_process
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._runtime_context_generation = 1
+                self._channel_procs = {}
+                self._qt_channel_py_path = "C:\\demo\\channels\\mykey.py"
+                self._qt_channel_parse_error = ""
+                self._qt_channel_configs = []
+                self._qt_channel_passthrough = []
+                self._qt_channel_extras = {}
+                self.qr_calls = 0
+
+            def _channel_target_context(self):
+                return False, None, {"is_remote": False}
+
+            def _qt_channels_save(self, silent=False, apply_running=True):
+                return True
+
+            def _channel_proc_alive(self, channel_id):
+                return False
+
+            def _stop_channel_process(self, channel_id):
+                raise AssertionError("telegram first start should not attempt restart")
+
+            def _open_wechat_qr_dialog(self, show_errors=True, remote_device=None):
+                self.qr_calls += 1
+                return True
+
+            def _channel_conflict_message(self, channel_id):
+                return ""
+
+            def _check_runtime_dependencies(self, **kwargs):
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _channel_log_path(self, channel_id):
+                return "C:\\demo\\temp\\launcher_channels\\telegram.log"
+
+            def _create_channel_process_session(self, channel_id, proc, log_path):
+                return "sess-telegram"
+
+            def _sync_channel_process_session(self, channel_id, final=False, exit_code=None):
+                return None
+
+            def _reload_channels_editor_state(self):
+                return None
+
+            def _refresh_sessions(self):
+                return None
+
+        dummy = DummyChannel()
+        with mock.patch.object(
+            channel_runtime.lz,
+            "COMM_CHANNEL_INDEX",
+            {"telegram": {"id": "telegram", "label": "Telegram", "script": "tgapp.py", "fields": []}},
+        ), mock.patch.object(
+            channel_runtime.lz, "is_valid_agent_dir", return_value=True
+        ), mock.patch.object(
+            channel_runtime.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            channel_runtime.lz, "_resolve_config_path", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_find_system_python", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_external_subprocess_env", return_value={}
+        ), mock.patch.object(
+            channel_runtime.lz, "_popen_external_subprocess", return_value=DummyProc()
+        ), mock.patch.object(
+            channel_runtime.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+        ), mock.patch(
+            "builtins.open", mock.mock_open()
+        ):
+            ok = dummy._start_channel_process("telegram", show_errors=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(dummy.qr_calls, 0)
+
+    def test_start_channel_process_restarts_managed_local_channel_instead_of_reusing_proc(self):
+        class DummyProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def poll(self):
+                return None
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_channel_process = ChannelRuntimeMixin._start_channel_process
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._runtime_context_generation = 1
+                self._qt_channel_py_path = "C:\\demo\\channels\\mykey.py"
+                self._qt_channel_parse_error = ""
+                self._qt_channel_configs = []
+                self._qt_channel_passthrough = []
+                self._qt_channel_extras = {}
+                self.stop_calls = []
+                self.session_ids = []
+                self._channel_procs = {
+                    "telegram": {
+                        "proc": DummyProc(111),
+                        "log_handle": None,
+                        "log_path": "C:\\demo\\temp\\launcher_channels\\telegram.log",
+                    }
+                }
+
+            def _channel_target_context(self):
+                return False, None, {"is_remote": False}
+
+            def _qt_channels_save(self, silent=False, apply_running=True):
+                return True
+
+            def _channel_proc_alive(self, channel_id):
+                info = self._channel_procs.get(channel_id) or {}
+                proc = info.get("proc")
+                return bool(proc) and proc.poll() is None
+
+            def _stop_channel_process(self, channel_id):
+                info = self._channel_procs.pop(channel_id, None) or {}
+                proc = info.get("proc")
+                self.stop_calls.append(int(getattr(proc, "pid", 0) or 0))
+                return True
+
+            def _channel_conflict_message(self, channel_id):
+                return ""
+
+            def _check_runtime_dependencies(self, **kwargs):
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _channel_log_path(self, channel_id):
+                return "C:\\demo\\temp\\launcher_channels\\telegram.log"
+
+            def _create_channel_process_session(self, channel_id, proc, log_path):
+                self.session_ids.append(int(getattr(proc, "pid", 0) or 0))
+                return f"sess-{proc.pid}"
+
+            def _sync_channel_process_session(self, channel_id, final=False, exit_code=None):
+                return None
+
+            def _reload_channels_editor_state(self):
+                return None
+
+            def _refresh_sessions(self):
+                return None
+
+        dummy = DummyChannel()
+        new_proc = DummyProc(222)
+        with mock.patch.object(
+            channel_runtime.lz,
+            "COMM_CHANNEL_INDEX",
+            {"telegram": {"id": "telegram", "label": "Telegram", "script": "tgapp.py", "fields": []}},
+        ), mock.patch.object(
+            channel_runtime.lz, "is_valid_agent_dir", return_value=True
+        ), mock.patch.object(
+            channel_runtime.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            channel_runtime.lz, "_resolve_config_path", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_find_system_python", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_external_subprocess_env", return_value={}
+        ), mock.patch.object(
+            channel_runtime.lz, "_popen_external_subprocess", return_value=new_proc
+        ) as popen_proc, mock.patch.object(
+            channel_runtime.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+        ), mock.patch(
+            "builtins.open", mock.mock_open()
+        ):
+            ok = dummy._start_channel_process("telegram", show_errors=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(dummy.stop_calls, [111])
+        self.assertEqual(dummy.session_ids, [222])
+        self.assertIs(dummy._channel_procs["telegram"]["proc"], new_proc)
+        popen_proc.assert_called_once()
+
+    def test_qt_channels_save_keeps_existing_extras_when_widgets_not_rendered(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _qt_channels_save = ChannelRuntimeMixin._qt_channels_save
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._qt_channel_py_path = "C:\\demo\\mykey.py"
+                self._qt_channel_configs = []
+                self._qt_channel_passthrough = []
+                self._qt_channel_extras = {
+                    "tg_bot_token": "old_token",
+                    "tg_allowed_users": [1001, 1002],
+                }
+                self._qt_channel_states = {}
+                self.saved_text = ""
+
+            def _settings_target_context(self):
+                return {"is_remote": False}
+
+            def _settings_target_write_mykey_text(self, text):
+                self.saved_text = str(text or "")
+                return True, self._qt_channel_py_path, ""
+
+            def _restart_running_channels(self, show_errors=False):
+                return 0
+
+            def _reload_channels_editor_state(self):
+                return None
+
+        dummy = DummyChannel()
+        specs = [
+            {
+                "id": "telegram",
+                "fields": [
+                    {"key": "tg_bot_token", "kind": "password"},
+                    {"key": "tg_allowed_users", "kind": "list_int"},
+                ],
+            }
+        ]
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", specs), mock.patch.object(channel_runtime.lz, "save_config", return_value=None):
+            ok = dummy._qt_channels_save(silent=True, apply_running=False)
+
+        self.assertTrue(ok)
+        self.assertEqual(dummy._qt_channel_extras.get("tg_bot_token"), "old_token")
+        self.assertEqual(dummy._qt_channel_extras.get("tg_allowed_users"), [1001, 1002])
+        self.assertIn("tg_bot_token = 'old_token'", dummy.saved_text)
+        self.assertIn("tg_allowed_users = [1001, 1002]", dummy.saved_text)
 
     def test_open_wechat_qr_dialog_drops_stale_local_status_callback(self):
         class DummySignal:
@@ -2972,9 +4560,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _channel_external_running(self, channel_id):
                 return str(channel_id) == "wechat"
 
-            def _refresh_wechat_external_running(self, *, persist=False):
-                self.calls.append("refresh_wechat")
-                return True
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                self.calls.append("refresh_local")
+                return {"wechat": [321]}
 
             def _refresh_channels_runtime_status_labels(self):
                 return None
@@ -2986,7 +4574,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         ):
             dummy._start_autostart_channels()
 
-        self.assertIn("refresh_wechat", dummy.calls)
+        self.assertIn("refresh_local", dummy.calls)
         self.assertEqual(dummy._autostart_channel_pending_ids, set())
         self.assertEqual(dummy._autostart_channel_current, "")
 
@@ -3042,8 +4630,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _channel_external_running(self, _channel_id):
                 return False
 
-            def _refresh_wechat_external_running(self, *, persist=False):
-                return False
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                return {}
 
             def _refresh_channels_runtime_status_labels(self):
                 self.status_refreshes += 1
@@ -3116,6 +4704,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
             def _remote_channel_conflict_message(self, did, channel_id):
                 return ""
+
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                return True, "", {"ok": True}
 
             def _remote_start_channel_process_blocking(self, device, channel_id, spec):
                 return True, "", {"pid": 321}
@@ -3303,6 +4894,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _remote_channel_conflict_message(self, did, channel_id):
                 return ""
 
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                return True, "", {"ok": True}
+
             def _remote_start_channel_process_blocking(self, device, channel_id, spec):
                 return True, "", {"pid": 321}
 
@@ -3344,7 +4938,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         )
         self.assertIn(("info", "启动成功", "远端 微信 已启动；如无响应可继续查看远端日志。"), dummy.calls)
 
-    def test_remote_channel_start_reports_already_running_with_reuse_hint(self):
+    def test_remote_channel_start_prepares_dependencies_before_launch(self):
         class ImmediateThread:
             def __init__(self, target=None, name=None, daemon=None):
                 self._target = target
@@ -3380,8 +4974,164 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _remote_channel_conflict_message(self, did, channel_id):
                 return ""
 
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                self.calls.append(("deps", str(channel_id), tuple(self._channel_extra_packages(spec))))
+                return True, "", {"ok": True}
+
             def _remote_start_channel_process_blocking(self, device, channel_id, spec):
-                return True, "", {"already_running": True, "pid": 321}
+                self.calls.append(("start", str(channel_id)))
+                return True, "", {"pid": 987}
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _force_remote_channel_sync(self):
+                self.calls.append("sync")
+
+            def _refresh_channels_runtime_status_labels(self):
+                self.calls.append("refresh_labels")
+
+            def _reload_channels_editor_state(self):
+                self.calls.append("reload_editor")
+
+            def _refresh_sessions(self):
+                self.calls.append("refresh_sessions")
+
+            def _channel_info(self, title, text, detail=""):
+                self.calls.append(("info", str(title), str(text)))
+
+            def _channel_warning(self, title, text, detail=""):
+                self.calls.append(("warning", str(title), str(text), str(detail)))
+
+            def _channel_post_ui(self, callback, action_name="界面刷新"):
+                if callable(callback):
+                    callback()
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.threading, "Thread", ImmediateThread):
+            self.assertTrue(dummy._start_remote_channel_process("telegram", show_errors=True))
+
+        self.assertEqual(dummy.calls[:2], [("deps", "telegram", ("python-telegram-bot",)), ("start", "telegram")])
+        self.assertEqual(dummy.statuses[-1], "已启动远端 Telegram / 纸飞机 渠道（PID 987）；如无新消息可再查看远端日志。")
+
+    def test_remote_channel_start_stops_on_dependency_install_failure(self):
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if callable(self._target):
+                    self._target()
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_remote_channel_process = ChannelRuntimeMixin._start_remote_channel_process
+            _remote_channel_label_text = ChannelRuntimeMixin._remote_channel_label_text
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._runtime_context_generation = 1
+                self._settings_target_change_token = 2
+                self._qt_channel_extras = {}
+                self.calls = []
+                self.statuses = []
+
+            def _settings_target_generation(self):
+                return self._settings_target_change_token
+
+            def _channel_target_context(self):
+                return True, {"id": "box-1"}, {"is_remote": True, "device_id": "box-1"}
+
+            def _qt_channels_save(self, silent=True, apply_running=False):
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _remote_channel_conflict_message(self, did, channel_id):
+                return ""
+
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                return False, "远端 Telegram / 纸飞机 依赖安装失败：缺少 pip。", {"report_text": "pip install python-telegram-bot 失败"}
+
+            def _remote_start_channel_process_blocking(self, device, channel_id, spec):
+                raise AssertionError("remote start should not run after dependency failure")
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _force_remote_channel_sync(self):
+                self.calls.append("sync")
+
+            def _refresh_channels_runtime_status_labels(self):
+                self.calls.append("refresh_labels")
+
+            def _reload_channels_editor_state(self):
+                self.calls.append("reload_editor")
+
+            def _refresh_sessions(self):
+                self.calls.append("refresh_sessions")
+
+            def _channel_info(self, title, text, detail=""):
+                self.calls.append(("info", str(title), str(text), str(detail)))
+
+            def _channel_warning(self, title, text, detail=""):
+                self.calls.append(("warning", str(title), str(text), str(detail)))
+
+            def _channel_post_ui(self, callback, action_name="界面刷新"):
+                if callable(callback):
+                    callback()
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.threading, "Thread", ImmediateThread):
+            self.assertTrue(dummy._start_remote_channel_process("telegram", show_errors=True))
+
+        self.assertEqual(dummy.statuses[-1], "远端 Telegram / 纸飞机 依赖安装失败：缺少 pip。")
+        self.assertIn(
+            ("warning", "依赖安装失败", "远端 Telegram / 纸飞机 依赖安装失败：缺少 pip。", "pip install python-telegram-bot 失败"),
+            dummy.calls,
+        )
+
+    def test_remote_channel_start_reports_restart_for_managed_running_process(self):
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if callable(self._target):
+                    self._target()
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_remote_channel_process = ChannelRuntimeMixin._start_remote_channel_process
+            _remote_channel_label_text = ChannelRuntimeMixin._remote_channel_label_text
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._runtime_context_generation = 1
+                self._settings_target_change_token = 2
+                self._qt_channel_extras = {}
+                self.calls = []
+                self.statuses = []
+
+            def _settings_target_generation(self):
+                return self._settings_target_change_token
+
+            def _channel_target_context(self):
+                return True, {"id": "box-1"}, {"is_remote": True, "device_id": "box-1"}
+
+            def _qt_channels_save(self, silent=True, apply_running=False):
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _remote_channel_conflict_message(self, did, channel_id):
+                return ""
+
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                return True, "", {"ok": True}
+
+            def _remote_start_channel_process_blocking(self, device, channel_id, spec):
+                return True, "", {"restarted": True, "previous_pid": 321, "pid": 654}
 
             def _set_status(self, text):
                 self.statuses.append(str(text))
@@ -3416,10 +5166,87 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             dummy.statuses,
             [
                 "正在启动远端 微信 渠道…",
-                "远端 微信 已在运行；当前会继续复用现有进程。",
+                "已重启远端 微信 渠道（旧 PID 321 -> 新 PID 654）。",
             ],
         )
-        self.assertIn(("info", "已在运行", "远端 微信 已在运行，无需重复启动；当前会继续复用现有进程。"), dummy.calls)
+        self.assertIn(("info", "重启成功", "远端 微信 已重启；如无响应可继续查看远端日志。"), dummy.calls)
+
+    def test_remote_start_channel_process_blocking_uses_shared_matcher_for_wechat_probe(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_start_channel_process_blocking = ChannelRuntimeMixin._remote_start_channel_process_blocking
+
+            def __init__(self):
+                self.scripts = []
+
+            def _remote_exec_json_script(self, device, script, timeout=120):
+                self.scripts.append(str(script))
+                return True, {"ok": True, "restarted": True, "previous_pid": 321, "pid": 654}, ""
+
+        dummy = DummyChannel()
+        ok, msg, payload = dummy._remote_start_channel_process_blocking(
+            {"id": "box-1"},
+            "wechat",
+            {"id": "wechat", "label": "微信", "script": "wechatapp.py", "conflicts_with": []},
+        )
+
+        self.assertTrue(ok, msg=msg)
+        self.assertTrue(payload.get("restarted"))
+        self.assertEqual(payload.get("previous_pid"), 321)
+        self.assertEqual(len(dummy.scripts), 1)
+        script = dummy.scripts[0]
+        self.assertIn("process_cmdline_matches_agent_script", script)
+        self.assertIn("def read_pid_cwd(pid):", script)
+        self.assertIn("find_wechat_pids", script)
+        self.assertIn("if not terminate_pid_force(existing_pid):", script)
+        self.assertIn("'restarted': bool(restarted)", script)
+
+    def test_remote_prepare_runtime_dependencies_blocking_uses_self_contained_remote_installer(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_prepare_runtime_dependencies_blocking = ChannelRuntimeMixin._remote_prepare_runtime_dependencies_blocking
+
+            def __init__(self):
+                self.scripts = []
+                self.cfg = {
+                    "vps_profiles": [
+                        {
+                            "id": "box-1",
+                            "dep_install_mode": "mirror",
+                            "pip_mirror_url": "https://mirror.example/simple",
+                        }
+                    ]
+                }
+
+            def _remote_exec_json_script(self, device, script, timeout=120):
+                self.scripts.append((str(script), int(timeout)))
+                return True, {"ok": True, "python": "/usr/bin/python3", "report_text": ""}, ""
+
+            def _vps_dep_install_source(self, dep_install_mode, pip_mirror_url=""):
+                return {
+                    "mode": str(dep_install_mode),
+                    "index_url": str(pip_mirror_url or ""),
+                    "trusted_host": "mirror.example",
+                }
+
+        dummy = DummyChannel()
+        ok, msg, payload = dummy._remote_prepare_runtime_dependencies_blocking(
+            {"id": "box-1"},
+            "telegram",
+            {"id": "telegram", "label": "Telegram / 纸飞机", "script": "tgapp.py", "pip": "python-telegram-bot"},
+        )
+
+        self.assertTrue(ok, msg=msg)
+        self.assertEqual(payload.get("python"), "/usr/bin/python3")
+        self.assertEqual(len(dummy.scripts), 1)
+        script, timeout = dummy.scripts[0]
+        self.assertEqual(timeout, 600)
+        self.assertIn("py_bin = str(os.environ.get('GA_PY_BIN') or sys.executable or '').strip()", script)
+        self.assertIn("remote_channel_dependency_state.json", script)
+        self.assertIn("def install_with_fallback(args, *, label, timeout=1200):", script)
+        self.assertIn("同步远端 requirements.txt", script)
+        self.assertIn("安装远端渠道依赖", script)
+        self.assertIn("mirror.example", script)
+        self.assertIn("python-telegram-bot", script)
+        self.assertNotIn("from launcher_core_parts import python_env as ga_python_env", script)
 
     def test_remote_channel_start_wechat_unbound_reopens_qr_before_retry(self):
         class ImmediateThread:
@@ -3458,6 +5285,9 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
             def _remote_channel_conflict_message(self, did, channel_id):
                 return ""
+
+            def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+                return True, "", {"ok": True}
 
             def _remote_start_channel_process_blocking(self, device, channel_id, spec):
                 self.start_attempts += 1
@@ -3517,6 +5347,91 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(msg, "远端停止失败，进程可能仍在运行。")
         self.assertEqual(payload["status"], "停止失败")
 
+    def test_remote_stop_blocking_embeds_fallback_pid_for_external_process(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_stop_channel_process_blocking = ChannelRuntimeMixin._remote_stop_channel_process_blocking
+
+            def __init__(self):
+                self.script = ""
+
+            def _remote_exec_json_script(self, device, script, timeout=80):
+                self.script = str(script)
+                return True, {"ok": True, "was_running": True, "stopped": True, "status": "已退出"}, ""
+
+        dummy = DummyChannel()
+        ok, msg, payload = dummy._remote_stop_channel_process_blocking({"id": "box-1"}, "wechat", fallback_pid=4321)
+
+        self.assertTrue(ok, msg=msg)
+        self.assertEqual(payload["status"], "已退出")
+        self.assertIn("fallback_pid = 4321", dummy.script)
+        self.assertIn("if pid <= 0 and fallback_pid > 0:", dummy.script)
+
+    def test_remote_channel_stop_uses_cached_pid_for_external_process(self):
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if callable(self._target):
+                    self._target()
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _stop_remote_channel_process = ChannelRuntimeMixin._stop_remote_channel_process
+            _remote_channel_label_text = ChannelRuntimeMixin._remote_channel_label_text
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._runtime_context_generation = 4
+                self._settings_target_change_token = 7
+                self.calls = []
+                self.statuses = []
+                self.received_fallback_pid = None
+
+            def _settings_target_generation(self):
+                return self._settings_target_change_token
+
+            def _channel_target_context(self):
+                return True, {"id": "box-1"}, {"is_remote": True, "device_id": "box-1"}
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {"process_status": "外部运行中", "process_pid": 4321, "managed_by_launcher": False}
+
+            def _remote_stop_channel_process_blocking(self, device, channel_id, fallback_pid=0):
+                self.received_fallback_pid = int(fallback_pid or 0)
+                return True, "", {"was_running": True}
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _force_remote_channel_sync(self):
+                self.calls.append("sync")
+
+            def _refresh_channels_runtime_status_labels(self):
+                self.calls.append("refresh_labels")
+
+            def _reload_channels_editor_state(self):
+                self.calls.append("reload_editor")
+
+            def _refresh_sessions(self):
+                self.calls.append("refresh_sessions")
+
+            def _channel_info(self, title, text, detail=""):
+                self.calls.append(("info", str(title), str(text)))
+
+            def _channel_warning(self, title, text, detail=""):
+                self.calls.append(("warning", str(title), str(text)))
+
+            def _channel_post_ui(self, callback, action_name="界面刷新"):
+                if callable(callback):
+                    callback()
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.threading, "Thread", ImmediateThread):
+            self.assertTrue(dummy._stop_remote_channel_process("wechat"))
+
+        self.assertEqual(dummy.received_fallback_pid, 4321)
+        self.assertIn(("info", "已停止", "远端 微信 已停止。"), dummy.calls)
+
     def test_remote_channel_stop_reports_not_running_without_redundant_stop(self):
         class ImmediateThread:
             def __init__(self, target=None, name=None, daemon=None):
@@ -3543,7 +5458,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _channel_target_context(self):
                 return True, {"id": "box-1"}, {"is_remote": True, "device_id": "box-1"}
 
-            def _remote_stop_channel_process_blocking(self, device, channel_id):
+            def _remote_stop_channel_process_blocking(self, device, channel_id, fallback_pid=0):
                 return True, "", {"was_running": False}
 
             def _set_status(self, text):
@@ -3794,8 +5709,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             def _channel_target_context(self):
                 return False, None, {"is_remote": False}
 
-            def _refresh_wechat_external_running(self, *, persist=False):
-                return True
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                return {"wechat": [321]}
 
             def _channel_status(self, channel_id, values, *, target_ctx=None):
                 return ("外部运行中", "#999999")
@@ -3903,6 +5818,612 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertIn("无法为 微信 打开远端扫码", state["bind_btn"].tooltip)
         self.assertIn("无法读取 微信 的远端状态或日志", state["log_btn"].tooltip)
         self.assertIn("无法读取 微信 的远端状态或日志", state["detail_btn"].tooltip)
+
+    def test_refresh_channel_runtime_status_treats_claimed_remote_process_with_pid_as_managed(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+                self.style = ""
+                self.visible = None
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def setStyleSheet(self, style):
+                self.style = str(style)
+
+            def setVisible(self, visible):
+                self.visible = bool(visible)
+
+        class DummyButton:
+            def __init__(self):
+                self.enabled = None
+                self.tooltip = ""
+                self.text = ""
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _channel_status = ChannelRuntimeMixin._channel_status
+            _channel_start_disabled_reason = ChannelRuntimeMixin._channel_start_disabled_reason
+            _channel_stop_disabled_reason = ChannelRuntimeMixin._channel_stop_disabled_reason
+            _refresh_channels_runtime_status_labels = ChannelRuntimeMixin._refresh_channels_runtime_status_labels
+            _apply_channel_button_state = ChannelRuntimeMixin._apply_channel_button_state
+            _remote_channel_is_running = ChannelRuntimeMixin._remote_channel_is_running
+            _remote_channel_is_launcher_managed = ChannelRuntimeMixin._remote_channel_is_launcher_managed
+            _remote_channel_is_external_running = ChannelRuntimeMixin._remote_channel_is_external_running
+            _remote_channel_process_pid = ChannelRuntimeMixin._remote_channel_process_pid
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._qt_channel_extras = {}
+                self._qt_channel_states = {
+                    "wechat": {
+                        "status_label": DummyLabel(),
+                        "status_hint_label": DummyLabel(),
+                        "start_btn": DummyButton(),
+                        "stop_btn": DummyButton(),
+                        "log_btn": DummyButton(),
+                        "detail_btn": DummyButton(),
+                    }
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1", "name": "Docker Box"}}
+
+            def _refresh_channel_source_actions(self):
+                return None
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {
+                    "process_status": "运行中",
+                    "process_pid": 4321,
+                    "managed_by_launcher": True,
+                }
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return 0.0, 0.0
+
+            def _remote_channel_device_sync_state(self, did):
+                return {}
+
+            def _remote_channel_check_hint(self, did, cid):
+                return "最近校验：2026-05-06 12:00:00"
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", [{"id": "wechat", "label": "微信", "fields": []}]):
+            dummy._refresh_channels_runtime_status_labels()
+
+        state = dummy._qt_channel_states["wechat"]
+        self.assertEqual(state["status_label"].text, "运行中 (PID 4321)")
+        self.assertTrue(state["start_btn"].enabled)
+        self.assertTrue(state["stop_btn"].enabled)
+        self.assertIn("重启远端 微信 渠道", state["start_btn"].tooltip)
+        self.assertIn("停止远端 微信 渠道", state["stop_btn"].tooltip)
+
+    def test_refresh_channel_runtime_status_disables_remote_actions_for_external_process_without_pid(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+                self.style = ""
+                self.visible = None
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def setStyleSheet(self, style):
+                self.style = str(style)
+
+            def setVisible(self, visible):
+                self.visible = bool(visible)
+
+        class DummyButton:
+            def __init__(self):
+                self.enabled = None
+                self.tooltip = ""
+                self.text = ""
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _channel_status = ChannelRuntimeMixin._channel_status
+            _channel_start_disabled_reason = ChannelRuntimeMixin._channel_start_disabled_reason
+            _channel_stop_disabled_reason = ChannelRuntimeMixin._channel_stop_disabled_reason
+            _refresh_channels_runtime_status_labels = ChannelRuntimeMixin._refresh_channels_runtime_status_labels
+            _apply_channel_button_state = ChannelRuntimeMixin._apply_channel_button_state
+            _remote_channel_is_running = ChannelRuntimeMixin._remote_channel_is_running
+            _remote_channel_is_launcher_managed = ChannelRuntimeMixin._remote_channel_is_launcher_managed
+            _remote_channel_is_external_running = ChannelRuntimeMixin._remote_channel_is_external_running
+            _remote_channel_process_pid = ChannelRuntimeMixin._remote_channel_process_pid
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._qt_channel_extras = {}
+                self._qt_channel_states = {
+                    "wechat": {
+                        "status_label": DummyLabel(),
+                        "status_hint_label": DummyLabel(),
+                        "start_btn": DummyButton(),
+                        "stop_btn": DummyButton(),
+                        "log_btn": DummyButton(),
+                        "detail_btn": DummyButton(),
+                    }
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1", "name": "Personal VPS"}}
+
+            def _refresh_channel_source_actions(self):
+                return None
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {
+                    "process_status": "外部运行中",
+                    "process_pid": 0,
+                    "managed_by_launcher": False,
+                }
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return 0.0, 0.0
+
+            def _remote_channel_device_sync_state(self, did):
+                return {}
+
+            def _remote_channel_check_hint(self, did, cid):
+                return "最近校验：2026-05-06 12:00:00"
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", [{"id": "wechat", "label": "微信", "fields": []}]):
+            dummy._refresh_channels_runtime_status_labels()
+
+        state = dummy._qt_channel_states["wechat"]
+        self.assertEqual(state["status_label"].text, "外部运行中")
+        self.assertFalse(state["start_btn"].enabled)
+        self.assertFalse(state["stop_btn"].enabled)
+        self.assertIn("不会重复启动", state["start_btn"].tooltip)
+        self.assertIn("暂未获取到 PID", state["stop_btn"].tooltip)
+
+    def test_refresh_channel_runtime_status_keeps_external_label_for_unclaimed_remote_pid(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+                self.style = ""
+                self.visible = None
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def setStyleSheet(self, style):
+                self.style = str(style)
+
+            def setVisible(self, visible):
+                self.visible = bool(visible)
+
+        class DummyButton:
+            def __init__(self):
+                self.enabled = None
+                self.tooltip = ""
+                self.text = ""
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _channel_status = ChannelRuntimeMixin._channel_status
+            _channel_start_disabled_reason = ChannelRuntimeMixin._channel_start_disabled_reason
+            _channel_stop_disabled_reason = ChannelRuntimeMixin._channel_stop_disabled_reason
+            _refresh_channels_runtime_status_labels = ChannelRuntimeMixin._refresh_channels_runtime_status_labels
+            _apply_channel_button_state = ChannelRuntimeMixin._apply_channel_button_state
+            _remote_channel_is_running = ChannelRuntimeMixin._remote_channel_is_running
+            _remote_channel_is_launcher_managed = ChannelRuntimeMixin._remote_channel_is_launcher_managed
+            _remote_channel_is_external_running = ChannelRuntimeMixin._remote_channel_is_external_running
+            _remote_channel_process_pid = ChannelRuntimeMixin._remote_channel_process_pid
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._qt_channel_extras = {}
+                self._qt_channel_states = {
+                    "wechat": {
+                        "status_label": DummyLabel(),
+                        "status_hint_label": DummyLabel(),
+                        "start_btn": DummyButton(),
+                        "stop_btn": DummyButton(),
+                        "log_btn": DummyButton(),
+                        "detail_btn": DummyButton(),
+                    }
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1", "name": "Personal VPS"}}
+
+            def _refresh_channel_source_actions(self):
+                return None
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {
+                    "process_status": "外部运行中",
+                    "process_pid": 4321,
+                    "managed_by_launcher": False,
+                }
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return 0.0, 0.0
+
+            def _remote_channel_device_sync_state(self, did):
+                return {}
+
+            def _remote_channel_check_hint(self, did, cid):
+                return "最近校验：2026-05-06 12:00:00"
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", [{"id": "wechat", "label": "微信", "fields": []}]):
+            dummy._refresh_channels_runtime_status_labels()
+
+        state = dummy._qt_channel_states["wechat"]
+        self.assertEqual(state["status_label"].text, "外部运行中 (PID 4321)")
+        self.assertFalse(state["start_btn"].enabled)
+        self.assertTrue(state["stop_btn"].enabled)
+        self.assertIn("不会重复启动", state["start_btn"].tooltip)
+        self.assertIn("停止远端 微信 渠道", state["stop_btn"].tooltip)
+
+    def test_remote_channel_status_keeps_cached_running_state_during_sync_failures(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {
+                    "process_status": "运行中",
+                    "process_pid": 4321,
+                    "managed_by_launcher": True,
+                }
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return 99.0, 99.0
+
+            def _remote_channel_device_sync_state(self, did):
+                return {"fail_count": 3, "last_error": "SSH reset"}
+
+            def _request_remote_channel_status_refresh(self):
+                raise AssertionError("cached running state should not be replaced by VPS error flow")
+
+            def _remote_channel_is_external_running(self, did, cid):
+                return False
+
+        dummy = DummyChannel()
+        text, color = dummy._remote_channel_status("box-1", "wechat")
+
+        self.assertEqual(text, "运行中 (PID 4321)")
+        self.assertEqual(color, channel_runtime.C["accent"])
+
+    def test_remote_channel_status_returns_no_process_when_sync_stuck_too_long(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._remote_channel_sync_running = True
+                self._REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS = 120.0
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {}
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return float("inf"), float("inf")
+
+            def _remote_channel_device_sync_state(self, did):
+                return {"last_attempt_at": 1.0, "fail_count": 0, "last_error": ""}
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.time, "time", return_value=1000.0):
+            text, color = dummy._remote_channel_status("box-1", "wechat")
+        self.assertEqual(text, "未检测到远端进程")
+        self.assertEqual(color, channel_runtime.C["muted"])
+        self.assertTrue(dummy._remote_channel_sync_running)
+
+    def test_remote_channel_status_shows_checking_within_probe_timeout(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_channel_status = ChannelRuntimeMixin._remote_channel_status
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._remote_channel_sync_running = True
+                self._REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS = 120.0
+
+            def _remote_channel_cached_session(self, did, cid):
+                return {}
+
+            def _remote_channel_status_check_age(self, did, cid):
+                return float("inf"), float("inf")
+
+            def _remote_channel_device_sync_state(self, did):
+                return {"last_attempt_at": 950.0, "fail_count": 0, "last_error": ""}
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.time, "time", return_value=1000.0):
+            text, color = dummy._remote_channel_status("box-1", "wechat")
+        self.assertEqual(text, "正在校验远端状态")
+        self.assertEqual(color, channel_runtime.C["text_soft"])
+
+    def test_request_channel_status_refresh_uses_manual_remote_sync_only(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _request_channel_status_refresh = ChannelRuntimeMixin._request_channel_status_refresh
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.calls = []
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1"}}
+
+            def _request_remote_channel_status_refresh(self):
+                self.calls.append("remote_refresh")
+
+            def _sync_all_channel_process_sessions(self):
+                self.calls.append("local_sync")
+
+            def _refresh_channels_runtime_status_labels(self, *, force=False):
+                self.calls.append(("refresh_labels", bool(force)))
+
+        dummy = DummyChannel()
+        dummy._request_channel_status_refresh()
+        self.assertEqual(dummy.calls, ["remote_refresh"])
+
+    def test_remote_channel_check_hint_reports_timeout_when_sync_stuck(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_channel_check_hint = ChannelRuntimeMixin._remote_channel_check_hint
+
+            def __init__(self):
+                self._remote_channel_sync_running = True
+                self._REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS = 30.0
+
+            def _remote_device_auto_ssh_enabled(self, _device_id):
+                return True
+
+            def _remote_channel_last_checked_at(self, _device_id, _channel_id):
+                return 0.0
+
+            def _remote_channel_device_sync_state(self, _device_id):
+                return {"last_attempt_at": 100.0, "fail_count": 0, "last_error": ""}
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.time, "time", return_value=200.0):
+            hint = dummy._remote_channel_check_hint("box-1", "wechat")
+        self.assertIn("已超时", hint)
+
+    def test_request_remote_channel_status_refresh_resets_stuck_sync_and_schedules_timeout_refresh(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _request_remote_channel_status_refresh = ChannelRuntimeMixin._request_remote_channel_status_refresh
+
+            def __init__(self):
+                self._last_remote_channel_status_refresh_at = 0.0
+                self._remote_channel_sync_running = True
+                self._next_remote_channel_sync_at = 99.0
+                self.settings_channels_notice = DummyLabel()
+                self.calls = []
+
+            def _auto_ssh_remote_devices(self):
+                return [{"id": "box-1"}]
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1"}}
+
+            def _remote_channel_sync_is_stuck(self, did):
+                return True
+
+            def _force_remote_channel_sync(self):
+                self.calls.append("force_sync")
+
+            def _schedule_remote_probe_timeout_refresh(self, did):
+                self.calls.append(("schedule_timeout", str(did)))
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.time, "time", return_value=1000.0):
+            dummy._request_remote_channel_status_refresh()
+        self.assertFalse(dummy._remote_channel_sync_running)
+        self.assertEqual(dummy._next_remote_channel_sync_at, 0.0)
+        self.assertEqual(dummy.calls, ["force_sync", ("schedule_timeout", "box-1")])
+
+    def test_sync_remote_device_channel_process_sessions_recovers_from_stuck_running_flag(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _sync_remote_device_channel_process_sessions = SidebarSessionsMixin._sync_remote_device_channel_process_sessions
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._remote_channel_sync_running = True
+                self._next_remote_channel_sync_at = 0.0
+                self._remote_channel_device_sync_errors = {"box-1": {"last_attempt_at": 100.0}}
+                self._runtime_context_generation = 1
+                self.started = False
+
+            def _auto_ssh_remote_devices(self):
+                return [{"id": "box-1"}]
+
+            def _remote_channel_probe_timeout_seconds(self):
+                return 30.0
+
+            def _sync_remote_device_channel_process_sessions_blocking(self, *, agent_dir="", runtime_context=None):
+                self.started = True
+                return False
+
+            def _sidebar_post_ui(self, callback):
+                if callable(callback):
+                    callback()
+
+            def _should_refresh_remote_sync_ui(self):
+                return False
+
+        class ImmediateThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if callable(self._target):
+                    self._target()
+
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.time, "time", return_value=200.0), mock.patch.object(
+            sidebar_sessions.threading, "Thread", ImmediateThread
+        ):
+            dummy._sync_remote_device_channel_process_sessions()
+        self.assertTrue(dummy.started)
+        self.assertFalse(dummy._remote_channel_sync_running)
+
+    def test_request_channel_status_refresh_scans_local_external_before_sync(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _request_channel_status_refresh = ChannelRuntimeMixin._request_channel_status_refresh
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.calls = []
+
+            def _settings_target_context(self):
+                return {"is_remote": False}
+
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                self.calls.append(("local_external", bool(persist)))
+                return {"wechat": [321]}
+
+            def _sync_all_channel_process_sessions(self):
+                self.calls.append("local_sync")
+
+            def _refresh_channels_runtime_status_labels(self, *, force=False):
+                self.calls.append(("refresh_labels", bool(force)))
+
+        dummy = DummyChannel()
+        dummy._request_channel_status_refresh()
+        self.assertEqual(dummy.calls, [("local_external", True), "local_sync", ("refresh_labels", True)])
+
+    def test_refresh_channel_runtime_status_notice_uses_cached_result_wording_after_failures(self):
+        class DummyLabel:
+            def __init__(self):
+                self.text = ""
+                self.style = ""
+                self.visible = None
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def setStyleSheet(self, style):
+                self.style = str(style)
+
+            def setVisible(self, visible):
+                self.visible = bool(visible)
+
+        class DummyButton:
+            def __init__(self):
+                self.enabled = None
+                self.tooltip = ""
+                self.text = ""
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _refresh_channels_runtime_status_labels = ChannelRuntimeMixin._refresh_channels_runtime_status_labels
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._qt_channel_extras = {}
+                self.settings_channels_notice = DummyLabel()
+                self._qt_channel_states = {
+                    "wechat": {
+                        "status_label": DummyLabel(),
+                        "status_hint_label": DummyLabel(),
+                        "start_btn": DummyButton(),
+                        "stop_btn": DummyButton(),
+                        "log_btn": DummyButton(),
+                        "detail_btn": DummyButton(),
+                    }
+                }
+
+            def _settings_target_context(self):
+                return {"is_remote": True, "device_id": "box-1", "device": {"id": "box-1", "name": "Personal VPS"}}
+
+            def _refresh_channel_source_actions(self):
+                return None
+
+            def _remote_channel_device_sync_state(self, did):
+                return {"fail_count": 3, "last_error": "SSH reset"}
+
+            def _remote_channel_device_has_cached_sessions(self, did):
+                return True
+
+            def _channel_status(self, channel_id, values, *, target_ctx=None):
+                return ("运行中 (PID 4321)", "#00aa00")
+
+            def _remote_channel_check_hint(self, did, cid):
+                return "最近校验：2026-05-06 12:00:00"
+
+            def _remote_channel_is_running(self, did, cid):
+                return True
+
+            def _remote_channel_is_launcher_managed(self, did, cid):
+                return True
+
+            def _remote_channel_process_pid(self, did, cid):
+                return 4321
+
+            def _channel_start_disabled_reason(self, channel_id, values, *, target_ctx=None):
+                return "disabled"
+
+            def _channel_stop_disabled_reason(self, channel_id, values, *, target_ctx=None):
+                return ""
+
+            def _channel_bind_disabled_reason(self, channel_id, *, target_ctx=None):
+                return ""
+
+            def _channel_remote_aux_disabled_reason(self, channel_id, *, target_ctx=None):
+                return ""
+
+        dummy = DummyChannel()
+        with mock.patch.object(channel_runtime.lz, "COMM_CHANNEL_SPECS", [{"id": "wechat", "label": "微信", "fields": []}]):
+            dummy._refresh_channels_runtime_status_labels()
+
+        self.assertIn("当前展示最近一次缓存结果", dummy.settings_channels_notice.text)
+        self.assertIn("SSH reset", dummy.settings_channels_notice.text)
 
     def test_reload_channels_editor_state_clears_stale_source_when_agent_dir_invalid(self):
         class DummyChannel(ChannelRuntimeMixin):
@@ -4589,7 +7110,7 @@ native_oai_config2 = {
         self.assertEqual(dummy.state["model_status"], "正在拉取模型列表…")
         self.assertTrue(dummy.state["model_fetching"])
 
-    def test_apply_loaded_channels_source_refreshes_local_wechat_state_before_render(self):
+    def test_apply_loaded_channels_source_refreshes_local_channel_external_state_before_render(self):
         class DummyChannel(ChannelRuntimeMixin):
             def __init__(self):
                 self.agent_dir = "C:\\demo"
@@ -4601,9 +7122,9 @@ native_oai_config2 = {
             def _settings_target_context(self):
                 return {"is_remote": False}
 
-            def _refresh_wechat_external_running(self, *, persist=False):
-                self.calls.append("refresh_wechat")
-                return True
+            def _refresh_local_channel_external_running(self, *, persist=False):
+                self.calls.append("refresh_local")
+                return {"wechat": [321]}
 
             def _render_channel_cards(self):
                 self.calls.append("render_cards")
@@ -4613,7 +7134,7 @@ native_oai_config2 = {
 
         dummy = DummyChannel()
         dummy._apply_loaded_channels_source("C:\\demo\\mykey.py", {"error": "", "configs": [], "passthrough": [], "extras": {}})
-        self.assertEqual(dummy.calls, ["refresh_wechat", "render_cards", "refresh_runtime_labels"])
+        self.assertEqual(dummy.calls, ["refresh_local", "render_cards", "refresh_runtime_labels"])
 
     def test_apply_loaded_channels_source_keeps_page_read_only_when_mykey_read_failed(self):
         class DummyChannel(ChannelRuntimeMixin):
@@ -4693,7 +7214,7 @@ native_oai_config2 = {
         self.assertTrue(failed_dummy.settings_channels_refresh_btn.enabled)
         self.assertTrue(failed_dummy.settings_channels_stop_all_btn.enabled)
         self.assertEqual(failed_dummy.settings_channels_save_btn.tooltip, "当前状态不可保存通讯配置。")
-        self.assertEqual(failed_dummy.settings_channels_refresh_btn.tooltip, "重新读取当前目标的通讯配置。")
+        self.assertEqual(failed_dummy.settings_channels_refresh_btn.tooltip, "手动刷新当前目标的渠道运行状态。")
 
     def test_show_settings_category_reloads_dynamic_or_target_pages_and_skips_cached_local_pages(self):
         class DummyStack:
@@ -4774,6 +7295,55 @@ native_oai_config2 = {
             dummy._show_settings_category("theme", reload=True)
         self.assertNotIn(("reload", ["theme"], False), dummy.calls)
         self.assertIn(("status", "theme"), dummy.calls)
+
+    def test_show_settings_switches_page_before_forced_reload(self):
+        class DummyPages:
+            def __init__(self):
+                self.current = None
+
+            def setCurrentWidget(self, widget):
+                self.current = widget
+
+        class DummyBtn:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = str(text)
+
+            def clicked(self):
+                return None
+
+        class DummyNav(NavigationMixin):
+            _show_settings = NavigationMixin._show_settings
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.pages = DummyPages()
+                self._settings_page = object()
+                self._current_settings_category = "api"
+                self._settings_top_back_btn = None
+                self.events = []
+
+            def _ensure_settings_page_built(self):
+                self.events.append("ensure")
+
+            def setWindowTitle(self, text):
+                self.events.append(("title", str(text)))
+
+            def _refresh_welcome_state(self):
+                self.events.append("refresh_welcome")
+
+            def _settings_reload(self, *, categories=None, force=False):
+                self.events.append(("reload", list(categories or []), bool(force), self.pages.current is self._settings_page))
+
+        dummy = DummyNav()
+        with mock.patch.object(navigation.lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            navigation.QTimer, "singleShot", side_effect=lambda *_args: _args[-1]()
+        ):
+            dummy._show_settings()
+        self.assertEqual(dummy.pages.current, dummy._settings_page)
+        self.assertIn(("reload", ["api"], True, True), dummy.events)
 
     def test_settings_reload_skips_target_combo_refresh_for_local_only_categories(self):
         class DummyLabel:
@@ -4916,11 +7486,12 @@ native_oai_config2 = {
         class DummySettings(SettingsPanelMixin):
             _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
             _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
             _vps_connection_incomplete_reason = SettingsPanelMixin._vps_connection_incomplete_reason
             _vps_auth_missing_reason = SettingsPanelMixin._vps_auth_missing_reason
             _vps_runtime_connection_disabled_reason = SettingsPanelMixin._vps_runtime_connection_disabled_reason
             _vps_deploy_validation_error = SettingsPanelMixin._vps_deploy_validation_error
-            _validate_vps_docker_image_name = SettingsPanelMixin._validate_vps_docker_image_name
+            _vps_takeover_validation_error = SettingsPanelMixin._vps_takeover_validation_error
 
             def __init__(self):
                 self.cfg = {}
@@ -4948,29 +7519,25 @@ native_oai_config2 = {
                 ),
                 "SSH 私钥路径不存在，请检查后重试。",
             )
+        with mock.patch.object(settings_panel.lz, "REPO_URL", ""):
+            self.assertEqual(
+                dummy._vps_deploy_validation_error(
+                    {
+                        "source": "git",
+                        "remote_dir": "/srv/genericagent",
+                        "repo_url": "",
+                    }
+                ),
+                "拉取模式下，仓库地址不能为空。",
+            )
         self.assertEqual(
             dummy._vps_deploy_validation_error(
                 {
                     "source": "git",
-                    "remote_dir": "/srv/genericagent",
-                    "docker_image": "genericagent",
-                    "docker_container": "",
                     "repo_url": "https://example.com/repo.git",
                 }
             ),
-            "请先填写容器名称。",
-        )
-        self.assertEqual(
-            dummy._vps_deploy_validation_error(
-                {
-                    "source": "git",
-                    "remote_dir": "/srv/genericagent",
-                    "docker_image": "GenericAgent",
-                    "docker_container": "genericagent",
-                    "repo_url": "https://example.com/repo.git",
-                }
-            ),
-            "镜像名称的仓库部分必须全小写，例如 `genericagent` 或 `registry.example.com/team/genericagent:latest`。",
+            "",
         )
         with mock.patch.object(settings_panel.os.path, "isdir", return_value=False):
             self.assertEqual(
@@ -4978,8 +7545,6 @@ native_oai_config2 = {
                     {
                         "source": "upload",
                         "remote_dir": "/srv/genericagent",
-                        "docker_image": "genericagent",
-                        "docker_container": "genericagent",
                         "local_agent_dir": "missing-agent",
                     }
                 ),
@@ -4990,8 +7555,6 @@ native_oai_config2 = {
                 {
                     "source": "git",
                     "remote_dir": "/srv/genericagent",
-                    "docker_image": "genericagent",
-                    "docker_container": "genericagent",
                     "repo_url": "https://example.com/repo.git",
                     "dep_install_mode": "mirror",
                     "pip_mirror_url": "ftp://mirror.example.com/simple",
@@ -4999,6 +7562,401 @@ native_oai_config2 = {
             ),
             "pip 镜像地址格式无效，请填写 http(s) URL。",
         )
+        self.assertEqual(
+            dummy._vps_takeover_validation_error({"takeover_agent_dir": ""}),
+            "请先填写要接管的 agant 路径。",
+        )
+        self.assertEqual(
+            dummy._normalize_vps_takeover_cfg({"takeover_agent_dir": "/srv/agant"}),
+            {
+                "remote_mode": "ssh",
+                "takeover_mode": "path",
+                "takeover_agent_dir": "/srv/agant",
+                "takeover_python_cmd": "python3",
+                "docker_takeover_container": "",
+                "docker_takeover_agent_dir": "",
+                "docker_takeover_python_cmd": "python3",
+            },
+        )
+        self.assertEqual(
+            dummy._normalize_vps_takeover_cfg({"docker_takeover_container": "ga-prod", "docker_takeover_agent_dir": "/app"}),
+            {
+                "remote_mode": "ssh",
+                "takeover_mode": "path",
+                "takeover_agent_dir": "/app",
+                "takeover_python_cmd": "python3",
+                "docker_takeover_container": "",
+                "docker_takeover_agent_dir": "",
+                "docker_takeover_python_cmd": "python3",
+            },
+        )
+
+    def test_vps_profile_to_remote_device_uses_path_takeover_context(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _vps_profile_to_remote_device = SettingsPanelMixin._vps_profile_to_remote_device
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+
+            def __init__(self):
+                self.cfg = {}
+
+        dummy = DummySettings()
+        device = dummy._vps_profile_to_remote_device(
+            {
+                "id": "srv-1",
+                "name": "生产环境",
+                "host": "10.0.0.8",
+                "username": "root",
+                "password": "pw",
+                "remote_mode": "ssh",
+                "remote_dir": "/srv/other",
+                "takeover_mode": "path",
+                "takeover_agent_dir": "/opt/agant",
+                "takeover_python_cmd": "python",
+            }
+        )
+        self.assertEqual(device["agent_dir"], "/opt/agant")
+        self.assertEqual(device["python_cmd"], "python")
+        self.assertEqual(device["docker_container"], "")
+        self.assertEqual(device["remote_mode"], "ssh")
+        self.assertEqual(device["takeover_mode"], "path")
+        self.assertEqual(device["takeover_agent_dir"], "/opt/agant")
+        self.assertEqual(device["name"], "生产环境")
+
+    def test_collect_current_vps_profile_form_data_normalizes_legacy_docker_takeover_to_path_on_save(self):
+        class DummyLineEdit:
+            def __init__(self, text=""):
+                self._text = str(text)
+
+            def text(self):
+                return self._text
+
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _collect_vps_form_data = SettingsPanelMixin._collect_vps_form_data
+            _collect_vps_takeover_form_data = SettingsPanelMixin._collect_vps_takeover_form_data
+            _collect_current_vps_profile_form_data = SettingsPanelMixin._collect_current_vps_profile_form_data
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+
+            def __init__(self):
+                self.cfg = {}
+                self.current = {
+                    "id": "srv-1",
+                    "name": "生产环境",
+                    "host": "10.0.0.8",
+                    "username": "root",
+                    "password": "pw",
+                    "remote_mode": "docker_container",
+                    "docker_takeover_container": "ga-prod",
+                    "docker_takeover_agent_dir": "/opt/agant",
+                    "docker_takeover_python_cmd": "python",
+                }
+                self.settings_vps_host_edit = DummyLineEdit("10.0.0.8")
+                self.settings_vps_username_edit = DummyLineEdit("root")
+                self.settings_vps_key_path_edit = DummyLineEdit("")
+                self.settings_vps_password_edit = DummyLineEdit("pw")
+                self.settings_vps_takeover_agent_dir_edit = DummyLineEdit("/opt/agant")
+
+            def _current_vps_profile(self):
+                return dict(self.current)
+
+            def _collect_vps_deploy_form_data(self):
+                return {}
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+        class DummySpin:
+            def value(self):
+                return 22
+
+        dummy = DummySettings()
+        dummy.settings_vps_port_spin = DummySpin()
+        payload = dummy._collect_current_vps_profile_form_data()
+        self.assertEqual(payload["remote_mode"], "ssh")
+        self.assertEqual(payload["takeover_mode"], "path")
+        self.assertEqual(payload["takeover_agent_dir"], "/opt/agant")
+        self.assertEqual(payload["takeover_python_cmd"], "python")
+        self.assertEqual(payload["docker_takeover_container"], "")
+        self.assertEqual(payload["docker_takeover_agent_dir"], "")
+        self.assertEqual(payload["docker_takeover_python_cmd"], "python3")
+
+    def test_normalize_vps_profile_strips_repeated_legacy_auto_added_docker_suffixes(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+
+            def __init__(self):
+                self.cfg = {}
+
+        dummy = DummySettings()
+        profile = dummy._normalize_vps_profile(
+            {
+                "id": "srv-1",
+                "name": "我的服务器（Docker）（Docker）（Docker）",
+                "host": "10.0.0.8",
+                "username": "root",
+                "password": "pw",
+                "remote_mode": "docker_container",
+                "docker_takeover_container": "ga-prod",
+            }
+        )
+        self.assertEqual(profile["name"], "我的服务器")
+
+    def test_normalize_vps_profile_preserves_user_name_without_docker_takeover_context(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+
+            def __init__(self):
+                self.cfg = {}
+
+        dummy = DummySettings()
+        profile = dummy._normalize_vps_profile(
+            {
+                "id": "srv-1",
+                "name": "我的服务器（Docker）",
+                "host": "10.0.0.8",
+                "username": "root",
+                "password": "pw",
+            }
+        )
+        self.assertEqual(profile["name"], "我的服务器（Docker）")
+
+    def test_normalize_vps_profile_preserves_user_name_with_deploy_docker_container_only(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+
+            def __init__(self):
+                self.cfg = {}
+
+        dummy = DummySettings()
+        raw = {
+            "id": "srv-1",
+            "name": "实验环境（Docker）",
+            "host": "10.0.0.8",
+            "username": "root",
+            "password": "pw",
+            "docker_container": "genericagent",
+        }
+        profile = dummy._normalize_vps_profile(raw)
+        self.assertFalse(dummy._vps_profile_name_needs_cleanup(raw))
+        self.assertEqual(profile["name"], "实验环境（Docker）")
+
+    def test_vps_profiles_write_back_cleaned_legacy_docker_names(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+            _vps_profiles = SettingsPanelMixin._vps_profiles
+
+            def __init__(self):
+                self.cfg = {
+                    "vps_current_profile_id": "srv-1",
+                    "vps_profiles": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器（Docker）（Docker）",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "remote_mode": "docker_container",
+                            "docker_takeover_container": "ga-prod",
+                            "docker_takeover_agent_dir": "/opt/agant",
+                        }
+                    ],
+                }
+                self.saved_rows = None
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+            def _save_vps_profiles(self, rows, *, selected_id=""):
+                self.saved_rows = [dict(item) for item in rows]
+                self.cfg["vps_profiles"] = [dict(item) for item in rows]
+                self.cfg["vps_current_profile_id"] = str(selected_id or "")
+                return rows
+
+        dummy = DummySettings()
+        rows = dummy._vps_profiles()
+        self.assertIsNotNone(dummy.saved_rows)
+        self.assertEqual(rows[0]["name"], "我的服务器")
+        self.assertEqual(dummy.saved_rows[0]["name"], "我的服务器")
+        self.assertEqual(dummy.cfg["vps_profiles"][0]["name"], "我的服务器")
+
+    def test_vps_profiles_reconstruct_legacy_docker_remote_device_rows_as_path_takeover(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+            _vps_profiles = SettingsPanelMixin._vps_profiles
+
+            def __init__(self):
+                self.cfg = {
+                    "remote_devices": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "agent_mode": "docker",
+                            "remote_mode": "docker_container",
+                            "agent_dir": "/opt/agant",
+                            "docker_container": "ga-prod",
+                            "docker_agent_dir": "/opt/agant",
+                            "python_cmd": "python",
+                            "auto_ssh": True,
+                        }
+                    ]
+                }
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+        dummy = DummySettings()
+        with mock.patch.object(settings_panel.lz, "save_config"):
+            rows = dummy._vps_profiles()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["remote_mode"], "ssh")
+        self.assertEqual(rows[0]["takeover_mode"], "path")
+        self.assertEqual(rows[0]["takeover_agent_dir"], "/opt/agant")
+        self.assertEqual(rows[0]["takeover_python_cmd"], "python")
+        self.assertEqual(rows[0]["docker_takeover_container"], "")
+        self.assertEqual(rows[0]["docker_takeover_agent_dir"], "")
+
+    def test_vps_profiles_reconstruct_path_takeover_from_host_remote_device_rows(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+            _vps_profiles = SettingsPanelMixin._vps_profiles
+
+            def __init__(self):
+                self.cfg = {
+                    "remote_devices": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "agent_mode": "host",
+                            "remote_mode": "ssh",
+                            "agent_dir": "/srv/agant",
+                            "python_cmd": "python",
+                            "takeover_mode": "path",
+                            "takeover_agent_dir": "/srv/agant",
+                            "takeover_python_cmd": "python",
+                            "auto_ssh": True,
+                        }
+                    ]
+                }
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+        dummy = DummySettings()
+        rows = dummy._vps_profiles()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["remote_mode"], "ssh")
+        self.assertEqual(rows[0]["takeover_mode"], "path")
+        self.assertEqual(rows[0]["takeover_agent_dir"], "/srv/agant")
+        self.assertEqual(rows[0]["takeover_python_cmd"], "python")
+        self.assertEqual(rows[0]["docker_takeover_container"], "")
+
+    def test_vps_profiles_self_heal_remote_devices_missing_remote_mode(self):
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+            _vps_profiles = SettingsPanelMixin._vps_profiles
+            _vps_profile_to_remote_device = SettingsPanelMixin._vps_profile_to_remote_device
+            _save_vps_profiles = SettingsPanelMixin._save_vps_profiles
+            _set_current_vps_profile_id = SettingsPanelMixin._set_current_vps_profile_id
+
+            def __init__(self):
+                self.cfg = {
+                    "remote_devices": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "agent_mode": "docker",
+                            "agent_dir": "/opt/agant",
+                            "docker_container": "ga-prod",
+                            "docker_agent_dir": "/opt/agant",
+                            "python_cmd": "python",
+                            "auto_ssh": True,
+                        }
+                    ]
+                }
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+        dummy = DummySettings()
+        with mock.patch.object(settings_panel.lz, "save_config"):
+            rows = dummy._vps_profiles()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["remote_mode"], "ssh")
+        self.assertEqual(rows[0]["takeover_mode"], "path")
+        self.assertEqual(rows[0]["takeover_agent_dir"], "/opt/agant")
+        self.assertEqual(rows[0]["docker_takeover_container"], "")
+        self.assertEqual(rows[0]["docker_takeover_agent_dir"], "")
+        self.assertEqual(dummy.cfg["remote_devices"][0]["remote_mode"], "ssh")
+        self.assertEqual(dummy.cfg["remote_devices"][0]["agent_mode"], "host")
+        self.assertEqual(dummy.cfg["remote_devices"][0]["docker_container"], "")
+        self.assertEqual(dummy.cfg["remote_devices"][0]["docker_agent_dir"], "")
 
     def test_refresh_vps_action_buttons_explains_missing_profiles_and_busy_states(self):
         class DummyWidget:
@@ -5031,7 +7989,6 @@ native_oai_config2 = {
             _vps_deploy_validation_error = SettingsPanelMixin._vps_deploy_validation_error
             _vps_deploy_disabled_reason = SettingsPanelMixin._vps_deploy_disabled_reason
             _vps_profile_action_disabled_reason = SettingsPanelMixin._vps_profile_action_disabled_reason
-            _validate_vps_docker_image_name = SettingsPanelMixin._validate_vps_docker_image_name
 
             def __init__(self):
                 self.cfg = {}
@@ -5090,8 +8047,6 @@ native_oai_config2 = {
             "source": "git",
             "repo_url": "https://example.com/repo.git",
             "remote_dir": "/srv/genericagent",
-            "docker_image": "genericagent",
-            "docker_container": "genericagent",
         }
         busy_dummy._vps_dep_install_running = True
         busy_dummy._refresh_vps_action_buttons()
@@ -5134,7 +8089,6 @@ native_oai_config2 = {
             _vps_deploy_validation_error = SettingsPanelMixin._vps_deploy_validation_error
             _vps_deploy_disabled_reason = SettingsPanelMixin._vps_deploy_disabled_reason
             _vps_profile_action_disabled_reason = SettingsPanelMixin._vps_profile_action_disabled_reason
-            _validate_vps_docker_image_name = SettingsPanelMixin._validate_vps_docker_image_name
 
             def __init__(self):
                 self.cfg = {}
@@ -5144,8 +8098,6 @@ native_oai_config2 = {
                     "source": "upload",
                     "local_agent_dir": "missing-agent",
                     "remote_dir": "/srv/genericagent",
-                    "docker_image": "genericagent",
-                    "docker_container": "genericagent",
                 }
                 self._vps_form_profile_id = "srv-2"
                 self._vps_connect_running = False
@@ -5190,6 +8142,216 @@ native_oai_config2 = {
         self.assertTrue(dummy.settings_vps_terminal_input.enabled)
         self.assertFalse(dummy.settings_vps_deploy_btn.enabled)
         self.assertEqual(dummy.settings_vps_deploy_btn.tooltip, "上传模式下，本地 agant 目录不存在。")
+
+    def test_collect_vps_deploy_form_data_falls_back_to_combo_item_data(self):
+        class DummyLineEdit:
+            def __init__(self, text=""):
+                self._text = str(text)
+
+            def text(self):
+                return self._text
+
+        class BrokenCombo:
+            def __init__(self, index, items):
+                self._index = int(index)
+                self._items = dict(items)
+
+            def currentData(self):
+                return None
+
+            def currentIndex(self):
+                return self._index
+
+            def itemData(self, index):
+                return self._items.get(int(index))
+
+        class DummySettings(SettingsPanelMixin):
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _collect_vps_deploy_form_data = SettingsPanelMixin._collect_vps_deploy_form_data
+            _combo_current_data_value = SettingsPanelMixin._combo_current_data_value
+
+            def __init__(self):
+                self.settings_vps_deploy_source_combo = BrokenCombo(1, {0: "upload", 1: "git"})
+                self.settings_vps_dep_install_mode_combo = BrokenCombo(2, {0: "offline", 1: "global", 2: "mirror"})
+                self.settings_vps_local_agent_dir_edit = DummyLineEdit("")
+                self.settings_vps_repo_url_edit = DummyLineEdit("https://example.com/repo.git")
+                self.settings_vps_remote_dir_edit = DummyLineEdit("/srv/genericagent")
+                self.settings_vps_pip_mirror_edit = DummyLineEdit("https://mirror.example.com/simple")
+                self.settings_vps_upload_excludes_edit = DummyLineEdit("")
+                self.settings_vps_username_edit = DummyLineEdit("root")
+
+        dummy = DummySettings()
+        payload = dummy._collect_vps_deploy_form_data()
+        self.assertEqual(payload["source"], "git")
+        self.assertEqual(payload["dep_install_mode"], "mirror")
+        self.assertEqual(payload["repo_url"], "https://example.com/repo.git")
+
+    def test_on_vps_deploy_source_changed_refreshes_buttons_and_honors_item_data_fallback(self):
+        class DummyWidget:
+            def __init__(self):
+                self.enabled = None
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+        class BrokenCombo:
+            def __init__(self, index, items):
+                self._index = int(index)
+                self._items = dict(items)
+
+            def currentData(self):
+                return None
+
+            def currentIndex(self):
+                return self._index
+
+            def itemData(self, index):
+                return self._items.get(int(index))
+
+        class DummySettings(SettingsPanelMixin):
+            _on_vps_deploy_source_changed = SettingsPanelMixin._on_vps_deploy_source_changed
+            _combo_current_data_value = SettingsPanelMixin._combo_current_data_value
+
+            def __init__(self):
+                self.settings_vps_deploy_source_combo = BrokenCombo(1, {0: "upload", 1: "git"})
+                self.settings_vps_local_agent_dir_edit = DummyWidget()
+                self.settings_vps_local_agent_browse_btn = DummyWidget()
+                self.settings_vps_repo_url_edit = DummyWidget()
+                self.refresh_calls = 0
+
+            def _refresh_vps_action_buttons(self):
+                self.refresh_calls += 1
+
+        dummy = DummySettings()
+        dummy._on_vps_deploy_source_changed()
+        self.assertFalse(dummy.settings_vps_local_agent_dir_edit.enabled)
+        self.assertFalse(dummy.settings_vps_local_agent_browse_btn.enabled)
+        self.assertTrue(dummy.settings_vps_repo_url_edit.enabled)
+        self.assertEqual(dummy.refresh_calls, 1)
+
+    def test_normalize_remote_device_strips_repeated_auto_added_docker_suffixes_from_name(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _normalize_remote_device = SidebarSessionsMixin._normalize_remote_device
+            _normalize_remote_auto_ssh_value = SidebarSessionsMixin._normalize_remote_auto_ssh_value
+
+        dummy = DummySidebar()
+        device = dummy._normalize_remote_device(
+            {
+                "id": "srv-1",
+                "name": "我的服务器（Docker）（Docker）（Docker）",
+                "host": "10.0.0.8",
+                "username": "root",
+                "password": "pw",
+                "docker_container": "ga-prod",
+                "docker_agent_dir": "/opt/agant",
+            }
+        )
+        self.assertEqual(device["name"], "我的服务器")
+        self.assertEqual(device["agent_mode"], "docker")
+
+    def test_remote_devices_write_back_cleaned_docker_names_and_sidebar_rows_use_clean_name(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _normalize_remote_device = SidebarSessionsMixin._normalize_remote_device
+            _normalize_remote_auto_ssh_value = SidebarSessionsMixin._normalize_remote_auto_ssh_value
+            _remote_device_name_needs_cleanup = SidebarSessionsMixin._remote_device_name_needs_cleanup
+            _remote_devices = SidebarSessionsMixin._remote_devices
+            _remote_device_auto_ssh_enabled = SidebarSessionsMixin._remote_device_auto_ssh_enabled
+            _sidebar_device_rows = SidebarSessionsMixin._sidebar_device_rows
+
+            def __init__(self):
+                self.cfg = {
+                    "remote_devices": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器（Docker）（Docker）",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "docker_container": "ga-prod",
+                            "docker_agent_dir": "/opt/agant",
+                            "auto_ssh": True,
+                        }
+                    ]
+                }
+                self.saved_rows = None
+
+            def _save_remote_devices(self, rows):
+                self.saved_rows = [dict(item) for item in rows]
+                self.cfg["remote_devices"] = [dict(item) for item in rows]
+
+            def _fallback_remote_device_from_vps(self):
+                return None
+
+        dummy = DummySidebar()
+        devices = dummy._remote_devices()
+        rows = dummy._sidebar_device_rows()
+        self.assertIsNotNone(dummy.saved_rows)
+        self.assertEqual(devices[0]["name"], "我的服务器")
+        self.assertEqual(dummy.saved_rows[0]["name"], "我的服务器")
+        self.assertEqual(rows[0]["device_name"], "我的服务器")
+
+    def test_remote_devices_cleanup_writeback_normalizes_legacy_docker_takeover_to_ssh_path(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _normalize_remote_device = SidebarSessionsMixin._normalize_remote_device
+            _normalize_remote_auto_ssh_value = SidebarSessionsMixin._normalize_remote_auto_ssh_value
+            _remote_device_name_needs_cleanup = SidebarSessionsMixin._remote_device_name_needs_cleanup
+            _remote_devices = SidebarSessionsMixin._remote_devices
+
+            def __init__(self):
+                self.cfg = {
+                    "remote_devices": [
+                        {
+                            "id": "srv-1",
+                            "name": "我的服务器（Docker）（Docker）",
+                            "host": "10.0.0.8",
+                            "username": "root",
+                            "password": "pw",
+                            "agent_mode": "docker",
+                            "remote_mode": "docker_container",
+                            "docker_container": "ga-prod",
+                            "docker_agent_dir": "/opt/agant",
+                            "python_cmd": "python",
+                            "auto_ssh": True,
+                        }
+                    ]
+                }
+
+            def _save_remote_devices(self, rows):
+                self.cfg["remote_devices"] = [dict(item) for item in rows]
+
+            def _fallback_remote_device_from_vps(self):
+                return None
+
+        class DummySettings(SettingsPanelMixin):
+            _strip_auto_docker_name_suffix = SettingsPanelMixin._strip_auto_docker_name_suffix
+            _vps_profile_uses_docker_takeover = SettingsPanelMixin._vps_profile_uses_docker_takeover
+            _vps_profile_name_needs_cleanup = SettingsPanelMixin._vps_profile_name_needs_cleanup
+            _normalize_vps_connection_cfg = SettingsPanelMixin._normalize_vps_connection_cfg
+            _normalize_vps_deploy_cfg = SettingsPanelMixin._normalize_vps_deploy_cfg
+            _normalize_vps_takeover_cfg = SettingsPanelMixin._normalize_vps_takeover_cfg
+            _normalize_vps_profile = SettingsPanelMixin._normalize_vps_profile
+            _settings_normalize_remote_auto_ssh_value = SettingsPanelMixin._settings_normalize_remote_auto_ssh_value
+            _vps_profiles = SettingsPanelMixin._vps_profiles
+
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def _make_vps_profile_id(self, seed=""):
+                return str(seed or "generated")
+
+        sidebar_dummy = DummySidebar()
+        devices = sidebar_dummy._remote_devices()
+        settings_dummy = DummySettings(sidebar_dummy.cfg)
+        with mock.patch.object(settings_panel.lz, "save_config"):
+            profiles = settings_dummy._vps_profiles()
+
+        self.assertEqual(devices[0]["remote_mode"], "docker_container")
+        self.assertEqual(sidebar_dummy.cfg["remote_devices"][0]["remote_mode"], "ssh")
+        self.assertEqual(profiles[0]["remote_mode"], "ssh")
+        self.assertEqual(profiles[0]["takeover_mode"], "path")
+        self.assertEqual(profiles[0]["takeover_agent_dir"], "/opt/agant")
+        self.assertEqual(profiles[0]["docker_takeover_container"], "")
+        self.assertEqual(profiles[0]["docker_takeover_agent_dir"], "")
 
     def test_sync_draft_from_floating_propagates_empty_text_back_to_main_editor(self):
         class DummyEditor:
@@ -5835,6 +8997,80 @@ native_oai_config2 = {
         self.assertTrue(dummy._tray_mode_active)
         self.assertEqual(dummy.calls, ["refresh_tray"])
 
+    def test_close_tray_helpers_clears_reply_notify_tray_and_hides_stale_reply_tray(self):
+        class DummyFloating:
+            def __init__(self):
+                self.calls = []
+
+            def hide(self):
+                self.calls.append("hide")
+
+            def deleteLater(self):
+                self.calls.append("delete")
+
+        class DummyTray:
+            def __init__(self):
+                self.calls = []
+
+            def hide(self):
+                self.calls.append("hide")
+
+        class DummyPopup:
+            def __init__(self):
+                self.calls = []
+
+            def hide(self):
+                self.calls.append("hide")
+
+            def close(self):
+                self.calls.append("close")
+
+            def deleteLater(self):
+                self.calls.append("delete")
+
+        class DummyHost:
+            _close_tray_helpers = launcher_window.QtChatWindow._close_tray_helpers
+            _close_reply_done_popups = launcher_window.QtChatWindow._close_reply_done_popups
+
+            def __init__(self):
+                self._floating_chat_window = DummyFloating()
+                self._launcher_tray_icon = DummyTray()
+                self._reply_notify_tray = DummyTray()
+                self._reply_done_popups = [DummyPopup()]
+                self._launcher_tray_menu = object()
+                self._tray_restore_main_action = object()
+                self._tray_show_floating_action = object()
+                self._tray_hide_floating_action = object()
+                self._tray_exit_action = object()
+                self._launcher_tray_signal_owner = object()
+                self._tray_restore_to_fullscreen = True
+                self._tray_restore_to_maximized = True
+
+        dummy = DummyHost()
+        floating = dummy._floating_chat_window
+        launcher_tray = dummy._launcher_tray_icon
+        reply_tray = dummy._reply_notify_tray
+        popup = dummy._reply_done_popups[0]
+
+        dummy._close_tray_helpers()
+
+        self.assertEqual(floating.calls, ["hide", "delete"])
+        self.assertEqual(launcher_tray.calls, ["hide"])
+        self.assertEqual(reply_tray.calls, ["hide"])
+        self.assertEqual(popup.calls, ["hide", "close", "delete"])
+        self.assertIsNone(dummy._floating_chat_window)
+        self.assertIsNone(dummy._launcher_tray_icon)
+        self.assertIsNone(dummy._reply_notify_tray)
+        self.assertEqual(dummy._reply_done_popups, [])
+        self.assertIsNone(dummy._launcher_tray_menu)
+        self.assertIsNone(dummy._tray_restore_main_action)
+        self.assertIsNone(dummy._tray_show_floating_action)
+        self.assertIsNone(dummy._tray_hide_floating_action)
+        self.assertIsNone(dummy._tray_exit_action)
+        self.assertIsNone(dummy._launcher_tray_signal_owner)
+        self.assertFalse(dummy._tray_restore_to_fullscreen)
+        self.assertFalse(dummy._tray_restore_to_maximized)
+
     def test_floating_hide_action_text_uses_hide_label_without_tray_on_macos(self):
         class DummyHost:
             _floating_hide_action_text = launcher_window.QtChatWindow._floating_hide_action_text
@@ -6349,6 +9585,32 @@ native_oai_config2 = {
         self.assertEqual(dummy.requested, ["sess-1"])
         self.assertIsNone(dummy._pending_state_session)
         self.assertEqual(dummy.status_text, "桥接进程已就绪。")
+
+    def test_set_status_keeps_recent_done_message_from_ready_override(self):
+        class DummyLabel:
+            def __init__(self, text=""):
+                self._text = str(text or "")
+
+            def setText(self, text):
+                self._text = str(text or "")
+
+            def text(self):
+                return str(self._text)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _set_status = BridgeRuntimeMixin._set_status
+
+            def __init__(self):
+                self.status_label = DummyLabel("已完成。")
+                self._last_task_complete_status_at = 1000.0
+
+            def _refresh_info_tooltip(self):
+                return None
+
+        dummy = DummyBridge()
+        with mock.patch.object(bridge_runtime.time, "time", return_value=1003.0):
+            dummy._set_status("桥接进程已就绪。")
+        self.assertEqual(dummy.status_label.text(), "已完成。")
 
     def test_load_session_by_id_preserves_saved_local_state_with_real_bind_mixin(self):
         class DummyCombo:
@@ -7713,6 +10975,464 @@ native_oai_config2 = {
         load_session.assert_not_called()
         save_session.assert_not_called()
 
+    def test_fetch_remote_channel_snapshots_uses_docker_exec_and_parses_external_rows(self):
+        class DummyClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummySidebar(SidebarSessionsMixin):
+            _fetch_remote_channel_snapshots = SidebarSessionsMixin._fetch_remote_channel_snapshots
+
+            def __init__(self):
+                self.commands = []
+                self.client = DummyClient()
+
+            def _remote_device_auto_ssh_enabled(self, device):
+                return True
+
+            def _remote_device_ssh_payload(self, device):
+                return {"host": "10.0.0.8"}
+
+            def _open_vps_ssh_client(self, payload, timeout=8):
+                return self.client, "", "", False
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                payload = {
+                    "rows": [
+                        {
+                            "channel_id": "telegram",
+                            "channel_label": "Telegram / 纸飞机",
+                            "title": "Telegram 进程",
+                            "updated_at": 123.0,
+                            "process_status": "外部运行中",
+                            "process_pid": 4321,
+                            "process_started_at": 0.0,
+                            "process_ended_at": 0.0,
+                            "managed_by_launcher": False,
+                            "bubble_text": "external snapshot",
+                        }
+                    ]
+                }
+                return 0, json.dumps(payload, ensure_ascii=False), ""
+
+        dummy = DummySidebar()
+        device = {
+            "id": "box-1",
+            "host": "10.0.0.8",
+            "username": "root",
+            "agent_mode": "docker",
+            "remote_mode": "docker_container",
+            "docker_container": "ga-prod",
+            "docker_agent_dir": "/opt/agant",
+            "agent_dir": "/opt/agant",
+            "python_cmd": "python3",
+        }
+        specs = [{"id": "telegram", "label": "Telegram / 纸飞机", "script": "tgapp.py"}]
+        with mock.patch.object(sidebar_sessions.lz, "COMM_CHANNEL_SPECS", specs):
+            ok, rows, err = dummy._fetch_remote_channel_snapshots(device)
+
+        self.assertTrue(ok, msg=err)
+        self.assertEqual(rows[0]["process_status"], "外部运行中")
+        self.assertFalse(rows[0]["managed_by_launcher"])
+        self.assertEqual(rows[0]["process_pid"], 4321)
+        self.assertTrue(dummy.client.closed)
+        self.assertTrue(any("docker exec -i" in cmd and "ga-prod" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("ps -eo pid=,args=" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("frontends/tgapp.py" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("process_cmdline_matches_agent_script" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("/proc/" in cmd and "/cwd" in cmd for cmd in dummy.commands))
+        self.assertFalse(any("    })\nfor cid, proc_info in scan_external_processes()" in cmd for cmd in dummy.commands))
+
+    def test_fetch_remote_channel_snapshots_includes_wechat_lock_probe_for_unmatched_instances(self):
+        class DummyClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummySidebar(SidebarSessionsMixin):
+            _fetch_remote_channel_snapshots = SidebarSessionsMixin._fetch_remote_channel_snapshots
+
+            def __init__(self):
+                self.commands = []
+                self.client = DummyClient()
+
+            def _remote_device_auto_ssh_enabled(self, device):
+                return True
+
+            def _remote_device_ssh_payload(self, device):
+                return {"host": "10.0.0.9"}
+
+            def _open_vps_ssh_client(self, payload, timeout=8):
+                return self.client, "", "", False
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, json.dumps({"rows": []}, ensure_ascii=False), ""
+
+        dummy = DummySidebar()
+        device = {
+            "id": "box-2",
+            "host": "10.0.0.9",
+            "username": "root",
+            "agent_dir": "/opt/agant",
+            "python_cmd": "python3",
+        }
+        specs = [{"id": "wechat", "label": "微信", "script": "wechatapp.py"}]
+        with mock.patch.object(sidebar_sessions.lz, "COMM_CHANNEL_SPECS", specs):
+            ok, _rows, err = dummy._fetch_remote_channel_snapshots(device)
+
+        self.assertTrue(ok, msg=err)
+        self.assertTrue(dummy.client.closed)
+        self.assertTrue(any("def wechat_lock_occupied" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("def wechat_lock_pid" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("matched_process_info('wechat', wechat_pid)" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("claim_channel_process('wechat'" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("ss -ltnp" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("WeChat 单实例锁检测（未匹配到进程命令）" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("rows_by_channel['wechat']" in cmd for cmd in dummy.commands))
+
+    def test_fetch_remote_channel_snapshots_revalidates_managed_pid_and_prefilters_candidates(self):
+        class DummyClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummySidebar(SidebarSessionsMixin):
+            _fetch_remote_channel_snapshots = SidebarSessionsMixin._fetch_remote_channel_snapshots
+
+            def __init__(self):
+                self.commands = []
+                self.client = DummyClient()
+
+            def _remote_device_auto_ssh_enabled(self, device):
+                return True
+
+            def _remote_device_ssh_payload(self, device):
+                return {"host": "10.0.0.10"}
+
+            def _open_vps_ssh_client(self, payload, timeout=8):
+                return self.client, "", "", False
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, json.dumps({"rows": []}, ensure_ascii=False), ""
+
+        dummy = DummySidebar()
+        device = {
+            "id": "box-3",
+            "host": "10.0.0.10",
+            "username": "root",
+            "agent_dir": "/opt/agant",
+            "python_cmd": "python3",
+        }
+        specs = [
+            {"id": "wechat", "label": "微信", "script": "wechatapp.py"},
+            {"id": "telegram", "label": "Telegram / 纸飞机", "script": "tgapp.py"},
+        ]
+        with mock.patch.object(sidebar_sessions.lz, "COMM_CHANNEL_SPECS", specs):
+            ok, _rows, err = dummy._fetch_remote_channel_snapshots(device)
+
+        self.assertTrue(ok, msg=err)
+        self.assertTrue(dummy.client.closed)
+        self.assertTrue(any("matched = matched_process_info(cid, pid) if alive and pid > 0 else None" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("candidate_specs = []" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("process_cmdline_has_script(cmd, script_rel)" in cmd for cmd in dummy.commands))
+
+    def test_generated_remote_channel_snapshot_script_ignores_stale_managed_session_rows(self):
+        class DummyClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummySidebar(SidebarSessionsMixin):
+            _fetch_remote_channel_snapshots = SidebarSessionsMixin._fetch_remote_channel_snapshots
+
+            def __init__(self):
+                self.commands = []
+                self.client = DummyClient()
+
+            def _remote_device_auto_ssh_enabled(self, device):
+                return True
+
+            def _remote_device_ssh_payload(self, device):
+                return {"host": "10.0.0.11"}
+
+            def _open_vps_ssh_client(self, payload, timeout=8):
+                return self.client, "", "", False
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, json.dumps({"rows": []}, ensure_ascii=False), ""
+
+        dummy = DummySidebar()
+        device = {
+            "id": "box-4",
+            "host": "10.0.0.11",
+            "username": "root",
+            "agent_dir": "/opt/agant",
+            "python_cmd": "python3",
+        }
+        specs = [{"id": "telegram", "label": "Telegram / 纸飞机", "script": "tgapp.py"}]
+        with mock.patch.object(sidebar_sessions.lz, "COMM_CHANNEL_SPECS", specs):
+            ok, _rows, err = dummy._fetch_remote_channel_snapshots(device)
+
+        self.assertTrue(ok, msg=err)
+        self.assertTrue(dummy.client.closed)
+        cmd = dummy.commands[0]
+        marker_pos = cmd.find("GA_SNAPSHOT_PY'\r\n")
+        marker_len = len("GA_SNAPSHOT_PY'\r\n")
+        if marker_pos < 0:
+            marker_pos = cmd.find("GA_SNAPSHOT_PY'\n")
+            marker_len = len("GA_SNAPSHOT_PY'\n")
+        self.assertGreaterEqual(marker_pos, 0, msg=cmd)
+        start = marker_pos + marker_len
+        end_marker = "\r\nGA_SNAPSHOT_PY"
+        end = cmd.rfind(end_marker)
+        if end < 0:
+            end_marker = "\nGA_SNAPSHOT_PY"
+            end = cmd.rfind(end_marker)
+        self.assertGreaterEqual(end, 0, msg=cmd)
+        script = cmd[start:end]
+
+        with tempfile.TemporaryDirectory() as td:
+            sess_dir = os.path.join(td, "temp", "launcher_sessions")
+            os.makedirs(sess_dir, exist_ok=True)
+            stale_path = os.path.join(sess_dir, "launcher_remote_channel_telegram.json")
+            with open(stale_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": "launcher_remote_channel_telegram",
+                        "title": "Telegram 进程",
+                        "session_kind": "channel_process",
+                        "channel_id": "telegram",
+                        "channel_label": "Telegram / 纸飞机",
+                        "process_pid": 999999,
+                        "process_status": "运行中",
+                        "process_started_at": 1.0,
+                        "process_ended_at": 0.0,
+                        "updated_at": 1.0,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            # This legacy file should be ignored because the scan now narrows to launcher_remote_channel_*.json.
+            with open(os.path.join(sess_dir, "other_channel_process.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": "other_channel_process",
+                        "title": "Other 进程",
+                        "session_kind": "channel_process",
+                        "channel_id": "other",
+                        "channel_label": "Other",
+                        "process_pid": 999998,
+                        "process_status": "运行中",
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=td,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = None
+            for line in reversed(str(result.stdout or "").splitlines()):
+                text = str(line or "").strip()
+                if not text.startswith("{"):
+                    continue
+                payload = json.loads(text)
+                break
+            self.assertIsInstance(payload, dict, msg=result.stdout)
+            self.assertEqual(payload.get("rows"), [])
+
+            with open(stale_path, "r", encoding="utf-8") as f:
+                stale_data = json.load(f)
+            self.assertEqual(stale_data.get("process_status"), "已退出")
+
+    def test_sync_remote_channel_process_sessions_claims_remote_process_with_pid(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _sync_remote_device_channel_process_sessions_blocking = SidebarSessionsMixin._sync_remote_device_channel_process_sessions_blocking
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+
+            def _auto_ssh_remote_devices(self):
+                return [{"id": "box-1", "name": "Docker Box"}]
+
+            def _fetch_remote_channel_snapshots(self, device):
+                return True, [
+                    {
+                        "channel_id": "telegram",
+                        "channel_label": "Telegram / 纸飞机",
+                        "title": "Telegram 进程",
+                        "updated_at": 321.0,
+                        "process_status": "运行中",
+                        "process_pid": 4321,
+                        "process_started_at": 0.0,
+                        "process_ended_at": 0.0,
+                        "managed_by_launcher": True,
+                        "bubble_text": "claimed snapshot",
+                    }
+                ], ""
+
+        dummy = DummySidebar()
+        saved = []
+        with mock.patch.object(lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            lz, "load_session", return_value={}
+        ), mock.patch.object(lz, "save_session", side_effect=lambda root, payload, touch=False: saved.append(dict(payload))), mock.patch.object(
+            lz, "list_sessions", return_value=[]
+        ):
+            changed = dummy._sync_remote_device_channel_process_sessions_blocking(agent_dir="C:\\demo")
+
+        self.assertTrue(changed)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], "rdev_box-1_telegram_proc")
+        self.assertEqual(saved[0]["process_status"], "运行中")
+        self.assertTrue(saved[0]["managed_by_launcher"])
+
+    def test_sync_remote_channel_process_sessions_keeps_external_fallback_without_pid(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _sync_remote_device_channel_process_sessions_blocking = SidebarSessionsMixin._sync_remote_device_channel_process_sessions_blocking
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+
+            def _auto_ssh_remote_devices(self):
+                return [{"id": "box-1", "name": "Docker Box"}]
+
+            def _fetch_remote_channel_snapshots(self, device):
+                return True, [
+                    {
+                        "channel_id": "wechat",
+                        "channel_label": "微信",
+                        "title": "微信 进程",
+                        "updated_at": 322.0,
+                        "process_status": "外部运行中",
+                        "process_pid": 0,
+                        "process_started_at": 0.0,
+                        "process_ended_at": 0.0,
+                        "managed_by_launcher": False,
+                        "bubble_text": "external fallback snapshot",
+                    }
+                ], ""
+
+        dummy = DummySidebar()
+        saved = []
+        with mock.patch.object(lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            lz, "load_session", return_value={}
+        ), mock.patch.object(lz, "save_session", side_effect=lambda root, payload, touch=False: saved.append(dict(payload))), mock.patch.object(
+            lz, "list_sessions", return_value=[]
+        ):
+            changed = dummy._sync_remote_device_channel_process_sessions_blocking(agent_dir="C:\\demo")
+
+        self.assertTrue(changed)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["process_status"], "外部运行中")
+        self.assertFalse(saved[0]["managed_by_launcher"])
+        self.assertEqual(saved[0]["process_pid"], 0)
+
+    def test_sync_remote_channel_process_sessions_preserves_launcher_managed_rows(self):
+        class DummySidebar(SidebarSessionsMixin):
+            _sync_remote_device_channel_process_sessions_blocking = SidebarSessionsMixin._sync_remote_device_channel_process_sessions_blocking
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+
+            def _auto_ssh_remote_devices(self):
+                return [{"id": "box-1", "name": "Mac Mini"}]
+
+            def _fetch_remote_channel_snapshots(self, device):
+                return True, [
+                    {
+                        "channel_id": "wechat",
+                        "channel_label": "微信",
+                        "title": "微信 进程",
+                        "updated_at": 654.0,
+                        "process_status": "运行中",
+                        "process_pid": 9876,
+                        "process_started_at": 600.0,
+                        "process_ended_at": 0.0,
+                        "managed_by_launcher": True,
+                        "bubble_text": "managed snapshot",
+                    }
+                ], ""
+
+        dummy = DummySidebar()
+        saved = []
+        with mock.patch.object(lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            lz, "load_session", return_value={}
+        ), mock.patch.object(lz, "save_session", side_effect=lambda root, payload, touch=False: saved.append(dict(payload))), mock.patch.object(
+            lz, "list_sessions", return_value=[]
+        ):
+            changed = dummy._sync_remote_device_channel_process_sessions_blocking(agent_dir="C:\\demo")
+
+        self.assertTrue(changed)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["process_status"], "运行中")
+        self.assertTrue(saved[0]["managed_by_launcher"])
+
+    def test_remote_exec_json_script_uses_docker_exec_for_container_targets(self):
+        class DummyClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _extract_json_payload = ChannelRuntimeMixin._extract_json_payload
+            _remote_exec_json_script = ChannelRuntimeMixin._remote_exec_json_script
+
+            def __init__(self):
+                self.commands = []
+                self.client = DummyClient()
+
+            def _settings_target_open_remote_client(self, device, timeout=10):
+                return self.client, ""
+
+            def _vps_exec_remote(self, client, cmd, timeout=0):
+                self.commands.append(str(cmd))
+                return 0, json.dumps({"ok": True, "mode": "docker"}, ensure_ascii=False), ""
+
+        dummy = DummyChannel()
+        device = {
+            "id": "box-1",
+            "host": "10.0.0.8",
+            "username": "root",
+            "agent_mode": "docker",
+            "remote_mode": "docker_container",
+            "docker_container": "ga-prod",
+            "docker_agent_dir": "/opt/agant",
+            "agent_dir": "/opt/agant",
+            "python_cmd": "python3",
+        }
+        ok, payload, err = dummy._remote_exec_json_script(device, "print('ignored')", timeout=20)
+
+        self.assertTrue(ok, msg=err)
+        self.assertEqual(payload["mode"], "docker")
+        self.assertTrue(dummy.client.closed)
+        self.assertTrue(any("docker exec -i" in cmd and "ga-prod" in cmd for cmd in dummy.commands))
+        self.assertTrue(any("/opt/agant" in cmd and "GA_REMOTE_PY" in cmd for cmd in dummy.commands))
+
     def test_restore_from_tray_mode_restores_maximized_window_state(self):
         class DummyEditor:
             def __init__(self):
@@ -7862,12 +11582,12 @@ native_oai_config2 = {
         }
         info = {
             "target_version": "1.2.4",
-            "external_url": "https://example.com/GenericAgentLauncher-macos-1.2.4.dmg",
-            "external_asset_name": "GenericAgentLauncher-macos-1.2.4.dmg",
+            "external_url": "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.dmg",
+            "external_asset_name": "GenericAgentLauncher-macos-arm64-1.2.4.dmg",
             "release_url": "https://github.com/example/release/v1.2.4",
-            "readme_url": "https://example.com/README-macOS.txt",
-            "sha256_url": "https://example.com/GenericAgentLauncher-macos-1.2.4.sha256",
-            "metadata_url": "https://example.com/install-metadata.json",
+            "readme_url": "https://example.com/README-macOS-arm64.txt",
+            "sha256_url": "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.sha256",
+            "metadata_url": "https://example.com/install-metadata-arm64.json",
         }
         with mock.patch.object(personal_usage.lz, "IS_MACOS", True), mock.patch.object(
             personal_usage.lz, "DATA_ROOT", install_state["data_root"]
@@ -7878,15 +11598,15 @@ native_oai_config2 = {
 
         self.assertEqual(payload["recommended_install_target"], "/Applications/GenericAgent Launcher.app")
         self.assertEqual(payload["data_root"], install_state["data_root"])
-        self.assertEqual(payload["readme_url"], "https://example.com/README-macOS.txt")
-        self.assertEqual(payload["sha256_url"], "https://example.com/GenericAgentLauncher-macos-1.2.4.sha256")
-        self.assertEqual(payload["metadata_url"], "https://example.com/install-metadata.json")
+        self.assertEqual(payload["readme_url"], "https://example.com/README-macOS-arm64.txt")
+        self.assertEqual(payload["sha256_url"], "https://example.com/GenericAgentLauncher-macos-arm64-1.2.4.sha256")
+        self.assertEqual(payload["metadata_url"], "https://example.com/install-metadata-arm64.json")
         self.assertIn("目标版本：1.2.4", payload["detail_text"])
         self.assertIn("建议替换路径：/Applications/GenericAgent Launcher.app", payload["detail_text"])
         self.assertIn("用户数据目录：/Users/tester/Library/Application Support/GenericAgentLauncher", payload["detail_text"])
         self.assertIn("优先推荐放到 /Applications", payload["detail_text"])
-        self.assertIn("README-macOS.txt", payload["detail_text"])
-        self.assertIn("install-metadata.json", payload["detail_text"])
+        self.assertIn("README-macOS-arm64.txt", payload["detail_text"])
+        self.assertIn("install-metadata-arm64.json", payload["detail_text"])
         self.assertIn("System Settings -> Privacy & Security -> Open Anyway", payload["detail_text"])
         self.assertIn("Finder 右键应用并选择 Open", payload["detail_text"])
 

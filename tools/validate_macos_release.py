@@ -73,12 +73,14 @@ def _normalized_arch(raw: str) -> str:
     return value
 
 
-def _expected_artifact_names(version: str) -> dict:
+def _expected_artifact_names(version: str, *, arch: str = "") -> dict:
     resolved = str(version or "").strip().lstrip("v")
+    resolved_arch = _normalized_arch(arch)
+    arch_prefix = f"{resolved_arch}-" if resolved_arch else ""
     return {
         "app_bundle": APP_BUNDLE_NAME,
-        "dmg": f"GenericAgentLauncher-macos-{resolved}.dmg",
-        "sha256": f"GenericAgentLauncher-macos-{resolved}.sha256",
+        "dmg": f"GenericAgentLauncher-macos-{arch_prefix}{resolved}.dmg",
+        "sha256": f"GenericAgentLauncher-macos-{arch_prefix}{resolved}.sha256",
         "readme": "README-macOS.txt",
         "metadata": "install-metadata.json",
         "version_json": MACOS_VERSION_JSON_RELATIVE_PATH,
@@ -109,7 +111,6 @@ def _assert_version_meta(payload: dict, *, version: str, expected_commit: str = 
 
 
 def _assert_install_metadata(payload: dict, *, version: str, expected_commit: str = "", expected_arch: str = "", expected_runner_label: str = ""):
-    expected_names = _expected_artifact_names(version)
     if str(payload.get("platform") or "").strip() != "macos":
         _die(f"unexpected platform: {payload.get('platform')}")
     if str(payload.get("version") or "").strip() != version:
@@ -147,6 +148,7 @@ def _assert_install_metadata(payload: dict, *, version: str, expected_commit: st
         _die("missing build_arch in install metadata")
     if expected_arch and build_arch != _normalized_arch(expected_arch):
         _die(f"build_arch mismatch: expected {_normalized_arch(expected_arch)}, got {build_arch}")
+    expected_names = _expected_artifact_names(version, arch=expected_arch or build_arch)
     runner_label = str(payload.get("runner_label") or "").strip()
     if expected_runner_label and runner_label != expected_runner_label:
         _die(f"runner_label mismatch: expected {expected_runner_label}, got {runner_label}")
@@ -262,7 +264,7 @@ def _assert_mounted_layout(
     readme_bytes: bytes,
     metadata_bytes: bytes,
 ):
-    expected_names = _expected_artifact_names(version)
+    expected_names = _expected_artifact_names(version, arch=expected_arch)
     app_path = os.path.join(mount_point, expected_names["app_bundle"])
     applications_alias = os.path.join(mount_point, "Applications")
     readme_path = os.path.join(mount_point, expected_names["readme"])
@@ -305,19 +307,23 @@ def main() -> int:
         _die("missing --version")
 
     macos_dir = os.path.join(os.path.abspath(str(args.out or "release")), version, "macos")
-    expected_names = _expected_artifact_names(version)
     required = {
-        "app_bundle": os.path.join(macos_dir, expected_names["app_bundle"]),
-        "dmg": os.path.join(macos_dir, expected_names["dmg"]),
-        "sha256": os.path.join(macos_dir, expected_names["sha256"]),
-        "readme": os.path.join(macos_dir, expected_names["readme"]),
-        "metadata": os.path.join(macos_dir, expected_names["metadata"]),
+        "app_bundle": os.path.join(macos_dir, APP_BUNDLE_NAME),
+        "readme": os.path.join(macos_dir, "README-macOS.txt"),
+        "metadata": os.path.join(macos_dir, "install-metadata.json"),
     }
     for label, path in required.items():
         if not os.path.exists(path):
             _die(f"missing macOS release asset ({label}): {path}")
 
     metadata = _load_json(required["metadata"])
+    resolved_arch = expected_arch or _normalized_arch(metadata.get("build_arch"))
+    expected_names = _expected_artifact_names(version, arch=resolved_arch)
+    required["dmg"] = os.path.join(macos_dir, expected_names["dmg"])
+    required["sha256"] = os.path.join(macos_dir, expected_names["sha256"])
+    for label in ("dmg", "sha256"):
+        if not os.path.exists(required[label]):
+            _die(f"missing macOS release asset ({label}): {required[label]}")
     _assert_install_metadata(
         metadata,
         version=version,

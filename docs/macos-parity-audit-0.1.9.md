@@ -50,7 +50,7 @@
 这些差异是当前产品定义的一部分，不算 bug：
 
 - Windows 有内部更新器、回滚、安装器；mac 没有
-- Windows 发布资产以安装包 + 内部更新资产为主；mac 公开资产是 `.dmg + .sha256 + README-macOS.txt + install-metadata.json`
+- Windows 发布资产以安装包 + 内部更新资产为主；mac 公开资产是双架构 `.dmg + .sha256 + README-macOS-<arch>.txt + install-metadata-<arch>.json`
 - Windows 可做私有 Python 安装器；mac 当前固定使用系统 Python
 - Windows 可继续走签名和安装器增强；mac 当前明确不做 Apple Developer 签名和 notarization
 

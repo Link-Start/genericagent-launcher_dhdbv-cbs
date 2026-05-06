@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMessageBox,
     QPushButton,
-    QVBoxLayout,
 )
 
 from launcher_app import core as lz
@@ -32,12 +31,31 @@ from .common import (
     _session_copy,
     capture_runtime_context,
     normalize_remote_agent_dir,
+    process_matcher_script_source,
+    remote_device_agent_dir,
+    remote_device_agent_mode,
+    remote_device_container_name,
+    remote_device_remote_mode,
     normalize_ssh_error_text,
     runtime_context_matches,
+    strip_auto_docker_name_suffix,
 )
 
 
 class SidebarSessionsMixin:
+    def _remote_sync_cache_root(self, *, agent_dir=""):
+        candidate = str(agent_dir or self.agent_dir or "").strip()
+        if candidate:
+            try:
+                return os.path.abspath(candidate)
+            except Exception:
+                return candidate
+        fallback = os.path.join(os.path.expanduser("~"), ".genericagent_launcher")
+        try:
+            return os.path.abspath(fallback)
+        except Exception:
+            return fallback
+
     def _sidebar_button_style(self, *, primary: bool = False, subtle: bool = False, selected: bool = False) -> str:
         radius = F["radius_md"]
         palette = C
@@ -94,9 +112,14 @@ class SidebarSessionsMixin:
         name = str(item.get("name") or host).strip() or host
         key_path = str(item.get("ssh_key_path") or "").strip()
         password = str(item.get("password") or "").strip()
-        agent_dir = normalize_remote_agent_dir(item.get("agent_dir"), username=username)
+        agent_mode = remote_device_agent_mode(item)
+        agent_dir = remote_device_agent_dir(item, username=username)
         python_cmd = str(item.get("python_cmd") or "python3").strip() or "python3"
         auto_ssh = self._normalize_remote_auto_ssh_value(item.get("auto_ssh", True), default=True)
+        docker_container = remote_device_container_name(item)
+        remote_mode = remote_device_remote_mode(item)
+        if agent_mode == "docker":
+            name = strip_auto_docker_name_suffix(name) or host
         return {
             "id": did,
             "name": name,
@@ -106,9 +129,22 @@ class SidebarSessionsMixin:
             "ssh_key_path": key_path,
             "password": password,
             "agent_dir": agent_dir,
+            "agent_mode": agent_mode,
+            "remote_mode": remote_mode,
+            "docker_container": docker_container,
+            "docker_agent_dir": agent_dir if agent_mode == "docker" else "",
             "python_cmd": python_cmd,
             "auto_ssh": auto_ssh,
         }
+
+    def _remote_device_name_needs_cleanup(self, raw) -> bool:
+        item = raw if isinstance(raw, dict) else {}
+        if remote_device_agent_mode(item) != "docker":
+            return False
+        raw_name = str(item.get("name") or "").strip()
+        if not raw_name:
+            return False
+        return strip_auto_docker_name_suffix(raw_name) != raw_name
 
     def _fallback_remote_device_from_vps(self):
         cfg = dict(self.cfg.get("vps_connection") or {})
@@ -147,8 +183,11 @@ class SidebarSessionsMixin:
     def _remote_devices(self):
         raw_rows = self.cfg.get("remote_devices")
         rows = []
+        writeback_required = False
         if isinstance(raw_rows, list):
             for raw in raw_rows:
+                if self._remote_device_name_needs_cleanup(raw):
+                    writeback_required = True
                 norm = self._normalize_remote_device(raw)
                 if norm:
                     rows.append(norm)
@@ -164,6 +203,12 @@ class SidebarSessionsMixin:
                 continue
             seen.add(did)
             out.append(row)
+        if out and writeback_required and not bool(getattr(self, "_remote_device_name_cleanup_in_progress", False)):
+            try:
+                self._remote_device_name_cleanup_in_progress = True
+                self._save_remote_devices(out)
+            finally:
+                self._remote_device_name_cleanup_in_progress = False
         return out
 
     def _save_remote_devices(self, rows):
@@ -346,8 +391,19 @@ class SidebarSessionsMixin:
 
     def _remote_launcher_sessions_dir(self, device):
         dev = device if isinstance(device, dict) else {}
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
         return f"{remote_dir.rstrip('/')}/temp/launcher_sessions"
+
+    def _remote_device_stage_root(self, device):
+        dev = device if isinstance(device, dict) else {}
+        did = self._normalize_remote_session_id(dev.get("id") or "remote-device", fallback="remote-device")
+        return f"/tmp/genericagent_launcher_remote/{did}"
+
+    def _remote_launcher_sessions_stage_dir(self, device):
+        return self._remote_device_stage_root(device).rstrip("/") + "/launcher_sessions"
+
+    def _remote_device_uses_docker(self, device) -> bool:
+        return remote_device_agent_mode(device) == "docker"
 
     def _open_remote_device_client(self, device, *, timeout=10):
         if not self._remote_device_auto_ssh_enabled(device):
@@ -365,6 +421,17 @@ class SidebarSessionsMixin:
 
     def _ensure_remote_launcher_sessions_dir(self, client, device):
         remote_sessions_dir = self._remote_launcher_sessions_dir(device)
+        if self._remote_device_uses_docker(device):
+            container = remote_device_container_name(device)
+            stage_dir = self._remote_launcher_sessions_stage_dir(device)
+            cmd = (
+                f"mkdir -p {shlex.quote(stage_dir)} && "
+                f"docker exec {shlex.quote(container)} sh -lc {shlex.quote('mkdir -p ' + shlex.quote(remote_sessions_dir))}"
+            )
+            rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+            if rc != 0:
+                return False, str(err or "创建容器内会话目录失败。").strip() or "创建容器内会话目录失败。"
+            return True, ""
         rc, _out, err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(remote_sessions_dir)}", timeout=20)
         if rc != 0:
             return False, str(err or "创建远端会话目录失败。").strip() or "创建远端会话目录失败。"
@@ -382,15 +449,26 @@ class SidebarSessionsMixin:
             sftp = client.open_sftp()
             try:
                 remote_dir = self._remote_launcher_sessions_dir(device)
+                read_dir = remote_dir
+                if self._remote_device_uses_docker(device):
+                    stage_dir = self._remote_launcher_sessions_stage_dir(device)
+                    container = remote_device_container_name(device)
+                    cmd = (
+                        f"mkdir -p {shlex.quote(stage_dir)} && "
+                        f"find {shlex.quote(stage_dir)} -maxdepth 1 -type f -name '*.json' -delete >/dev/null 2>&1 || true; "
+                        f"docker cp {shlex.quote(container + ':' + remote_dir.rstrip('/') + '/.')} {shlex.quote(stage_dir)} >/dev/null 2>&1 || true"
+                    )
+                    self._vps_exec_remote(client, cmd, timeout=40)
+                    read_dir = stage_dir
                 try:
-                    names = list(sftp.listdir(remote_dir))
+                    names = list(sftp.listdir(read_dir))
                 except Exception:
                     names = []
                 for name in names:
                     fn = str(name or "").strip()
                     if not fn.endswith(".json") or fn.startswith("."):
                         continue
-                    remote_fp = f"{remote_dir}/{fn}"
+                    remote_fp = f"{read_dir}/{fn}"
                     try:
                         with sftp.open(remote_fp, "rb") as fp:
                             raw = fp.read()
@@ -456,8 +534,22 @@ class SidebarSessionsMixin:
             try:
                 remote_dir = self._remote_launcher_sessions_dir(device)
                 remote_fp = f"{remote_dir}/{remote_sid}.json"
+                read_fp = remote_fp
+                if self._remote_device_uses_docker(device):
+                    stage_dir = self._remote_launcher_sessions_stage_dir(device)
+                    stage_fp = f"{stage_dir}/{remote_sid}.json"
+                    container = remote_device_container_name(device)
+                    cmd = (
+                        f"mkdir -p {shlex.quote(stage_dir)} && "
+                        f"rm -f {shlex.quote(stage_fp)} >/dev/null 2>&1 || true; "
+                        f"docker cp {shlex.quote(container + ':' + remote_fp)} {shlex.quote(stage_fp)} >/dev/null 2>&1"
+                    )
+                    rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+                    if rc != 0:
+                        return None, str(err or "读取容器内会话失败。").strip() or "读取容器内会话失败。"
+                    read_fp = stage_fp
                 try:
-                    with sftp.open(remote_fp, "rb") as fp:
+                    with sftp.open(read_fp, "rb") as fp:
                         raw = fp.read()
                 except Exception as e:
                     return None, f"读取远端会话失败：{e}"
@@ -534,9 +626,7 @@ class SidebarSessionsMixin:
         return payload
 
     def _sync_remote_device_launcher_sessions_blocking(self, *, force=False, device_id="", include_all_channels=False, include_usage=False, agent_dir="", runtime_context=None):
-        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
-        if not lz.is_valid_agent_dir(root):
-            return False
+        root = self._remote_sync_cache_root(agent_dir=agent_dir)
         if not force:
             mode = str(getattr(self, "_sidebar_view_mode", "roots") or "roots").strip().lower()
             scope, _did = self._current_device_context()
@@ -674,8 +764,6 @@ class SidebarSessionsMixin:
         return current_scope == "remote"
 
     def _sync_remote_device_launcher_sessions(self, *, force=False, device_id="", trigger_refresh=True):
-        if not lz.is_valid_agent_dir(self.agent_dir):
-            return
         req_device_id = str(device_id or "").strip()
         if not self._auto_ssh_remote_devices(req_device_id):
             return
@@ -771,18 +859,42 @@ class SidebarSessionsMixin:
             sftp = client.open_sftp()
             remote_dir = self._remote_launcher_sessions_dir(dev)
             remote_fp = f"{remote_dir}/{remote_sid}.json"
+            write_fp = remote_fp
+            stage_dir = self._remote_launcher_sessions_stage_dir(dev)
+            if self._remote_device_uses_docker(dev):
+                write_fp = f"{stage_dir}/{remote_sid}.json"
             previous_remote_bytes = None
             try:
-                with sftp.open(remote_fp, "rb") as fp:
-                    previous_remote_bytes = fp.read()
+                if self._remote_device_uses_docker(dev):
+                    container = remote_device_container_name(dev)
+                    cmd = (
+                        f"mkdir -p {shlex.quote(stage_dir)} && "
+                        f"rm -f {shlex.quote(write_fp)} >/dev/null 2>&1 || true; "
+                        f"docker cp {shlex.quote(container + ':' + remote_fp)} {shlex.quote(write_fp)} >/dev/null 2>&1"
+                    )
+                    rc, _out, _err = self._vps_exec_remote(client, cmd, timeout=30)
+                    if rc != 0:
+                        previous_remote_bytes = None
+                    else:
+                        with sftp.open(write_fp, "rb") as fp:
+                            previous_remote_bytes = fp.read()
+                else:
+                    with sftp.open(remote_fp, "rb") as fp:
+                        previous_remote_bytes = fp.read()
             except Exception as read_err:
                 read_text = str(read_err or "").strip().lower()
                 read_errno = getattr(read_err, "errno", None)
                 if read_errno not in (None, 2) and "no such file" not in read_text and "not found" not in read_text:
                     raise
             text = json.dumps(payload, ensure_ascii=False, indent=2)
-            with sftp.open(remote_fp, "wb") as fp:
+            with sftp.open(write_fp, "wb") as fp:
                 fp.write(text.encode("utf-8"))
+            if self._remote_device_uses_docker(dev):
+                container = remote_device_container_name(dev)
+                cmd = f"docker cp {shlex.quote(write_fp)} {shlex.quote(container + ':' + remote_fp)}"
+                rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+                if rc != 0:
+                    return False, str(err or "写入容器内会话失败。").strip() or "写入容器内会话失败。"
         except Exception as e:
             return False, f"写入远端会话失败：{e}"
         local_payload = dict(payload)
@@ -794,10 +906,24 @@ class SidebarSessionsMixin:
         except Exception as save_err:
             try:
                 if previous_remote_bytes is None:
-                    sftp.remove(remote_fp)
+                    if self._remote_device_uses_docker(dev):
+                        self._vps_exec_remote(
+                            client,
+                            f"docker exec {shlex.quote(remote_device_container_name(dev))} sh -lc {shlex.quote('rm -f ' + shlex.quote(remote_fp))}",
+                            timeout=20,
+                        )
+                    else:
+                        sftp.remove(remote_fp)
                 else:
-                    with sftp.open(remote_fp, "wb") as fp:
+                    rollback_fp = write_fp
+                    with sftp.open(rollback_fp, "wb") as fp:
                         fp.write(previous_remote_bytes)
+                    if self._remote_device_uses_docker(dev):
+                        self._vps_exec_remote(
+                            client,
+                            f"docker cp {shlex.quote(rollback_fp)} {shlex.quote(remote_device_container_name(dev) + ':' + remote_fp)}",
+                            timeout=30,
+                        )
             except Exception as rollback_err:
                 return False, f"写入本地缓存失败：{save_err}；且远端回滚失败：{rollback_err}"
             return False, f"写入本地缓存失败：{save_err}；已回滚远端改动。"
@@ -861,7 +987,11 @@ class SidebarSessionsMixin:
             if not ok:
                 return False, detail
             remote_dir = self._remote_launcher_sessions_dir(dev)
-            cmd = f"rm -f {shlex.quote(remote_dir.rstrip('/') + '/' + remote_sid + '.json')} >/dev/null 2>&1 || true"
+            remote_fp = remote_dir.rstrip("/") + "/" + remote_sid + ".json"
+            if self._remote_device_uses_docker(dev):
+                cmd = f"docker exec {shlex.quote(remote_device_container_name(dev))} sh -lc {shlex.quote('rm -f ' + shlex.quote(remote_fp))}"
+            else:
+                cmd = f"rm -f {shlex.quote(remote_fp)} >/dev/null 2>&1 || true"
             rc, _out, err = self._vps_exec_remote(client, cmd, timeout=20)
             if rc != 0:
                 return False, str(err or "删除远端会话失败。").strip() or "删除远端会话失败。"
@@ -955,8 +1085,24 @@ class SidebarSessionsMixin:
         if not payload:
             return False, [], "远程设备 SSH 配置无效。"
         dev = device if isinstance(device, dict) else {}
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username")) or normalize_remote_agent_dir(
+            dev.get("agent_dir"),
+            username=dev.get("username"),
+        )
+        if not str(remote_dir or "").strip():
+            return False, [], "远端设备缺少可用的 agent_dir。"
+        agent_mode = remote_device_agent_mode(dev)
+        container = remote_device_container_name(dev)
         python_cmd = str((device or {}).get("python_cmd") or "python3").strip() or "python3"
+        channel_specs = [
+            {
+                "channel_id": str(spec.get("id") or "").strip(),
+                "channel_label": str(spec.get("label") or spec.get("id") or "").strip(),
+                "script_rel": ("frontends/" + str(spec.get("script") or "").strip()).replace("\\", "/"),
+            }
+            for spec in getattr(lz, "COMM_CHANNEL_SPECS", [])
+            if str(spec.get("id") or "").strip() and str(spec.get("script") or "").strip()
+        ]
         client, _err_msg, _detail, _missing = self._open_vps_ssh_client(payload, timeout=8)
         if client is None:
             detail = str(_detail or _err_msg or "SSH 连接失败。").strip() or "SSH 连接失败。"
@@ -964,7 +1110,7 @@ class SidebarSessionsMixin:
         try:
             q_dir = shlex.quote(remote_dir)
             q_py = shlex.quote(python_cmd)
-            cmd = (
+            inner_cmd = (
                 "set -e; "
                 f"cd {q_dir}; "
                 f"PY_BIN={q_py}; "
@@ -974,7 +1120,8 @@ class SidebarSessionsMixin:
                 "else echo '{}'; exit 0; fi; "
                 "fi; "
                 "\"$PY_BIN\" - <<'GA_SNAPSHOT_PY'\n"
-                "import glob, json, os, time\n"
+                "import glob, json, os, re, subprocess, time\n"
+                f"specs = json.loads({json.dumps(channel_specs, ensure_ascii=False)!r})\n"
                 "base = os.path.join(os.getcwd(), 'temp', 'launcher_sessions')\n"
                 "\n"
                 "def pid_alive(pid):\n"
@@ -1001,11 +1148,12 @@ class SidebarSessionsMixin:
                 "        return fallback\n"
                 "    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))\n"
                 "\n"
-                "def build_bubble(label, status, pid, started_at, ended_at, log_path, tail_text):\n"
+                "def build_bubble(label, status, pid, started_at, ended_at, log_path, tail_text, source_text):\n"
                 "    parts = [\n"
                 "        f'**{label} 渠道进程快照**',\n"
                 "        '',\n"
                 "        f'- 状态：{status or \"未知\"}',\n"
+                "        f'- 来源：{source_text or \"未知来源\"}',\n"
                 "        f'- PID：{pid or \"未知\"}',\n"
                 "        f'- 启动时间：{fmt_ts(started_at)}',\n"
                 "        f'- 结束时间：{fmt_ts(ended_at, \"仍在运行\") if float(ended_at or 0) > 0 else \"仍在运行\"}',\n"
@@ -1017,8 +1165,282 @@ class SidebarSessionsMixin:
                 "    ]\n"
                 "    return '\\n'.join(parts)\n"
                 "\n"
-                "rows = []\n"
-                "for fp in glob.glob(os.path.join(base, '*.json')):\n"
+                f"{process_matcher_script_source()}\n"
+                "\n"
+                "specs_by_channel = {\n"
+                "    str(spec.get('channel_id') or '').strip().lower(): spec\n"
+                "    for spec in specs\n"
+                "    if str(spec.get('channel_id') or '').strip()\n"
+                "}\n"
+                "\n"
+                "def load_json(path):\n"
+                "    if not path or (not os.path.isfile(path)):\n"
+                "        return {}\n"
+                "    try:\n"
+                "        with open(path, 'r', encoding='utf-8', errors='replace') as f:\n"
+                "            obj = json.load(f)\n"
+                "        return obj if isinstance(obj, dict) else {}\n"
+                "    except Exception:\n"
+                "        return {}\n"
+                "\n"
+                "def read_pid_cwd(pid):\n"
+                "    try:\n"
+                "        return os.path.realpath(f'/proc/{int(pid)}/cwd')\n"
+                "    except Exception:\n"
+                "        return ''\n"
+                "\n"
+                "def read_pid_cmdline(pid):\n"
+                "    try:\n"
+                "        with open(f'/proc/{int(pid)}/cmdline', 'rb') as f:\n"
+                "            raw = f.read()\n"
+                "        text = raw.replace(b'\\x00', b' ').decode('utf-8', errors='replace').strip()\n"
+                "        if text:\n"
+                "            return text\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        proc = subprocess.run(\n"
+                "            ['sh', '-lc', f'ps -p {int(pid)} -o args= 2>/dev/null || true'],\n"
+                "            capture_output=True,\n"
+                "            text=True,\n"
+                "            encoding='utf-8',\n"
+                "            errors='replace',\n"
+                "            timeout=5,\n"
+                "        )\n"
+                "        return str(proc.stdout or '').strip()\n"
+                "    except Exception:\n"
+                "        return ''\n"
+                "\n"
+                "def channel_session_path(channel_id):\n"
+                "    return os.path.join(base, f'launcher_remote_channel_{channel_id}.json')\n"
+                "\n"
+                "def build_snapshot_row(channel_id, label, status, pid, started_at, ended_at, log_path, title, source_text, managed, updated_at):\n"
+                "    tail_text = read_tail(log_path, limit=12000)\n"
+                "    return {\n"
+                "        'channel_id': channel_id,\n"
+                "        'channel_label': label,\n"
+                "        'title': title,\n"
+                "        'updated_at': float(updated_at or time.time()),\n"
+                "        'process_status': status,\n"
+                "        'process_pid': int(pid or 0),\n"
+                "        'process_started_at': float(started_at or 0),\n"
+                "        'process_ended_at': float(ended_at or 0),\n"
+                "        'channel_log_path': log_path,\n"
+                "        'bubble_text': build_bubble(label, status, int(pid or 0), started_at, ended_at, log_path, tail_text, source_text),\n"
+                "        'managed_by_launcher': bool(managed),\n"
+                "    }\n"
+                "\n"
+                "def claim_channel_process(channel_id, label, pid, log_path, title=''):\n"
+                "    if int(pid or 0) <= 0:\n"
+                "        return None\n"
+                "    session_path = channel_session_path(channel_id)\n"
+                "    existing = load_json(session_path)\n"
+                "    now = time.time()\n"
+                "    started_at = float(existing.get('process_started_at', 0) or 0)\n"
+                "    created_at = float(existing.get('created_at', now) or now)\n"
+                "    session = {\n"
+                "        'id': str(existing.get('id') or f'launcher_remote_channel_{channel_id}').strip() or f'launcher_remote_channel_{channel_id}',\n"
+                "        'title': str(existing.get('title') or title).strip() or (f'{label} 进程 ' + time.strftime('%m-%d %H:%M', time.localtime(now))),\n"
+                "        'created_at': created_at,\n"
+                "        'updated_at': now,\n"
+                "        'session_kind': 'channel_process',\n"
+                "        'session_source_label': label,\n"
+                "        'channel_id': channel_id,\n"
+                "        'channel_label': label,\n"
+                "        'process_pid': int(pid or 0),\n"
+                "        'process_status': '运行中',\n"
+                "        'process_started_at': started_at,\n"
+                "        'process_ended_at': 0,\n"
+                "        'channel_log_path': log_path,\n"
+                "        'bubbles': list(existing.get('bubbles') or []),\n"
+                "    }\n"
+                "    if bool(existing.get('pinned', False)):\n"
+                "        session['pinned'] = True\n"
+                "    try:\n"
+                "        with open(session_path, 'w', encoding='utf-8') as f:\n"
+                "            json.dump(session, f, ensure_ascii=False, indent=2)\n"
+                "    except Exception:\n"
+                "        return None\n"
+                "    return build_snapshot_row(\n"
+                "        channel_id,\n"
+                "        label,\n"
+                "        '运行中',\n"
+                "        int(pid or 0),\n"
+                "        started_at,\n"
+                "        0.0,\n"
+                "        log_path,\n"
+                "        session['title'],\n"
+                "        '启动器认领远端现有进程',\n"
+                "        True,\n"
+                "        session['updated_at'],\n"
+                "    )\n"
+                "\n"
+                "def matched_process_info(channel_id, pid):\n"
+                "    cid = str(channel_id or '').strip().lower()\n"
+                "    if (not cid) or int(pid or 0) <= 0:\n"
+                "        return None\n"
+                "    spec = specs_by_channel.get(cid) or {}\n"
+                "    script_rel = str(spec.get('script_rel') or '').strip()\n"
+                "    if not script_rel:\n"
+                "        return None\n"
+                "    target_base = os.getcwd()\n"
+                "    try:\n"
+                "        target_real = os.path.realpath(target_base)\n"
+                "    except Exception:\n"
+                "        target_real = ''\n"
+                "    cwd = read_pid_cwd(pid)\n"
+                "    cmd = read_pid_cmdline(pid)\n"
+                "    if not process_cmdline_matches_agent_script(cmd, target_base, script_rel, cwd=cwd, agent_dir_real=target_real, cwd_real=cwd):\n"
+                "        return None\n"
+                "    return {\n"
+                "        'channel_id': cid,\n"
+                "        'channel_label': str(spec.get('channel_label') or cid).strip() or cid,\n"
+                "        'process_pid': int(pid or 0),\n"
+                "    }\n"
+                "\n"
+                "def wechat_lock_occupied():\n"
+                "    sock = None\n"
+                "    try:\n"
+                "        import socket\n"
+                "        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "        sock.bind(('127.0.0.1', 19528))\n"
+                "        return False\n"
+                "    except OSError:\n"
+                "        return True\n"
+                "    except Exception:\n"
+                "        return False\n"
+                "    finally:\n"
+                "        if sock is not None:\n"
+                "            try:\n"
+                "                sock.close()\n"
+                "            except Exception:\n"
+                "                pass\n"
+                "\n"
+                "def wechat_lock_pid():\n"
+                "    try:\n"
+                "        proc = subprocess.run(\n"
+                "            ['sh', '-lc', \"ss -ltnp '( sport = :19528 )' 2>/dev/null || ss -ltnp 2>/dev/null | grep ':19528' || true\"],\n"
+                "            capture_output=True,\n"
+                "            text=True,\n"
+                "            encoding='utf-8',\n"
+                "            errors='replace',\n"
+                "            timeout=5,\n"
+                "        )\n"
+                "        text = str(proc.stdout or proc.stderr or '')\n"
+                "        for raw_pid in re.findall(r'pid=(\\d+)', text):\n"
+                "            pid = int(raw_pid or 0)\n"
+                "            if pid > 0:\n"
+                "                return pid\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        proc = subprocess.run(\n"
+                "            ['sh', '-lc', 'lsof -nP -iTCP:19528 -sTCP:LISTEN -t 2>/dev/null || true'],\n"
+                "            capture_output=True,\n"
+                "            text=True,\n"
+                "            encoding='utf-8',\n"
+                "            errors='replace',\n"
+                "            timeout=5,\n"
+                "        )\n"
+                "        for line in str(proc.stdout or '').splitlines():\n"
+                "            pid = int(str(line or '').strip() or 0)\n"
+                "            if pid > 0:\n"
+                "                return pid\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        proc = subprocess.run(\n"
+                "            ['sh', '-lc', \"netstat -lntp 2>/dev/null | grep ':19528 ' || true\"],\n"
+                "            capture_output=True,\n"
+                "            text=True,\n"
+                "            encoding='utf-8',\n"
+                "            errors='replace',\n"
+                "            timeout=5,\n"
+                "        )\n"
+                "        text = str(proc.stdout or '')\n"
+                "        m = re.search(r'\\s(\\d+)/(?:[^\\s]+)', text)\n"
+                "        if m:\n"
+                "            pid = int(m.group(1) or 0)\n"
+                "            if pid > 0:\n"
+                "                return pid\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    return 0\n"
+                "\n"
+                "def scan_external_processes():\n"
+                "    target_base = os.getcwd()\n"
+                "    target_real = ''\n"
+                "    try:\n"
+                "        target_real = os.path.realpath(target_base)\n"
+                "    except Exception:\n"
+                "        target_real = ''\n"
+                "    skip_pids = set()\n"
+                "    try:\n"
+                "        skip_pids.add(int(os.getpid() or 0))\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        skip_pids.add(int(os.getppid() or 0))\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        proc = subprocess.run(\n"
+                "            ['sh', '-lc', 'ps -eo pid=,args='],\n"
+                "            capture_output=True,\n"
+                "            text=True,\n"
+                "            encoding='utf-8',\n"
+                "            errors='replace',\n"
+                "            timeout=8,\n"
+                "        )\n"
+                "        if int(proc.returncode or 0) != 0:\n"
+                "            return {}\n"
+                "        lines = str(proc.stdout or '').splitlines()\n"
+                "    except Exception:\n"
+                "        return {}\n"
+                "    found = {}\n"
+                "    for line in lines:\n"
+                "        text = str(line or '').strip()\n"
+                "        if not text:\n"
+                "            continue\n"
+                "        parts = text.split(None, 1)\n"
+                "        if (not parts) or (not str(parts[0]).isdigit()):\n"
+                "            continue\n"
+                "        pid = int(parts[0])\n"
+                "        cmd = str(parts[1] if len(parts) > 1 else '')\n"
+                "        norm_cmd = normalize_process_match_text(cmd)\n"
+                "        if pid in skip_pids:\n"
+                "            continue\n"
+                "        if ('ga_snapshot_py' in norm_cmd) or ('<<\\'ga_snapshot_py\\'' in norm_cmd):\n"
+                "            continue\n"
+                "        candidate_specs = []\n"
+                "        for spec in specs:\n"
+                "            cid = str(spec.get('channel_id') or '').strip().lower()\n"
+                "            if not cid or cid in found:\n"
+                "                continue\n"
+                "            script_rel = str(spec.get('script_rel') or '').strip()\n"
+                "            if (not script_rel) or (not process_cmdline_has_script(cmd, script_rel)):\n"
+                "                continue\n"
+                "            candidate_specs.append((cid, spec, script_rel))\n"
+                "        if not candidate_specs:\n"
+                "            continue\n"
+                "        cwd = ''\n"
+                "        for cid, spec, script_rel in candidate_specs:\n"
+                "            if cid in found:\n"
+                "                continue\n"
+                "            if not cwd:\n"
+                "                cwd = read_pid_cwd(pid)\n"
+                "            if not process_cmdline_matches_agent_script(cmd, target_base, script_rel, cwd=cwd, agent_dir_real=target_real, cwd_real=cwd):\n"
+                "                continue\n"
+                "            found[cid] = {\n"
+                "                'channel_id': cid,\n"
+                "                'channel_label': str(spec.get('channel_label') or cid).strip() or cid,\n"
+                "                'process_pid': pid,\n"
+                "            }\n"
+                "    return found\n"
+                "\n"
+                "rows_by_channel = {}\n"
+                "known_rows_by_channel = {}\n"
+                "for fp in glob.glob(os.path.join(base, 'launcher_remote_channel_*.json')):\n"
                 "    try:\n"
                 "        with open(fp, 'r', encoding='utf-8', errors='replace') as f:\n"
                 "            data = json.load(f)\n"
@@ -1033,8 +1455,9 @@ class SidebarSessionsMixin:
                 "    ended = float(data.get('process_ended_at', 0) or 0)\n"
                 "    status = str(data.get('process_status') or '').strip()\n"
                 "    alive = pid_alive(pid)\n"
+                "    matched = matched_process_info(cid, pid) if alive and pid > 0 else None\n"
                 "    changed = False\n"
-                "    if alive:\n"
+                "    if matched is not None:\n"
                 "        if status != '运行中':\n"
                 "            status = '运行中'\n"
                 "            changed = True\n"
@@ -1052,8 +1475,14 @@ class SidebarSessionsMixin:
                 "    if not log_path:\n"
                 "        log_path = os.path.join(os.getcwd(), 'temp', 'launcher_channels', f'{cid}.log')\n"
                 "    tail_text = read_tail(log_path, limit=12000)\n"
-                "    bubble_text = build_bubble(clabel, status, pid, started, ended, log_path, tail_text)\n"
+                "    bubble_text = build_bubble(clabel, status, pid, started, ended, log_path, tail_text, '启动器托管快照')\n"
                 "    updated_at = float(data.get('updated_at', 0) or 0)\n"
+                "    known_rows_by_channel[cid] = {\n"
+                "        'channel_id': cid,\n"
+                "        'channel_label': clabel,\n"
+                "        'title': str(data.get('title') or f'{clabel} 进程'),\n"
+                "        'channel_log_path': log_path,\n"
+                "    }\n"
                 "    if changed:\n"
                 "        now = time.time()\n"
                 "        data['process_status'] = status\n"
@@ -1065,7 +1494,9 @@ class SidebarSessionsMixin:
                 "                json.dump(data, f, ensure_ascii=False, indent=2)\n"
                 "        except Exception:\n"
                 "            pass\n"
-                "    rows.append({\n"
+                "    if not alive:\n"
+                "        continue\n"
+                "    rows_by_channel[cid] = {\n"
                 "        'channel_id': cid,\n"
                 "        'channel_label': clabel,\n"
                 "        'title': str(data.get('title') or f'{clabel} 进程'),\n"
@@ -1074,12 +1505,88 @@ class SidebarSessionsMixin:
                 "        'process_pid': pid,\n"
                 "        'process_started_at': started,\n"
                 "        'process_ended_at': ended,\n"
+                "        'channel_log_path': log_path,\n"
                 "        'bubble_text': bubble_text,\n"
-                "    })\n"
+                "        'managed_by_launcher': True,\n"
+                "    }\n"
+                "for cid, proc_info in scan_external_processes().items():\n"
+                "    existing = rows_by_channel.get(cid) or known_rows_by_channel.get(cid) or {}\n"
+                "    status = str(existing.get('process_status') or '').strip()\n"
+                "    if bool(existing.get('managed_by_launcher', False)) and ('运行' in status) and ('退出' not in status):\n"
+                "        continue\n"
+                "    label = str(proc_info.get('channel_label') or existing.get('channel_label') or cid).strip() or cid\n"
+                "    log_path = str(existing.get('channel_log_path') or '').strip()\n"
+                "    if not log_path:\n"
+                "        log_path = os.path.join(os.getcwd(), 'temp', 'launcher_channels', f'{cid}.log')\n"
+                "    claimed = claim_channel_process(cid, label, int(proc_info.get('process_pid') or 0), log_path, str(existing.get('title') or ''))\n"
+                "    if claimed is not None:\n"
+                "        rows_by_channel[cid] = claimed\n"
+                "        continue\n"
+                "    rows_by_channel[cid] = build_snapshot_row(\n"
+                "        cid,\n"
+                "        label,\n"
+                "        '外部运行中',\n"
+                "        int(proc_info.get('process_pid') or 0),\n"
+                "        0.0,\n"
+                "        0.0,\n"
+                "        log_path,\n"
+                "        f'{label} 进程',\n"
+                "        '外部进程检测（非启动器托管）',\n"
+                "        False,\n"
+                "        time.time(),\n"
+                "    )\n"
+                "wechat_existing = rows_by_channel.get('wechat') or known_rows_by_channel.get('wechat') or {}\n"
+                "wechat_status = str(wechat_existing.get('process_status') or '').strip()\n"
+                "wechat_running = ('运行' in wechat_status) and ('退出' not in wechat_status)\n"
+                "if (not wechat_running) and wechat_lock_occupied():\n"
+                "    label = str(wechat_existing.get('channel_label') or '微信').strip() or '微信'\n"
+                "    wechat_pid = wechat_lock_pid()\n"
+                "    log_path = str(wechat_existing.get('channel_log_path') or '').strip()\n"
+                "    if not log_path:\n"
+                "        log_path = os.path.join(os.getcwd(), 'temp', 'launcher_channels', 'wechat.log')\n"
+                "    matched = matched_process_info('wechat', wechat_pid)\n"
+                "    if matched is not None:\n"
+                "        claimed = claim_channel_process('wechat', label, int(matched.get('process_pid') or 0), log_path, str(wechat_existing.get('title') or ''))\n"
+                "        if claimed is not None:\n"
+                "            rows_by_channel['wechat'] = claimed\n"
+                "        else:\n"
+                "            rows_by_channel['wechat'] = build_snapshot_row(\n"
+                "                'wechat',\n"
+                "                label,\n"
+                "                '外部运行中',\n"
+                "                int(wechat_pid or 0),\n"
+                "                0.0,\n"
+                "                0.0,\n"
+                "                log_path,\n"
+                "                f'{label} 进程',\n"
+                "                'WeChat 单实例锁检测（未匹配到进程命令）',\n"
+                "                False,\n"
+                "                time.time(),\n"
+                "            )\n"
+                "    elif int(wechat_pid or 0) > 0:\n"
+                "        rows_by_channel['wechat'] = build_snapshot_row(\n"
+                "            'wechat',\n"
+                "            label,\n"
+                "            '外部运行中',\n"
+                "            int(wechat_pid or 0),\n"
+                "            0.0,\n"
+                "            0.0,\n"
+                "            log_path,\n"
+                "            f'{label} 进程',\n"
+                "            'WeChat 单实例锁检测（未匹配到进程命令）',\n"
+                "            False,\n"
+                "            time.time(),\n"
+                "        )\n"
+                "rows = list(rows_by_channel.values())\n"
                 "print(json.dumps({'rows': rows}, ensure_ascii=False))\n"
                 "GA_SNAPSHOT_PY"
             )
-            rc, out, err = self._vps_exec_remote(client, cmd, timeout=180)
+            cmd = inner_cmd
+            if agent_mode == "docker":
+                if not container:
+                    return False, [], "远程 Docker 设备缺少容器名称。"
+                cmd = f"docker exec -i {shlex.quote(container)} sh -lc {shlex.quote(inner_cmd)}"
+            rc, out, err = self._vps_exec_remote(client, cmd, timeout=45)
             if rc != 0:
                 detail = str(err or out or f"远端命令失败 (exit {rc})").strip() or f"远端命令失败 (exit {rc})"
                 return False, [], detail
@@ -1111,9 +1618,7 @@ class SidebarSessionsMixin:
                 pass
 
     def _sync_remote_device_channel_process_sessions_blocking(self, *, agent_dir="", runtime_context=None):
-        root = os.path.abspath(str(agent_dir or self.agent_dir or "").strip()) if str(agent_dir or self.agent_dir or "").strip() else ""
-        if not lz.is_valid_agent_dir(root):
-            return False
+        root = self._remote_sync_cache_root(agent_dir=agent_dir)
         now = time.time()
         next_at = float(getattr(self, "_next_remote_channel_sync_at", 0) or 0)
         if now < next_at:
@@ -1187,6 +1692,7 @@ class SidebarSessionsMixin:
                     "process_status": str(row.get("process_status") or "").strip() or "运行中",
                     "process_started_at": float(row.get("process_started_at", 0) or 0),
                     "process_ended_at": float(row.get("process_ended_at", 0) or 0),
+                    "managed_by_launcher": bool(row.get("managed_by_launcher", True)),
                     "bubbles": [{"role": "assistant", "text": bubble_text}],
                     "backend_history": [],
                     "agent_history": [],
@@ -1217,6 +1723,7 @@ class SidebarSessionsMixin:
                     and str(data.get("device_id") or "") == payload["device_id"]
                     and str(data.get("channel_id") or "") == payload["channel_id"]
                     and str(data.get("session_kind") or "") == payload["session_kind"]
+                    and bool(data.get("managed_by_launcher", True)) == payload["managed_by_launcher"]
                     and str(((list(data.get("bubbles") or [{}])[-1] or {}).get("text") or "")) == bubble_text
                 )
                 if not same_payload:
@@ -1248,14 +1755,34 @@ class SidebarSessionsMixin:
         return changed
 
     def _sync_remote_device_channel_process_sessions(self):
-        if not lz.is_valid_agent_dir(self.agent_dir):
-            return
         if not self._auto_ssh_remote_devices():
             return
         now = time.time()
         next_at = float(getattr(self, "_next_remote_channel_sync_at", 0) or 0)
         if now < next_at:
             return
+        if bool(getattr(self, "_remote_channel_sync_running", False)):
+            # 避免同步线程异常卡死后永久阻塞手动刷新。
+            try:
+                error_map = getattr(self, "_remote_channel_device_sync_errors", None)
+                timeout_getter = getattr(self, "_remote_channel_probe_timeout_seconds", None)
+                timeout_secs = float(timeout_getter() if callable(timeout_getter) else 30.0)
+                timeout_secs = max(15.0, timeout_secs)
+                last_attempt_candidates = []
+                if isinstance(error_map, dict):
+                    for item in error_map.values():
+                        if isinstance(item, dict):
+                            ts = float(item.get("last_attempt_at") or 0)
+                            if ts > 0:
+                                last_attempt_candidates.append(ts)
+                if last_attempt_candidates:
+                    last_attempt_at = max(last_attempt_candidates)
+                    if (now - last_attempt_at) > timeout_secs:
+                        self._remote_channel_sync_running = False
+                else:
+                    self._remote_channel_sync_running = False
+            except Exception:
+                pass
         if bool(getattr(self, "_remote_channel_sync_running", False)):
             return
         self._remote_channel_sync_running = True

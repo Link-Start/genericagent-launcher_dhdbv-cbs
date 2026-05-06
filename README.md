@@ -44,13 +44,13 @@ Release 页面：
 
 当前公开发布提供两个架构：
 
-- `GenericAgentLauncher-macos-<version>-arm64.dmg`
-- `GenericAgentLauncher-macos-<version>-x86_64.dmg`
+- `GenericAgentLauncher-macos-arm64-<version>.dmg`
+- `GenericAgentLauncher-macos-x86_64-<version>.dmg`
 
 配套校验和说明资产：
 
-- `GenericAgentLauncher-macos-<version>-arm64.sha256`
-- `GenericAgentLauncher-macos-<version>-x86_64.sha256`
+- `GenericAgentLauncher-macos-arm64-<version>.sha256`
+- `GenericAgentLauncher-macos-x86_64-<version>.sha256`
 - `README-macOS-arm64.txt`
 - `README-macOS-x86_64.txt`
 - `install-metadata-arm64.json`
@@ -228,8 +228,8 @@ python tools/build_macos_release.py --version "$(python tools/resolve_release_ve
 常见产物包括：
 
 - `release/<version>/macos/GenericAgent Launcher.app`
-- `release/<version>/macos/GenericAgentLauncher-macos-<version>.dmg`
-- `release/<version>/macos/GenericAgentLauncher-macos-<version>.sha256`
+- `release/<version>/macos/GenericAgentLauncher-macos-<arch>-<version>.dmg`
+- `release/<version>/macos/GenericAgentLauncher-macos-<arch>-<version>.sha256`
 - `release/<version>/macos/README-macOS.txt`
 - `release/<version>/macos/install-metadata.json`
 

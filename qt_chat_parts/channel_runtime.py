@@ -4,7 +4,6 @@ import io
 import json
 import os
 import re
-import signal
 import shlex
 import socket
 import subprocess
@@ -12,6 +11,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QPixmap
@@ -29,10 +29,68 @@ from PySide6.QtWidgets import (
 from launcher_app import core as lz
 from launcher_app.theme import C
 
-from .common import capture_runtime_context, normalize_remote_agent_dir, normalize_ssh_error_text, runtime_context_matches
+from .common import (
+    capture_runtime_context,
+    normalize_remote_agent_dir,
+    normalize_ssh_error_text,
+    process_cmdline_matches_agent_script,
+    process_matcher_script_source,
+    remote_device_agent_dir,
+    remote_device_agent_mode,
+    remote_device_container_name,
+    runtime_context_matches,
+)
 
 
 class ChannelRuntimeMixin:
+    _REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS = 30.0
+
+    def _remote_channel_sync_is_stuck(self, device_id) -> bool:
+        did = str(device_id or "").strip()
+        if not did:
+            return False
+        if not bool(getattr(self, "_remote_channel_sync_running", False)):
+            return False
+        sync_state = self._remote_channel_device_sync_state(did)
+        last_attempt_at = float(sync_state.get("last_attempt_at") or 0)
+        if last_attempt_at <= 0:
+            return False
+        try:
+            now = float(time.time())
+        except Exception:
+            now = 0.0
+        return (now - last_attempt_at) > self._remote_channel_probe_timeout_seconds()
+
+    def _schedule_remote_probe_timeout_refresh(self, device_id):
+        did = str(device_id or "").strip()
+        if not did:
+            return
+        timeout_ms = int(max(1000.0, self._remote_channel_probe_timeout_seconds() * 1000.0))
+        run_token = int(getattr(self, "_remote_probe_refresh_run_token", 0) or 0) + 1
+        self._remote_probe_refresh_run_token = run_token
+
+        def _refresh_if_due(token=run_token, expected_did=did):
+            if int(getattr(self, "_remote_probe_refresh_run_token", 0) or 0) != int(token):
+                return
+            target_ctx_getter = getattr(self, "_settings_target_context", None)
+            target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+            if not bool((target_ctx or {}).get("is_remote")):
+                return
+            current_did = str((target_ctx or {}).get("device_id") or "").strip()
+            if current_did != expected_did:
+                return
+            refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
+            if callable(refresher):
+                try:
+                    refresher(force=True)
+                except Exception:
+                    pass
+
+        try:
+            QTimer.singleShot(timeout_ms + 300, _refresh_if_due)
+        except Exception:
+            pass
+
     def _channel_dialogs_allowed(self) -> bool:
         return not bool(getattr(self, "_closing_in_progress", False) or getattr(self, "_force_exit_requested", False))
 
@@ -78,7 +136,9 @@ class ChannelRuntimeMixin:
         return False
 
     def _channel_post_ui(self, callback, *, action_name="界面刷新"):
-        wrapped = lambda: self._safe_channel_ui_call(action_name, callback, show_errors=False)
+        def wrapped():
+            self._safe_channel_ui_call(action_name, callback, show_errors=False)
+
         poster = getattr(self, "_api_on_ui_thread", None)
         if callable(poster):
             try:
@@ -131,7 +191,7 @@ class ChannelRuntimeMixin:
             self._apply_channel_button_state(
                 refresh_btn,
                 True,
-                enabled_tooltip="重新读取当前目标的通讯配置。",
+                enabled_tooltip="手动刷新当前目标的渠道运行状态。",
             )
         if stop_all_btn is not None:
             disabled_reason = self._channel_source_action_disabled_reason("停止全部", is_remote_target=is_remote_target)
@@ -161,7 +221,7 @@ class ChannelRuntimeMixin:
         target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
         if not bool((target_ctx or {}).get("is_remote")):
             try:
-                self._refresh_wechat_external_running()
+                self._refresh_local_channel_external_running()
             except Exception:
                 pass
         notices = [py_path]
@@ -192,6 +252,59 @@ class ChannelRuntimeMixin:
         if not isinstance(spec, dict):
             return []
         return lz._split_requirement_tokens(spec.get("pip", ""))
+
+    def _remote_dependency_install_profile(self, device):
+        dev = dict(device or {}) if isinstance(device, dict) else {}
+        did = str(dev.get("id") or "").strip()
+        if not did:
+            return dev
+        for item in list(self.cfg.get("vps_profiles") or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "").strip() != did:
+                continue
+            merged = dict(item)
+            merged.update(dev)
+            return merged
+        return dev
+
+    def _remote_dependency_install_source(self, device):
+        profile = self._remote_dependency_install_profile(device)
+        mode = str(profile.get("dep_install_mode") or "offline").strip().lower()
+        if mode == "online":
+            mode = "global"
+        if mode not in ("offline", "global", "mirror"):
+            mode = "offline"
+        pip_mirror_url = str(profile.get("pip_mirror_url") or "").strip()
+        source_builder = getattr(self, "_vps_dep_install_source", None)
+        if callable(source_builder):
+            try:
+                source = dict(source_builder(mode, pip_mirror_url) or {})
+            except Exception:
+                source = {}
+            if source:
+                return source
+        source = {
+            "mode": mode,
+            "index_url": "https://pypi.tuna.tsinghua.edu.cn/simple",
+            "trusted_host": "pypi.tuna.tsinghua.edu.cn",
+        }
+        if mode == "global":
+            source.update(
+                {
+                    "index_url": "https://pypi.org/simple",
+                    "trusted_host": "pypi.org",
+                }
+            )
+        elif mode == "mirror":
+            parsed = urlparse(pip_mirror_url)
+            source.update(
+                {
+                    "index_url": pip_mirror_url,
+                    "trusted_host": str(getattr(parsed, "hostname", "") or "").strip(),
+                }
+            )
+        return source
 
     def _channel_cfg_bucket(self):
         bucket = self.cfg.get("communication_channels")
@@ -226,6 +339,175 @@ class ChannelRuntimeMixin:
     def _channel_external_running(self, channel_id):
         return bool(self._channel_runtime_cfg(channel_id).get("external_running", False))
 
+    def _iter_local_channel_processes(self):
+        if os.name == "nt":
+            cmd = (
+                "$ErrorActionPreference='SilentlyContinue'; "
+                "$rows=@(); "
+                "try { "
+                "  $rows = Get-CimInstance Win32_Process | "
+                "    Where-Object { $_.CommandLine } | "
+                "    ForEach-Object { \"$($_.ProcessId)`t$([string]$_.CommandLine)\" }; "
+                "} catch { $rows=@() }; "
+                "if ($rows -and $rows.Count -gt 0) { $rows; return }; "
+                "$wmic = Get-Command wmic -ErrorAction SilentlyContinue; "
+                "if (-not $wmic) { return }; "
+                "$buf = wmic process get ProcessId,CommandLine /FORMAT:CSV 2>$null; "
+                "if (-not $buf) { return }; "
+                "$buf | ForEach-Object { "
+                "  $line=[string]$_; "
+                "  if (-not $line) { return }; "
+                "  $line=$line.Trim(); "
+                "  if ((-not $line) -or $line.StartsWith('Node,CommandLine,ProcessId')) { return }; "
+                "  $idx=$line.LastIndexOf(','); "
+                "  if ($idx -lt 0) { return }; "
+                "  $pidText=$line.Substring($idx+1).Trim(); "
+                "  if ($pidText -notmatch '^[0-9]+$') { return }; "
+                "  $cmdText=$line.Substring(0,$idx); "
+                "  $first=$cmdText.IndexOf(','); "
+                "  if ($first -ge 0) { $cmdText=$cmdText.Substring($first+1) }; "
+                "  $cmdText=$cmdText.Trim(); "
+                "  if (-not $cmdText) { return }; "
+                "  \"$pidText`t$cmdText\" "
+                "}"
+            )
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", cmd],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8,
+                    creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                )
+            except Exception:
+                return []
+            if result.returncode != 0:
+                return []
+            raw_lines = str(result.stdout or "").splitlines()
+
+            def line_splitter(text):
+                return text.split("\t", 1)
+
+            def normalize_cmd(cmdline):
+                return os.path.normcase(str(cmdline or "").replace("/", "\\"))
+
+            def fetch_cwd(_pid):
+                return "", ""
+        else:
+            try:
+                result = subprocess.run(
+                    ["ps", "-eo", "pid=,args="],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=8,
+                )
+            except Exception:
+                return []
+            if result.returncode != 0:
+                return []
+            raw_lines = str(result.stdout or "").splitlines()
+
+            def line_splitter(text):
+                return re.split(r"\s+", text, maxsplit=1)
+
+            def normalize_cmd(cmdline):
+                return os.path.normcase(str(cmdline or "").replace("\\", "/"))
+
+            def fetch_cwd(pid):
+                try:
+                    cwd_real = os.path.realpath(f"/proc/{int(pid)}/cwd")
+                except Exception:
+                    cwd_real = ""
+                return cwd_real, cwd_real
+
+        processes = []
+        for line in raw_lines:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            parts = line_splitter(text)
+            pid_text = str(parts[0] if parts else "").strip()
+            cmdline = str(parts[1] if len(parts) > 1 else "").strip()
+            if not re.fullmatch(r"\d+", pid_text):
+                continue
+            pid = int(pid_text)
+            cwd, cwd_real = fetch_cwd(pid)
+            processes.append(
+                {
+                    "pid": pid,
+                    "cmdline": cmdline,
+                    "norm_cmd": normalize_cmd(cmdline),
+                    "cwd": cwd,
+                    "cwd_real": cwd_real,
+                }
+            )
+        return processes
+
+    def _channel_script_rel(self, channel_id):
+        cid = str(channel_id or "").strip()
+        spec = lz.COMM_CHANNEL_INDEX.get(cid) or {}
+        script = str(spec.get("script") or "").strip()
+        if (not spec) or (not script):
+            for item in getattr(lz, "COMM_CHANNEL_SPECS", []):
+                if str((item or {}).get("id") or "").strip() == cid:
+                    spec = dict(item)
+                    break
+        script = str(spec.get("script") or "").strip()
+        if not script:
+            return ""
+        return ("frontends/" + script).replace("\\", "/")
+
+    def _local_channel_external_pids(self):
+        results: dict[str, list[int]] = {}
+        agent_dir = str(self.agent_dir or "").strip()
+        if not agent_dir:
+            return results
+        agent_dir_real = ""
+        if os.name != "nt":
+            try:
+                agent_dir_real = os.path.realpath(agent_dir)
+            except Exception:
+                agent_dir_real = ""
+        managed_by_channel: dict[str, set[int]] = {}
+        for cid, info in dict(getattr(self, "_channel_procs", {}) or {}).items():
+            try:
+                pid = int(getattr((info or {}).get("proc"), "pid", 0) or 0)
+            except Exception:
+                pid = 0
+            if pid > 0:
+                managed_by_channel.setdefault(str(cid or "").strip(), set()).add(pid)
+        for proc_info in self._iter_local_channel_processes():
+            pid = int(proc_info.get("pid") or 0)
+            if pid <= 0:
+                continue
+            norm_cmd = str(proc_info.get("norm_cmd") or "").strip()
+            if not norm_cmd:
+                continue
+            for spec in getattr(lz, "COMM_CHANNEL_SPECS", []):
+                cid = str(spec.get("id") or "").strip()
+                if not cid:
+                    continue
+                if pid in managed_by_channel.get(cid, set()):
+                    continue
+                script = str((spec or {}).get("script") or "").strip()
+                script_rel = (("frontends/" + script).replace("\\", "/")) if script else self._channel_script_rel(cid)
+                if not script_rel:
+                    continue
+                if process_cmdline_matches_agent_script(
+                    norm_cmd,
+                    agent_dir=agent_dir,
+                    script_rel=script_rel,
+                    cwd=proc_info.get("cwd") or "",
+                    agent_dir_real=agent_dir_real,
+                    cwd_real=proc_info.get("cwd_real") or "",
+                ):
+                    results.setdefault(cid, []).append(pid)
+        return results
+
     def _wechat_singleton_locked(self):
         lock_sock = None
         try:
@@ -244,103 +526,31 @@ class ChannelRuntimeMixin:
                     pass
 
     def _refresh_wechat_external_running(self, *, persist=False):
-        active = bool(self._find_local_wechat_process_pids()) or bool(self._wechat_singleton_locked())
+        external_map = self._local_channel_external_pids()
+        active = bool(external_map.get("wechat")) or bool(self._wechat_singleton_locked())
         if self._channel_external_running("wechat") != active:
             self._channel_set_external_running("wechat", active, persist=persist)
         return active
 
     def _find_local_wechat_process_pids(self):
-        target = os.path.normcase(os.path.normpath(os.path.join(self.agent_dir, "frontends", "wechatapp.py")))
-        target_base = os.path.normcase(os.path.basename(target))
-        if os.name == "nt":
-            cmd = (
-                "$ErrorActionPreference='SilentlyContinue'; "
-                "Get-CimInstance Win32_Process | "
-                "Where-Object { $_.CommandLine -and $_.CommandLine -match 'wechatapp\\.py' } | "
-                "ForEach-Object { "
-                "  $line=[string]$_.CommandLine; "
-                "  \"$($_.ProcessId)`t$line\" "
-                "}"
-            )
-            try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", cmd],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=8,
-                    creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
-                )
-            except Exception:
-                return []
-            if r.returncode != 0:
-                return []
-            raw_lines = str(r.stdout or "").splitlines()
-            line_splitter = lambda text: text.split("\t", 1)
-            normalize_cmd = lambda cmdline: os.path.normcase(cmdline.replace("/", "\\"))
-        else:
-            try:
-                r = subprocess.run(
-                    ["ps", "-eo", "pid=,args="],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=8,
-                )
-            except Exception:
-                return []
-            if r.returncode != 0:
-                return []
-            raw_lines = str(r.stdout or "").splitlines()
-            line_splitter = lambda text: re.split(r"\s+", text, maxsplit=1)
-            normalize_cmd = lambda cmdline: os.path.normcase(cmdline.replace("\\", "/"))
-        exact = []
-        loose = []
-        for line in raw_lines:
-            text = str(line or "").strip()
-            if not text:
+        return list(self._local_channel_external_pids().get("wechat") or [])
+
+    def _refresh_local_channel_external_running(self, *, persist=False):
+        external_map = self._local_channel_external_pids()
+        changed = False
+        for spec in getattr(lz, "COMM_CHANNEL_SPECS", []):
+            cid = str(spec.get("id") or "").strip()
+            if not cid:
                 continue
-            parts = line_splitter(text)
-            pid_text = str(parts[0] if parts else "").strip()
-            cmdline = str(parts[1] if len(parts) > 1 else "").strip()
-            if not re.fullmatch(r"\d+", pid_text):
-                continue
-            pid = int(pid_text)
-            norm_cmd = normalize_cmd(cmdline)
-            if target and (target in norm_cmd):
-                exact.append(pid)
-                continue
-            if os.name == "nt":
-                # 回退匹配：外部实例常用相对路径启动（frontends/wechatapp.py）
-                if re.search(r"(^|[\\\s\"'])frontends\\wechatapp\.py($|[\\\s\"'])", norm_cmd):
-                    loose.append(pid)
-                    continue
-                if re.search(r"(^|[\\\s\"'])wechatapp\.py($|[\\\s\"'])", norm_cmd):
-                    loose.append(pid)
-                    continue
-            else:
-                if target_base and target_base in norm_cmd:
-                    exact.append(pid)
-                    continue
-                if re.search(r"(^|[/\s\"'])frontends/wechatapp\.py($|[/\s\"'])", norm_cmd):
-                    loose.append(pid)
-                    continue
-                if re.search(r"(^|[/\s\"'])wechatapp\.py($|[/\s\"'])", norm_cmd):
-                    loose.append(pid)
-                    continue
-            if "wechatapp.py" in norm_cmd:
-                loose.append(pid)
-        # 去重并保持顺序
-        seen = set()
-        uniq = []
-        for pid in (exact + loose):
-            if pid in seen:
-                continue
-            seen.add(pid)
-            uniq.append(pid)
-        return uniq
+            active = bool(external_map.get(cid))
+            if cid == "wechat" and (not active):
+                active = bool(self._wechat_singleton_locked())
+            if self._channel_external_running(cid) != active:
+                self._channel_set_external_running(cid, active, persist=False)
+                changed = True
+        if changed and persist:
+            lz.save_config(self.cfg)
+        return external_map
 
     def _terminate_pid_force(self, pid):
         p = int(pid or 0)
@@ -816,11 +1026,18 @@ class ChannelRuntimeMixin:
             msg = str(err or "远端 SSH 连接失败。").strip() or "远端 SSH 连接失败。"
             return False, {}, normalize_ssh_error_text(msg, context="远端 SSH 连接")
         try:
-            remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+            remote_dir = remote_device_agent_dir(dev, username=dev.get("username")) or normalize_remote_agent_dir(
+                dev.get("agent_dir"),
+                username=dev.get("username"),
+            )
+            if not str(remote_dir or "").strip():
+                return False, {}, "远端设备缺少可用的 agent_dir。"
             python_cmd = str(dev.get("python_cmd") or "python3").strip() or "python3"
+            agent_mode = remote_device_agent_mode(dev)
+            container = remote_device_container_name(dev)
             q_dir = shlex.quote(remote_dir)
             q_py = shlex.quote(python_cmd)
-            cmd = (
+            inner_cmd = (
                 "set -e; "
                 f"cd {q_dir}; "
                 f"PY_BIN={q_py}; "
@@ -833,6 +1050,11 @@ class ChannelRuntimeMixin:
                 f"{script_text}\n"
                 "GA_REMOTE_PY"
             )
+            cmd = inner_cmd
+            if agent_mode == "docker":
+                if not container:
+                    return False, {}, "远程 Docker 设备缺少容器名称。"
+                cmd = f"docker exec -i {shlex.quote(container)} sh -lc {shlex.quote(inner_cmd)}"
             try:
                 rc, out, err_text = exec_remote(client, cmd, timeout=max(15, int(timeout or 120)))
             except Exception as e:
@@ -1651,18 +1873,6 @@ class ChannelRuntimeMixin:
                 self._sync_channel_process_session(channel_id, final=False)
             except Exception:
                 continue
-        remote_sync = getattr(self, "_sync_remote_device_channel_process_sessions", None)
-        if callable(remote_sync):
-            try:
-                remote_sync()
-            except Exception:
-                pass
-        remote_chat_sync = getattr(self, "_sync_remote_device_launcher_sessions", None)
-        if callable(remote_chat_sync):
-            try:
-                remote_chat_sync()
-            except Exception:
-                pass
         refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
         if callable(refresher):
             try:
@@ -1690,6 +1900,23 @@ class ChannelRuntimeMixin:
             return {}
         data = lz.load_session(self.agent_dir, sid)
         return dict(data) if isinstance(data, dict) else {}
+
+    def _remote_channel_device_has_cached_sessions(self, device_id):
+        did = str(device_id or "").strip()
+        if (not did) or (not lz.is_valid_agent_dir(self.agent_dir)):
+            return False
+        try:
+            for meta in lz.list_sessions(self.agent_dir):
+                if str(meta.get("session_kind") or "").strip().lower() != "channel_process":
+                    continue
+                if str(meta.get("device_scope") or "").strip().lower() != "remote":
+                    continue
+                if str(meta.get("device_id") or "").strip() != did:
+                    continue
+                return True
+        except Exception:
+            return False
+        return False
 
     def _remote_channel_status_check_age(self, device_id, channel_id):
         did = str(device_id or "").strip()
@@ -1766,6 +1993,8 @@ class ChannelRuntimeMixin:
         fail_count = int(sync_state.get("fail_count") or 0)
         last_error = normalize_ssh_error_text(str(sync_state.get("last_error") or "").strip(), context="SSH 连接")
         last_attempt_at = float(sync_state.get("last_attempt_at") or 0)
+        if self._remote_channel_sync_is_stuck(device_id):
+            return "远端校验已超时，当前按未检测到进程处理；可点击“刷新状态”重试。"
         if sync_running:
             if last_attempt_at > 0:
                 return f"正在校验服务器状态… 上次发起：{self._remote_channel_time_text(last_attempt_at)}"
@@ -1776,7 +2005,32 @@ class ChannelRuntimeMixin:
             return f"最近校验：{self._remote_channel_time_text(last_checked_at)}"
         if last_error:
             return f"最近校验失败：{last_error}"
-        return "等待首次校验服务器状态。"
+        return "尚未校验远端状态；点击“刷新状态”开始探测。"
+
+    def _remote_channel_probe_timeout_seconds(self):
+        try:
+            value = float(getattr(self, "_REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS", 30.0) or 30.0)
+        except Exception:
+            value = 30.0
+        return max(15.0, value)
+
+    def _request_channel_status_refresh(self):
+        target_ctx_getter = getattr(self, "_settings_target_context", None)
+        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+        if bool((target_ctx or {}).get("is_remote")):
+            self._request_remote_channel_status_refresh()
+            return
+        try:
+            self._refresh_local_channel_external_running(persist=True)
+        except Exception:
+            pass
+        self._sync_all_channel_process_sessions()
+        refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
+        if callable(refresher):
+            try:
+                refresher(force=True)
+            except Exception:
+                pass
 
     def _show_remote_channel_status_detail(self, device_id, channel_id, title):
         did = str(device_id or "").strip()
@@ -1828,7 +2082,23 @@ class ChannelRuntimeMixin:
                 pass
         if notice is not None:
             notice.setText("正在校验远端渠道运行状态…")
+        did = ""
+        target_ctx_getter = getattr(self, "_settings_target_context", None)
+        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
+        if bool((target_ctx or {}).get("is_remote")):
+            did = str((target_ctx or {}).get("device_id") or "").strip()
+        if did and self._remote_channel_sync_is_stuck(did):
+            try:
+                self._remote_channel_sync_running = False
+            except Exception:
+                pass
+            try:
+                self._next_remote_channel_sync_at = 0.0
+            except Exception:
+                pass
         self._force_remote_channel_sync()
+        if did:
+            self._schedule_remote_probe_timeout_refresh(did)
 
     def _remote_channel_is_running(self, device_id, channel_id):
         data = self._remote_channel_cached_session(device_id, channel_id)
@@ -1838,6 +2108,28 @@ class ChannelRuntimeMixin:
         if "运行" in status and "退出" not in status:
             return True
         return False
+
+    def _remote_channel_is_launcher_managed(self, device_id, channel_id):
+        data = self._remote_channel_cached_session(device_id, channel_id)
+        if not data or (not self._remote_channel_is_running(device_id, channel_id)):
+            return False
+        if "managed_by_launcher" in data:
+            return bool(data.get("managed_by_launcher"))
+        return "外部" not in str(data.get("process_status") or "").strip()
+
+    def _remote_channel_is_external_running(self, device_id, channel_id):
+        return self._remote_channel_is_running(device_id, channel_id) and (
+            not self._remote_channel_is_launcher_managed(device_id, channel_id)
+        )
+
+    def _remote_channel_process_pid(self, device_id, channel_id):
+        data = self._remote_channel_cached_session(device_id, channel_id)
+        if not data:
+            return 0
+        try:
+            return max(0, int(data.get("process_pid") or 0))
+        except Exception:
+            return 0
 
     def _remote_channel_label_text(self, channel_id):
         spec = lz.COMM_CHANNEL_INDEX.get(channel_id) or {}
@@ -1853,24 +2145,30 @@ class ChannelRuntimeMixin:
         data = self._remote_channel_cached_session(device_id, channel_id)
         channel_age, device_age = self._remote_channel_status_check_age(device_id, channel_id)
         sync_running = bool(getattr(self, "_remote_channel_sync_running", False))
-        checked_recently = min(channel_age, device_age) <= 30.0
         sync_state = self._remote_channel_device_sync_state(device_id)
         fail_count = int(sync_state.get("fail_count") or 0)
         last_error = str(sync_state.get("last_error") or "").strip()
+        now = float(time.time())
+        last_attempt_at = float(sync_state.get("last_attempt_at") or 0)
+        attempt_age = (now - last_attempt_at) if last_attempt_at > 0 else float("inf")
+        probe_timeout = self._remote_channel_probe_timeout_seconds()
+        if sync_running and attempt_age > probe_timeout:
+            sync_running = False
         if not data:
             if fail_count >= 2 and last_error:
                 return "服务器连接异常", C["danger_text"]
-            if sync_running or (not checked_recently):
-                self._request_remote_channel_status_refresh()
+            if sync_running and attempt_age <= probe_timeout:
                 return "正在校验远端状态", C["text_soft"]
             return "未检测到远端进程", C["muted"]
         status = str(data.get("process_status") or "").strip() or "未知状态"
         pid = int(data.get("process_pid") or 0)
-        if fail_count >= 2 and last_error and (sync_running or (not checked_recently)):
-            return "服务器连接异常", C["danger_text"]
-        if any(key in status for key in ("退出", "失败", "错误", "异常")) and (sync_running or (not checked_recently)):
-            self._request_remote_channel_status_refresh()
+        if any(key in status for key in ("退出", "失败", "错误", "异常")) and sync_running and attempt_age <= probe_timeout:
             return "正在校验远端状态", C["text_soft"]
+        if self._remote_channel_is_external_running(device_id, channel_id):
+            status_text = "外部运行中"
+            if pid > 0:
+                status_text = f"{status_text} (PID {pid})"
+            return status_text, C["text_soft"]
         if pid > 0 and ("运行" in status) and ("退出" not in status):
             status_text = f"{status} (PID {pid})"
             return status_text, C["accent"]
@@ -1959,12 +2257,14 @@ class ChannelRuntimeMixin:
                 return "当前远端设备信息不可用，请先检查设备配置。"
             did = str(ctx.get("device_id") or "").strip()
             if self._remote_channel_is_running(did, channel_id):
-                return f"远端 {self._remote_channel_label_text(channel_id)} 已在运行；无需重复启动。"
+                if self._remote_channel_is_external_running(did, channel_id):
+                    return f"检测到远端外部 {self._remote_channel_label_text(channel_id)} 进程正在运行；启动器不会重复启动。"
+                return ""
             return ""
         if not lz.is_valid_agent_dir(self.agent_dir):
             return "请先选择有效的 GenericAgent 目录。"
         if self._channel_proc_alive(channel_id):
-            return f"{self._remote_channel_label_text(channel_id)} 当前已由启动器托管运行；如需重启请先停止。"
+            return ""
         if self._channel_external_running(channel_id):
             return f"检测到外部 {self._remote_channel_label_text(channel_id)} 进程正在运行；请先关闭外部实例。"
         conflict = self._channel_conflict_message(channel_id)
@@ -1987,6 +2287,14 @@ class ChannelRuntimeMixin:
             did = str(ctx.get("device_id") or "").strip()
             if not self._remote_channel_is_running(did, channel_id):
                 return f"当前未检测到远端 {self._remote_channel_label_text(channel_id)} 运行中进程。"
+            if self._remote_channel_is_external_running(did, channel_id):
+                pid = self._remote_channel_process_pid(did, channel_id)
+                if pid > 0:
+                    return ""
+                return (
+                    f"当前远端 {self._remote_channel_label_text(channel_id)} 为外部启动进程，"
+                    "但暂未获取到 PID，无法安全停止。"
+                )
             return ""
         if self._channel_proc_alive(channel_id):
             return ""
@@ -2058,7 +2366,7 @@ class ChannelRuntimeMixin:
         self._refresh_channel_source_actions()
         if not is_remote_target:
             try:
-                self._refresh_wechat_external_running()
+                self._refresh_local_channel_external_running()
             except Exception:
                 pass
         if is_remote_target:
@@ -2069,10 +2377,14 @@ class ChannelRuntimeMixin:
                 sync_state = self._remote_channel_device_sync_state(did)
                 fail_count = int(sync_state.get("fail_count") or 0)
                 last_error = normalize_ssh_error_text(str(sync_state.get("last_error") or "").strip(), context="SSH 连接")
+                has_cached_sessions = self._remote_channel_device_has_cached_sessions(did)
                 if sync_running:
                     notice.setText("正在校验远端渠道运行状态…")
                 elif fail_count >= 2 and last_error:
-                    notice.setText(f"远端渠道状态连续校验失败：{last_error}")
+                    if has_cached_sessions:
+                        notice.setText(f"远端渠道状态校验失败，当前展示最近一次缓存结果：{last_error}")
+                    else:
+                        notice.setText(f"远端渠道状态连续校验失败：{last_error}")
         states = getattr(self, "_qt_channel_states", None)
         if not isinstance(states, dict):
             return
@@ -2102,15 +2414,21 @@ class ChannelRuntimeMixin:
                 remote_dev = dict((target_ctx or {}).get("device") or {})
                 remote_actions_ready = bool(remote_dev)
                 remote_running = self._remote_channel_is_running(did, spec["id"])
+                remote_managed = self._remote_channel_is_launcher_managed(did, spec["id"])
+                remote_pid = self._remote_channel_process_pid(did, spec["id"])
                 self._apply_channel_button_state(
                     start_btn,
-                    (not remote_running) and remote_actions_ready,
-                    enabled_tooltip=f"启动远端 {spec.get('label', spec['id'])} 渠道。",
+                    ((not remote_running) or remote_managed) and remote_actions_ready,
+                    enabled_tooltip=(
+                        f"重启远端 {spec.get('label', spec['id'])} 渠道。"
+                        if remote_managed
+                        else f"启动远端 {spec.get('label', spec['id'])} 渠道。"
+                    ),
                     disabled_tooltip=self._channel_start_disabled_reason(spec["id"], values, target_ctx=target_ctx),
                 )
                 self._apply_channel_button_state(
                     stop_btn,
-                    remote_running and remote_actions_ready,
+                    remote_running and remote_actions_ready and (remote_managed or (remote_pid > 0)),
                     enabled_tooltip=f"停止远端 {spec.get('label', spec['id'])} 渠道。",
                     disabled_tooltip=self._channel_stop_disabled_reason(spec["id"], values, target_ctx=target_ctx),
                 )
@@ -2133,7 +2451,6 @@ class ChannelRuntimeMixin:
                 missing = self._channel_missing_required(spec["id"], values)
                 can_start = (
                     lz.is_valid_agent_dir(self.agent_dir)
-                    and (not managed_running)
                     and (not external_running)
                     and (not conflict)
                     and (not missing)
@@ -2141,7 +2458,11 @@ class ChannelRuntimeMixin:
                 self._apply_channel_button_state(
                     start_btn,
                     bool(can_start),
-                    enabled_tooltip=f"启动 {spec.get('label', spec['id'])} 渠道。",
+                    enabled_tooltip=(
+                        f"重启 {spec.get('label', spec['id'])} 渠道。"
+                        if managed_running
+                        else f"启动 {spec.get('label', spec['id'])} 渠道。"
+                    ),
                     disabled_tooltip=self._channel_start_disabled_reason(spec["id"], values, target_ctx=target_ctx),
                 )
                 self._apply_channel_button_state(
@@ -2219,7 +2540,6 @@ class ChannelRuntimeMixin:
                     self._qt_channel_remote_loading = False
                     self._clear_layout(self.settings_channels_list_layout)
                     self._apply_loaded_channels_source(py_path, parsed)
-                    self._force_remote_channel_sync()
 
                 self._channel_post_ui(done, action_name="远端渠道配置加载")
 
@@ -2413,6 +2733,10 @@ class ChannelRuntimeMixin:
             state = self._qt_channel_states.get(spec["id"]) or {}
             for field in spec.get("fields", []):
                 edit = state.get("widgets", {}).get(field["key"])
+                # 某些入口（如启动器自动启动或外部触发启动）会在渠道卡片尚未渲染时调用保存。
+                # 这时没有输入框对象，不能把字段当成“用户清空”，否则会误删 mykey.py 里的既有配置。
+                if edit is None:
+                    continue
                 value = self._channel_parse_value(field, edit.text() if edit is not None else "")
                 if isinstance(value, list):
                     if value:
@@ -2493,7 +2817,7 @@ class ChannelRuntimeMixin:
         label = str(spec.get("label") or channel_id).strip() or channel_id
         conflicts = [lz._normalize_usage_channel_id(x, "") for x in (spec.get("conflicts_with") or []) if str(x or "").strip()]
         script = (
-            "import json, os, signal, site, socket, subprocess, sys, time\n"
+            "import json, os, re, signal, site, socket, subprocess, sys, time\n"
             f"channel_id = {str(channel_id)!r}\n"
             f"channel_label = {label!r}\n"
             f"script_rel = {script_rel!r}\n"
@@ -2553,9 +2877,20 @@ class ChannelRuntimeMixin:
             "            except Exception:\n"
             "                pass\n"
             "\n"
+            f"{process_matcher_script_source()}\n"
+            "\n"
+            "def read_pid_cwd(pid):\n"
+            "    try:\n"
+            "        return os.path.realpath(f'/proc/{int(pid)}/cwd')\n"
+            "    except Exception:\n"
+            "        return ''\n"
+            "\n"
             "def find_wechat_pids():\n"
-            "    target_script = os.path.normpath(os.path.join(base, script_rel)).lower().replace('\\\\', '/')\n"
-            "    target_base = os.path.normpath(base).lower().replace('\\\\', '/')\n"
+            "    target_real = ''\n"
+            "    try:\n"
+            "        target_real = os.path.realpath(base)\n"
+            "    except Exception:\n"
+            "        target_real = ''\n"
             "    rows = []\n"
             "    try:\n"
             "        r = subprocess.run(\n"
@@ -2580,11 +2915,9 @@ class ChannelRuntimeMixin:
             "        if (not parts) or (not str(parts[0]).isdigit()):\n"
             "            continue\n"
             "        pid = int(parts[0])\n"
-            "        cmd = str(parts[1] if len(parts) > 1 else '').lower().replace('\\\\', '/')\n"
-            "        if target_script and (target_script in cmd):\n"
-            "            out.append(pid)\n"
-            "            continue\n"
-            "        if ('wechatapp.py' in cmd) and target_base and (target_base in cmd):\n"
+            "        cmd = str(parts[1] if len(parts) > 1 else '')\n"
+            "        cwd = read_pid_cwd(pid)\n"
+            "        if process_cmdline_matches_agent_script(cmd, base, script_rel, cwd=cwd, agent_dir_real=target_real, cwd_real=cwd):\n"
             "            out.append(pid)\n"
             "    seen = set()\n"
             "    uniq = []\n"
@@ -2620,9 +2953,24 @@ class ChannelRuntimeMixin:
             "existing = load_json(session_path)\n"
             "existing_pid = int(existing.get('process_pid') or 0)\n"
             "managed_pids = set([int(existing_pid or 0)])\n"
+            "restarted = False\n"
+            "previous_pid = int(existing_pid or 0)\n"
             "if existing_pid and pid_alive(existing_pid):\n"
-            "    print(json.dumps({'ok': True, 'already_running': True, 'pid': existing_pid, 'session_id': sid}, ensure_ascii=False))\n"
-            "    raise SystemExit(0)\n"
+            "    if not terminate_pid_force(existing_pid):\n"
+            "        print(json.dumps({'ok': False, 'error': f'{channel_label} 重启失败，旧进程仍在运行。', 'pid': existing_pid, 'session_id': sid}, ensure_ascii=False))\n"
+            "        raise SystemExit(0)\n"
+            "    restarted = True\n"
+            "    managed_pids = set()\n"
+            "    stopped_at = time.time()\n"
+            "    existing['updated_at'] = stopped_at\n"
+            "    existing['process_status'] = '已退出'\n"
+            "    existing['process_ended_at'] = stopped_at\n"
+            "    existing['process_pid'] = 0\n"
+            "    try:\n"
+            "        with open(session_path, 'w', encoding='utf-8') as f:\n"
+            "            json.dump(existing, f, ensure_ascii=False, indent=2)\n"
+            "    except Exception:\n"
+            "        pass\n"
             "\n"
             "for other in conflicts:\n"
             "    other_sid = f'launcher_remote_channel_{other}'\n"
@@ -2747,7 +3095,7 @@ class ChannelRuntimeMixin:
             "    tail = read_tail(log_path, limit=16000)\n"
             "    print(json.dumps({'ok': False, 'error': f'{channel_label} 启动后立即退出。', 'pid': int(proc.pid or 0), 'session_id': sid, 'tail': tail}, ensure_ascii=False))\n"
             "    raise SystemExit(0)\n"
-            "print(json.dumps({'ok': True, 'already_running': False, 'pid': int(proc.pid or 0), 'session_id': sid, 'log_path': log_path}, ensure_ascii=False))\n"
+            "print(json.dumps({'ok': True, 'already_running': False, 'restarted': bool(restarted), 'previous_pid': int(previous_pid or 0), 'pid': int(proc.pid or 0), 'session_id': sid, 'log_path': log_path}, ensure_ascii=False))\n"
         )
         ok, payload, err = self._remote_exec_json_script(device, script, timeout=120)
         if not ok:
@@ -2759,6 +3107,251 @@ class ChannelRuntimeMixin:
                 msg = f"{msg} {detail}"
             return False, msg, payload
         return True, "", payload
+
+    def _remote_prepare_runtime_dependencies_blocking(self, device, channel_id, spec):
+        extra_packages = self._channel_extra_packages(spec)
+        label = str(spec.get("label") or channel_id).strip() or channel_id
+        dep_source = self._remote_dependency_install_source(device)
+        script = (
+            "import hashlib, importlib, json, os, re, subprocess, sys\n"
+            f"extra_packages = json.loads({json.dumps(extra_packages, ensure_ascii=False)!r})\n"
+            f"dep_source = json.loads({json.dumps(dep_source, ensure_ascii=False)!r})\n"
+            "base = os.getcwd()\n"
+            "py_bin = str(os.environ.get('GA_PY_BIN') or sys.executable or '').strip() or (sys.executable or 'python3')\n"
+            "runtime_dir = os.path.join(base, 'temp', 'launcher_runtime')\n"
+            "os.makedirs(runtime_dir, exist_ok=True)\n"
+            "state_path = os.path.join(runtime_dir, 'remote_channel_dependency_state.json')\n"
+            "package_import_map = {\n"
+            "    'pycryptodome': 'Crypto',\n"
+            "    'python-telegram-bot': 'telegram',\n"
+            "    'qq-botpy': 'botpy',\n"
+            "    'lark-oapi': 'lark_oapi',\n"
+            "    'dingtalk-stream': 'dingtalk_stream',\n"
+            "}\n"
+            "progress_lines = []\n"
+            "report_lines = []\n"
+            "pip_env = dict(os.environ)\n"
+            "pip_env['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'\n"
+            "pip_env['PIP_NO_CACHE_DIR'] = '1'\n"
+            "\n"
+            "def progress(ev):\n"
+            "    data = ev if isinstance(ev, dict) else {}\n"
+            "    msg = str(data.get('msg') or '').strip()\n"
+            "    if msg:\n"
+            "        progress_lines.append(msg)\n"
+            "\n"
+            "def push(msg):\n"
+            "    text = str(msg or '').strip()\n"
+            "    if text:\n"
+            "        progress_lines.append(text)\n"
+            "\n"
+            "def append_report(title, text):\n"
+            "    header = str(title or '').strip()\n"
+            "    body = str(text or '').strip()\n"
+            "    if header and body:\n"
+            "        report_lines.append(header + '\\n' + body)\n"
+            "    elif header:\n"
+            "        report_lines.append(header)\n"
+            "    elif body:\n"
+            "        report_lines.append(body)\n"
+            "\n"
+            "def load_state():\n"
+            "    if not os.path.isfile(state_path):\n"
+            "        return {}\n"
+            "    try:\n"
+            "        with open(state_path, 'r', encoding='utf-8') as f:\n"
+            "            obj = json.load(f)\n"
+            "        return obj if isinstance(obj, dict) else {}\n"
+            "    except Exception:\n"
+            "        return {}\n"
+            "\n"
+            "def save_state(payload):\n"
+            "    try:\n"
+            "        with open(state_path, 'w', encoding='utf-8') as f:\n"
+            "            json.dump(payload, f, ensure_ascii=False, indent=2)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "\n"
+            "def hash_file(path):\n"
+            "    if not path or (not os.path.isfile(path)):\n"
+            "        return ''\n"
+            "    digest = hashlib.sha256()\n"
+            "    with open(path, 'rb') as f:\n"
+            "        for chunk in iter(lambda: f.read(65536), b''):\n"
+            "            if not chunk:\n"
+            "                break\n"
+            "            digest.update(chunk)\n"
+            "    return digest.hexdigest()\n"
+            "\n"
+            "def spec_package_name(spec_text):\n"
+            "    token = str(spec_text or '').strip()\n"
+            "    if not token:\n"
+            "        return ''\n"
+            "    token = re.split(r'[<>=!~ ]', token, maxsplit=1)[0]\n"
+            "    if '[' in token:\n"
+            "        token = token.split('[', 1)[0]\n"
+            "    return token.strip()\n"
+            "\n"
+            "def import_name_for_spec(spec_text):\n"
+            "    pkg = spec_package_name(spec_text)\n"
+            "    if not pkg:\n"
+            "        return ''\n"
+            "    return str(package_import_map.get(pkg) or pkg.replace('-', '_')).strip()\n"
+            "\n"
+            "def module_available(import_name):\n"
+            "    name = str(import_name or '').strip()\n"
+            "    if not name:\n"
+            "        return False\n"
+            "    try:\n"
+            "        importlib.import_module(name)\n"
+            "        return True\n"
+            "    except Exception:\n"
+            "        return False\n"
+            "\n"
+            "def missing_extra_specs(specs):\n"
+            "    out = []\n"
+            "    for spec_text in specs:\n"
+            "        if not module_available(import_name_for_spec(spec_text)):\n"
+            "            out.append(str(spec_text))\n"
+            "    return out\n"
+            "\n"
+            "def run_cmd(cmd, *, label='', timeout=1200, allow_fail=False):\n"
+            "    if label:\n"
+            "        push(label)\n"
+            "    try:\n"
+            "        proc = subprocess.run(\n"
+            "            cmd,\n"
+            "            capture_output=True,\n"
+            "            text=True,\n"
+            "            encoding='utf-8',\n"
+            "            errors='replace',\n"
+            "            timeout=max(30, int(timeout or 1200)),\n"
+            "            env=pip_env,\n"
+            "        )\n"
+            "    except Exception as e:\n"
+            "        return False, str(e)\n"
+            "    output = '\\n'.join(part for part in [str(proc.stdout or '').strip(), str(proc.stderr or '').strip()] if part).strip()\n"
+            "    if proc.returncode != 0 and (not allow_fail):\n"
+            "        return False, output or f'命令失败（exit {proc.returncode}）'\n"
+            "    return True, output\n"
+            "\n"
+            "def install_with_fallback(args, *, label, timeout=1200):\n"
+            "    commands = []\n"
+            "    mode = str(dep_source.get('mode') or '').strip().lower()\n"
+            "    index_url = str(dep_source.get('index_url') or '').strip()\n"
+            "    trusted_host = str(dep_source.get('trusted_host') or '').strip()\n"
+            "    base_cmd = [py_bin, '-m', 'pip', 'install', '--default-timeout=180', '--retries=6']\n"
+            "    if mode != 'global' and index_url and trusted_host:\n"
+            "        commands.append(base_cmd + ['-i', index_url, '--trusted-host', trusted_host] + list(args))\n"
+            "    commands.append(base_cmd + list(args))\n"
+            "    last_output = ''\n"
+            "    for idx, cmd in enumerate(commands):\n"
+            "        suffix = '' if idx == 0 else '（回退默认源）'\n"
+            "        ok, output = run_cmd(cmd, label=label + suffix, timeout=timeout, allow_fail=(idx + 1) < len(commands))\n"
+            "        last_output = str(output or '').strip()\n"
+            "        if ok:\n"
+            "            if last_output:\n"
+            "                append_report(label + suffix, last_output)\n"
+            "            return True, last_output\n"
+            "        if last_output:\n"
+            "            append_report(label + suffix, last_output)\n"
+            "    return False, last_output\n"
+            "\n"
+            "req_path = os.path.join(base, 'requirements.txt')\n"
+            "signature = {\n"
+            "    'python': py_bin,\n"
+            "    'requirements_hash': hash_file(req_path),\n"
+            "    'extra_packages': sorted(str(item or '').strip() for item in extra_packages if str(item or '').strip()),\n"
+            "}\n"
+            "state = load_state()\n"
+            "missing_extra = missing_extra_specs(extra_packages)\n"
+            "need_requirements = bool(signature['requirements_hash']) and state != signature\n"
+            "if (not need_requirements) and (not missing_extra):\n"
+            "    payload = {\n"
+            "        'ok': True,\n"
+            "        'python': py_bin,\n"
+            "        'error': '',\n"
+            "        'report_text': '',\n"
+            "        'progress': progress_lines or ['远端依赖已就绪，无需重复安装。'],\n"
+            "        'extra_packages': extra_packages,\n"
+            "    }\n"
+            "    print(json.dumps(payload, ensure_ascii=False))\n"
+            "    raise SystemExit(0)\n"
+            "run_cmd([py_bin, '-m', 'ensurepip', '--upgrade'], label='准备远端 pip 环境', timeout=240, allow_fail=True)\n"
+            "ok, pip_text = run_cmd([py_bin, '-m', 'pip', '--version'], label='检查远端 pip', timeout=120)\n"
+            "if not ok:\n"
+            "    payload = {\n"
+            "        'ok': False,\n"
+            "        'python': py_bin,\n"
+            "        'error': '服务器上的 Python 缺少 pip。',\n"
+            "        'report_text': str(pip_text or '').strip(),\n"
+            "        'progress': progress_lines,\n"
+            "        'extra_packages': extra_packages,\n"
+            "    }\n"
+            "    print(json.dumps(payload, ensure_ascii=False))\n"
+            "    raise SystemExit(0)\n"
+            "if need_requirements:\n"
+            "    ok, req_text = install_with_fallback(['-r', req_path], label='同步远端 requirements.txt', timeout=1200)\n"
+            "    if not ok:\n"
+            "        payload = {\n"
+            "            'ok': False,\n"
+            "            'python': py_bin,\n"
+            "            'error': '同步远端 requirements.txt 失败。',\n"
+            "            'report_text': '\\n\\n'.join(report_lines).strip() or str(req_text or '').strip(),\n"
+            "            'progress': progress_lines,\n"
+            "            'extra_packages': extra_packages,\n"
+            "        }\n"
+            "        print(json.dumps(payload, ensure_ascii=False))\n"
+            "        raise SystemExit(0)\n"
+            "missing_extra = missing_extra_specs(extra_packages)\n"
+            "if missing_extra:\n"
+            "    ok, extra_text = install_with_fallback(missing_extra, label='安装远端渠道依赖', timeout=1200)\n"
+            "    if not ok:\n"
+            "        payload = {\n"
+            "            'ok': False,\n"
+            "            'python': py_bin,\n"
+            "            'error': '安装远端渠道依赖失败。',\n"
+            "            'report_text': '\\n\\n'.join(report_lines).strip() or str(extra_text or '').strip(),\n"
+            "            'progress': progress_lines,\n"
+            "            'extra_packages': extra_packages,\n"
+            "        }\n"
+            "        print(json.dumps(payload, ensure_ascii=False))\n"
+            "        raise SystemExit(0)\n"
+            "    missing_extra = missing_extra_specs(extra_packages)\n"
+            "if missing_extra:\n"
+            "    payload = {\n"
+            "        'ok': False,\n"
+            "        'python': py_bin,\n"
+            "        'error': '远端渠道依赖安装后仍无法导入：' + '、'.join(missing_extra),\n"
+            "        'report_text': '\\n\\n'.join(report_lines).strip(),\n"
+            "        'progress': progress_lines,\n"
+            "        'extra_packages': extra_packages,\n"
+            "    }\n"
+            "    print(json.dumps(payload, ensure_ascii=False))\n"
+            "    raise SystemExit(0)\n"
+            "save_state(signature)\n"
+            "payload = {\n"
+            "    'ok': True,\n"
+            "    'python': py_bin,\n"
+            "    'error': '',\n"
+            "    'report_text': '\\n\\n'.join(report_lines).strip(),\n"
+            "    'progress': progress_lines,\n"
+            "    'extra_packages': extra_packages,\n"
+            "}\n"
+            "print(json.dumps(payload, ensure_ascii=False))\n"
+        )
+        ok, payload, err = self._remote_exec_json_script(device, script, timeout=600)
+        if not ok:
+            msg = str(err or f"远端 {label} 依赖检查失败。").strip() or f"远端 {label} 依赖检查失败。"
+            return False, msg, {}
+        if not bool(payload.get("ok", False)):
+            base_msg = str(payload.get("error") or "").strip()
+            if base_msg:
+                msg = f"远端 {label} 依赖安装失败：{base_msg}"
+            else:
+                msg = f"远端 {label} 依赖检查失败。"
+            return False, msg, dict(payload or {})
+        return True, "", dict(payload or {})
 
     def _start_remote_channel_process(self, channel_id, show_errors=True):
         spec = lz.COMM_CHANNEL_INDEX.get(channel_id) or {}
@@ -2781,6 +3374,12 @@ class ChannelRuntimeMixin:
                 self._channel_warning("配置不完整", f"{spec.get('label', channel_id)} 还缺少这些字段：\n- " + "\n- ".join(missing))
             return False
         did = str(ctx.get("device_id") or "").strip()
+        if self._remote_channel_is_external_running(did, channel_id):
+            msg = f"检测到远端外部 {label} 进程正在运行；启动器不会重复启动。"
+            self._set_status(msg)
+            if show_errors:
+                self._channel_warning("无法启动", msg)
+            return False
         conflict = self._remote_channel_conflict_message(did, channel_id)
         if conflict:
             if show_errors:
@@ -2788,18 +3387,27 @@ class ChannelRuntimeMixin:
             return False
         context = capture_runtime_context(self, include_settings_target=True)
         self._set_status(f"正在启动远端 {label} 渠道…")
-        holder = {"ok": False, "msg": "", "payload": {}}
+        holder = {"ok": False, "msg": "", "payload": {}, "failed_stage": ""}
 
         def worker():
             try:
-                ok, msg, payload = self._remote_start_channel_process_blocking(dev, channel_id, spec)
-                holder["ok"] = bool(ok)
-                holder["msg"] = str(msg or "")
-                holder["payload"] = dict(payload or {})
+                dep_ok, dep_msg, dep_payload = self._remote_prepare_runtime_dependencies_blocking(dev, channel_id, spec)
+                if not dep_ok:
+                    holder["ok"] = False
+                    holder["msg"] = str(dep_msg or "")
+                    holder["payload"] = dict(dep_payload or {})
+                    holder["failed_stage"] = "dependencies"
+                else:
+                    ok, msg, payload = self._remote_start_channel_process_blocking(dev, channel_id, spec)
+                    holder["ok"] = bool(ok)
+                    holder["msg"] = str(msg or "")
+                    holder["payload"] = dict(payload or {})
+                    holder["failed_stage"] = ""
             except Exception as e:
                 holder["ok"] = False
                 holder["msg"] = f"远端启动异常：{e}"
                 holder["payload"] = {}
+                holder["failed_stage"] = "start"
 
             def done():
                 if not runtime_context_matches(self, context, include_settings_target=True):
@@ -2814,6 +3422,14 @@ class ChannelRuntimeMixin:
                         self._set_status(f"远端 {label} 已在运行；当前会继续复用现有进程。")
                         if show_errors:
                             self._channel_info("已在运行", f"远端 {label} 已在运行，无需重复启动；当前会继续复用现有进程。")
+                    elif bool(holder["payload"].get("restarted")):
+                        old_pid = int(holder["payload"].get("previous_pid") or 0)
+                        pid = int(holder["payload"].get("pid") or 0)
+                        self._set_status(
+                            f"已重启远端 {label} 渠道（旧 PID {old_pid if old_pid > 0 else '-'} -> 新 PID {pid if pid > 0 else '-'}）。"
+                        )
+                        if show_errors:
+                            self._channel_info("重启成功", f"远端 {label} 已重启；如无响应可继续查看远端日志。")
                     else:
                         pid = int(holder["payload"].get("pid") or 0)
                         self._set_status(f"已启动远端 {label} 渠道（PID {pid if pid > 0 else '-'}）；如无新消息可再查看远端日志。")
@@ -2821,6 +3437,15 @@ class ChannelRuntimeMixin:
                             self._channel_info("启动成功", f"远端 {label} 已启动；如无响应可继续查看远端日志。")
                     return
                 msg = holder["msg"] or f"远端 {label} 启动失败。"
+                if holder["failed_stage"] == "dependencies":
+                    detail = str(holder["payload"].get("report_text") or "").strip()
+                    progress = holder["payload"].get("progress") or []
+                    if (not detail) and progress:
+                        detail = "\n".join(str(item or "").strip() for item in progress if str(item or "").strip())
+                    self._set_status(msg)
+                    if show_errors:
+                        self._channel_warning("依赖安装失败", msg, detail=detail)
+                    return
                 if channel_id == "wechat" and ("未绑定" in msg):
                     self._set_status("远端微信未绑定，已转入远端扫码绑定；完成后会继续尝试启动。")
                     if self._open_wechat_qr_dialog(show_errors=show_errors, remote_device=dev):
@@ -2836,10 +3461,11 @@ class ChannelRuntimeMixin:
         threading.Thread(target=worker, name=f"remote-start-{channel_id}", daemon=True).start()
         return True
 
-    def _remote_stop_channel_process_blocking(self, device, channel_id):
+    def _remote_stop_channel_process_blocking(self, device, channel_id, fallback_pid=0):
         script = (
             "import json, os, signal, time\n"
             f"channel_id = {str(channel_id)!r}\n"
+            f"fallback_pid = {max(0, int(fallback_pid or 0))}\n"
             "base = os.getcwd()\n"
             "sess_dir = os.path.join(base, 'temp', 'launcher_sessions')\n"
             "sid = f'launcher_remote_channel_{channel_id}'\n"
@@ -2854,6 +3480,8 @@ class ChannelRuntimeMixin:
             "    except Exception:\n"
             "        data = {}\n"
             "pid = int(data.get('process_pid') or 0)\n"
+            "if pid <= 0 and fallback_pid > 0:\n"
+            "    pid = fallback_pid\n"
             "\n"
             "def pid_alive(x):\n"
             "    if not x:\n"
@@ -2916,13 +3544,21 @@ class ChannelRuntimeMixin:
             self._channel_warning("无法停止", "当前远端设备信息不可用，请先检查设备配置。")
             return False
         label = self._remote_channel_label_text(channel_id)
+        did = str(ctx.get("device_id") or "").strip()
+        cached = self._remote_channel_cached_session(did, channel_id)
+        fallback_pid = 0
+        if isinstance(cached, dict):
+            try:
+                fallback_pid = max(0, int(cached.get("process_pid") or 0))
+            except Exception:
+                fallback_pid = 0
         context = capture_runtime_context(self, include_settings_target=True)
         holder = {"ok": False, "msg": "", "payload": {}}
         self._set_status(f"正在停止远端 {label} 渠道…")
 
         def worker():
             try:
-                ok, msg, payload = self._remote_stop_channel_process_blocking(dev, channel_id)
+                ok, msg, payload = self._remote_stop_channel_process_blocking(dev, channel_id, fallback_pid=fallback_pid)
                 holder["ok"] = bool(ok)
                 holder["msg"] = str(msg or "")
                 holder["payload"] = dict(payload or {})
@@ -3052,8 +3688,26 @@ class ChannelRuntimeMixin:
         spec = lz.COMM_CHANNEL_INDEX.get(channel_id)
         if not spec:
             return False
+        if not str(getattr(self, "_qt_channel_py_path", "") or "").strip():
+            loader = getattr(self, "_load_channels_source", None)
+            if callable(loader):
+                try:
+                    _root, py_path, parsed = loader()
+                except Exception:
+                    py_path, parsed = "", {}
+                if str(py_path or "").strip():
+                    self._qt_channel_py_path = str(py_path)
+                if isinstance(parsed, dict):
+                    self._qt_channel_parse_error = str(parsed.get("error") or "")
+                    self._qt_channel_configs = list(parsed.get("configs") or [])
+                    self._qt_channel_passthrough = list(parsed.get("passthrough") or [])
+                    self._qt_channel_extras = dict(parsed.get("extras") or {})
         if not self._qt_channels_save(silent=True, apply_running=False):
             return False
+        restarting_managed = bool(self._channel_proc_alive(channel_id))
+        if restarting_managed:
+            if not self._stop_channel_process(channel_id):
+                return False
         if channel_id == "wechat":
             token_info = self._wx_token_info()
             if (not skip_wechat_token_probe) and str(token_info.get("bot_token", "") or "").strip():
@@ -3085,9 +3739,6 @@ class ChannelRuntimeMixin:
                     if show_errors:
                         self._channel_warning("无法启动", "微信单实例锁仍被占用。已尝试自动关闭外部实例，请手动结束后重试。")
                     return False
-        if self._channel_proc_alive(channel_id):
-            self._reload_channels_editor_state()
-            return True
         if not lz.is_valid_agent_dir(self.agent_dir):
             if show_errors:
                 self._channel_warning("目录无效", "请先选择有效的 GenericAgent 目录。")
@@ -3371,7 +4022,7 @@ class ChannelRuntimeMixin:
         if bool(getattr(self, "_autostart_channels_running", False)):
             return
         try:
-            self._refresh_wechat_external_running()
+            self._refresh_local_channel_external_running()
         except Exception:
             pass
         pending = []

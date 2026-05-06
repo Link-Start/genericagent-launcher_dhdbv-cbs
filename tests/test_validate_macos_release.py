@@ -24,10 +24,10 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
         cls.mod = _load_validate_macos_release_module()
 
     def test_expected_artifact_names_match_public_contract(self):
-        names = self.mod._expected_artifact_names("1.2.3")
+        names = self.mod._expected_artifact_names("1.2.3", arch="arm64")
         self.assertEqual(names["app_bundle"], "GenericAgent Launcher.app")
-        self.assertEqual(names["dmg"], "GenericAgentLauncher-macos-1.2.3.dmg")
-        self.assertEqual(names["sha256"], "GenericAgentLauncher-macos-1.2.3.sha256")
+        self.assertEqual(names["dmg"], "GenericAgentLauncher-macos-arm64-1.2.3.dmg")
+        self.assertEqual(names["sha256"], "GenericAgentLauncher-macos-arm64-1.2.3.sha256")
         self.assertEqual(names["readme"], "README-macOS.txt")
         self.assertEqual(names["metadata"], "install-metadata.json")
         self.assertEqual(names["version_json"], "Contents/Resources/version.json")
@@ -36,10 +36,10 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             fp = os.path.join(td, "sample.sha256")
             with open(fp, "w", encoding="utf-8") as f:
-                f.write("abc123  GenericAgentLauncher-macos-1.2.3.dmg\n")
+                f.write("abc123  GenericAgentLauncher-macos-arm64-1.2.3.dmg\n")
             digest, filename = self.mod._parse_sha256_file(fp)
         self.assertEqual(digest, "abc123")
-        self.assertEqual(filename, "GenericAgentLauncher-macos-1.2.3.dmg")
+        self.assertEqual(filename, "GenericAgentLauncher-macos-arm64-1.2.3.dmg")
 
     def test_assert_install_metadata_accepts_expected_contract(self):
         payload = {
@@ -65,7 +65,7 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
             "apple_developer_signed": False,
             "notarized": False,
             "pyinstaller_may_ad_hoc_sign": True,
-            "artifact_names": self.mod._expected_artifact_names("1.2.3"),
+            "artifact_names": self.mod._expected_artifact_names("1.2.3", arch="x86_64"),
         }
         self.mod._assert_install_metadata(
             payload,
@@ -99,7 +99,7 @@ class ValidateMacOSReleaseTests(unittest.TestCase):
             "apple_developer_signed": False,
             "notarized": False,
             "pyinstaller_may_ad_hoc_sign": True,
-            "artifact_names": self.mod._expected_artifact_names("1.2.3"),
+            "artifact_names": self.mod._expected_artifact_names("1.2.3", arch="x86_64"),
         }
         with self.assertRaises(SystemExit) as ctx:
             self.mod._assert_install_metadata(

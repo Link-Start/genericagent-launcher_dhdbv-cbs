@@ -90,12 +90,14 @@ def _current_build_arch() -> str:
     return _normalized_build_arch(platform.machine())
 
 
-def _artifact_names(version: str) -> dict:
+def _artifact_names(version: str, *, arch: str = "") -> dict:
     resolved_version = str(version or "").strip() or "unknown"
+    resolved_arch = _normalized_build_arch(arch)
+    arch_prefix = f"{resolved_arch}-" if resolved_arch else ""
     return {
         "app_bundle": APP_BUNDLE_NAME,
-        "dmg": f"GenericAgentLauncher-macos-{resolved_version}.dmg",
-        "sha256": f"GenericAgentLauncher-macos-{resolved_version}.sha256",
+        "dmg": f"GenericAgentLauncher-macos-{arch_prefix}{resolved_version}.dmg",
+        "sha256": f"GenericAgentLauncher-macos-{arch_prefix}{resolved_version}.sha256",
         "readme": "README-macOS.txt",
         "metadata": "install-metadata.json",
         "version_json": MACOS_VERSION_JSON_RELATIVE_PATH,
@@ -156,7 +158,8 @@ def _install_readme_text(version: str, *, version_meta: dict | None = None) -> s
 def _install_metadata(version: str, *, dmg_name: str, version_meta: dict | None = None) -> dict:
     meta = dict(version_meta or {})
     resolved_version = str(meta.get("version") or version or "").strip() or "unknown"
-    artifact_names = _artifact_names(resolved_version)
+    build_arch = _current_build_arch()
+    artifact_names = _artifact_names(resolved_version, arch=build_arch)
     artifact_names["dmg"] = str(dmg_name or artifact_names["dmg"]).strip()
     return {
         "platform": "macos",
@@ -176,7 +179,7 @@ def _install_metadata(version: str, *, dmg_name: str, version_meta: dict | None 
         "artifact_names": artifact_names,
         "supports_internal_updater": False,
         "requires_system_python": True,
-        "build_arch": _current_build_arch(),
+        "build_arch": build_arch,
         "runner_label": str(os.environ.get("GA_MACOS_RUNNER_LABEL") or "").strip(),
         "developer_id_signed": False,
         "apple_developer_signed": False,
@@ -258,8 +261,10 @@ def main() -> int:
     dist_dir = _resolve_path(root, str(args.dist or "dist"))
     out_root = _resolve_path(root, str(args.out or "release"))
     spec_path = os.path.join(root, "GenericAgentLauncher.mac.spec")
-    dmg_name = f"GenericAgentLauncher-macos-{version}.dmg"
-    sha_name = f"GenericAgentLauncher-macos-{version}.sha256"
+    build_arch = _current_build_arch()
+    artifact_names = _artifact_names(version, arch=build_arch)
+    dmg_name = artifact_names["dmg"]
+    sha_name = artifact_names["sha256"]
     bundle_icon_path = _prepare_macos_bundle_icon(root)
 
     _run(
