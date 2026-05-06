@@ -563,7 +563,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 self.statuses.append(str(text))
 
         dummy = DummyBridge()
-        with mock.patch.object(bridge_runtime.os, "name", "posix"):
+        with mock.patch.object(bridge_runtime.os, "name", "posix"), mock.patch.object(personal_usage.lz, "IS_MACOS", False):
             dummy._notify_reply_done("windows stays silent")
 
         self.assertEqual(dummy.sound_calls, 1)
