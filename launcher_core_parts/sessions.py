@@ -67,8 +67,187 @@ def _safe_float(value, default=0.0):
         return float(default)
 
 
+def _safe_int(value, default=0):
+    try:
+        if value in (None, ""):
+            return int(default or 0)
+        return int(value or 0)
+    except Exception:
+        return int(default or 0)
+
+
+def _safe_cost(value, default=0.0):
+    try:
+        if value is None:
+            return round(float(default or 0), 8)
+        if isinstance(value, str) and not value.strip():
+            return round(float(default or 0), 8)
+        return round(float(value), 8)
+    except Exception:
+        return round(float(default or 0), 8)
+
+
 def _safe_bool(value):
     return bool(value)
+
+
+def usage_pricing_target_key(device_scope="local", device_id="local"):
+    scope = str(device_scope or "local").strip().lower()
+    if scope not in ("local", "remote"):
+        scope = "local"
+    did = str(device_id or "").strip() if scope == "remote" else "local"
+    if scope == "remote" and not did:
+        scope = "local"
+        did = "local"
+    return f"{scope}:{did or 'local'}"
+
+
+def normalize_usage_currency(value):
+    text = str(value or "USD").strip().upper()
+    if not text:
+        text = "USD"
+    return re.sub(r"[^A-Z0-9_\-]", "", text)[:12] or "USD"
+
+
+def _normalize_price_per_1m(value):
+    try:
+        number = float(value or 0)
+    except Exception:
+        number = 0.0
+    if number < 0:
+        number = 0.0
+    return round(number, 8)
+
+
+def normalize_usage_pricing_config(cfg):
+    root_cfg = cfg if isinstance(cfg, dict) else {}
+    pricing = root_cfg.get("usage_pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+    currency = normalize_usage_currency(pricing.get("currency") or root_cfg.get("usage_currency") or "USD")
+    targets = pricing.get("targets")
+    if not isinstance(targets, dict):
+        targets = {}
+    normalized_targets = {}
+    for raw_key, raw_rules in list(targets.items()):
+        rules = raw_rules if isinstance(raw_rules, dict) else {}
+        key = str(raw_key or "").strip()
+        if ":" not in key:
+            key = usage_pricing_target_key("local", "local")
+        normalized_rules = {}
+        for raw_var, raw_rule in list(rules.items()):
+            api_var = str(raw_var or "").strip()
+            if not api_var:
+                continue
+            rule = raw_rule if isinstance(raw_rule, dict) else {}
+            normalized_rules[api_var] = {
+                "api_card_var": api_var,
+                "api_card_label": str(rule.get("api_card_label") or rule.get("label") or api_var).strip() or api_var,
+                "input_per_1m": _normalize_price_per_1m(rule.get("input_per_1m")),
+                "output_per_1m": _normalize_price_per_1m(rule.get("output_per_1m")),
+                "cache_read_per_1m": _normalize_price_per_1m(rule.get("cache_read_per_1m")),
+                "cache_creation_per_1m": _normalize_price_per_1m(rule.get("cache_creation_per_1m")),
+                "updated_at": _safe_float(rule.get("updated_at"), 0.0),
+            }
+        normalized_targets[key] = normalized_rules
+    pricing = {"version": 1, "currency": currency, "targets": normalized_targets}
+    if isinstance(cfg, dict):
+        cfg["usage_pricing"] = pricing
+    return pricing
+
+
+def usage_price_rule(cfg, device_scope="local", device_id="local", api_card_var=""):
+    api_var = str(api_card_var or "").strip()
+    if not api_var:
+        return None
+    pricing = normalize_usage_pricing_config(cfg)
+    target_key = usage_pricing_target_key(device_scope, device_id)
+    rule = (pricing.get("targets") or {}).get(target_key, {}).get(api_var)
+    return dict(rule) if isinstance(rule, dict) else None
+
+
+def set_usage_price_rule(cfg, device_scope="local", device_id="local", api_card_var="", rule=None):
+    if not isinstance(cfg, dict):
+        return None
+    api_var = str(api_card_var or "").strip()
+    if not api_var:
+        return None
+    pricing = normalize_usage_pricing_config(cfg)
+    target_key = usage_pricing_target_key(device_scope, device_id)
+    targets = pricing.setdefault("targets", {})
+    bucket = targets.setdefault(target_key, {})
+    raw = rule if isinstance(rule, dict) else {}
+    normalized = {
+        "api_card_var": api_var,
+        "api_card_label": str(raw.get("api_card_label") or raw.get("label") or api_var).strip() or api_var,
+        "input_per_1m": _normalize_price_per_1m(raw.get("input_per_1m")),
+        "output_per_1m": _normalize_price_per_1m(raw.get("output_per_1m")),
+        "cache_read_per_1m": _normalize_price_per_1m(raw.get("cache_read_per_1m")),
+        "cache_creation_per_1m": _normalize_price_per_1m(raw.get("cache_creation_per_1m")),
+        "updated_at": _safe_float(raw.get("updated_at"), time.time()),
+    }
+    if not any(normalized.get(k, 0) > 0 for k in ("input_per_1m", "output_per_1m", "cache_read_per_1m", "cache_creation_per_1m")):
+        bucket.pop(api_var, None)
+        return None
+    bucket[api_var] = normalized
+    cfg["usage_pricing"] = pricing
+    return normalized
+
+
+def usage_price_snapshot(rule, currency="USD"):
+    data = rule if isinstance(rule, dict) else {}
+    api_var = str(data.get("api_card_var") or "").strip()
+    if not api_var:
+        return None
+    snapshot = {
+        "version": 1,
+        "api_card_var": api_var,
+        "api_card_label": str(data.get("api_card_label") or api_var).strip() or api_var,
+        "currency": normalize_usage_currency(currency),
+        "unit": "per_1m_tokens",
+        "input_per_1m": _normalize_price_per_1m(data.get("input_per_1m")),
+        "output_per_1m": _normalize_price_per_1m(data.get("output_per_1m")),
+        "cache_read_per_1m": _normalize_price_per_1m(data.get("cache_read_per_1m")),
+        "cache_creation_per_1m": _normalize_price_per_1m(data.get("cache_creation_per_1m")),
+        "captured_at": time.time(),
+    }
+    if not any(snapshot.get(k, 0) > 0 for k in ("input_per_1m", "output_per_1m", "cache_read_per_1m", "cache_creation_per_1m")):
+        return None
+    return snapshot
+
+
+def apply_usage_price_snapshot(event, snapshot):
+    ev = event if isinstance(event, dict) else {}
+    snap = snapshot if isinstance(snapshot, dict) else None
+    if not snap:
+        ev["billing_mode"] = "unpriced"
+        return ev
+    input_tokens = _safe_int(ev.get("input_tokens"))
+    output_tokens = _safe_int(ev.get("output_tokens"))
+    cache_read = _safe_int(ev.get("cache_read_input_tokens"))
+    cache_creation = _safe_int(ev.get("cache_creation_input_tokens"))
+    billable_input = max(0, input_tokens - cache_read - cache_creation)
+    cost_input = _safe_cost(billable_input * _normalize_price_per_1m(snap.get("input_per_1m")) / 1_000_000)
+    cost_output = _safe_cost(output_tokens * _normalize_price_per_1m(snap.get("output_per_1m")) / 1_000_000)
+    cost_cache_read = _safe_cost(cache_read * _normalize_price_per_1m(snap.get("cache_read_per_1m")) / 1_000_000)
+    cost_cache_creation = _safe_cost(cache_creation * _normalize_price_per_1m(snap.get("cache_creation_per_1m")) / 1_000_000)
+    ev["price_snapshot"] = dict(snap)
+    ev["currency"] = normalize_usage_currency(snap.get("currency"))
+    ev["billable_input_tokens"] = billable_input
+    ev["cost_input"] = cost_input
+    ev["cost_output"] = cost_output
+    ev["cost_cache_read"] = cost_cache_read
+    ev["cost_cache_creation"] = cost_cache_creation
+    ev["cost_total"] = _safe_cost(cost_input + cost_output + cost_cache_read + cost_cache_creation)
+    ev["billing_mode"] = "priced"
+    return ev
+
+
+def usage_event_is_priced(event):
+    ev = event if isinstance(event, dict) else {}
+    return isinstance(ev.get("price_snapshot"), dict) or any(
+        key in ev for key in ("cost_input", "cost_output", "cost_cache_read", "cost_cache_creation", "cost_total")
+    )
 
 
 def _session_meta_from_payload(payload, *, sid="", path=""):
@@ -628,11 +807,20 @@ def _normalize_token_usage_inplace(session):
     usage = session.get("token_usage")
     if not isinstance(usage, dict):
         usage = {}
+    usage_cleared = bool(usage.get("launcher_usage_cleared"))
     events = usage.get("events")
     if not isinstance(events, list):
         events = []
 
     normalized_events = []
+    default_scope = str(session.get("device_scope") or "local").strip().lower()
+    if default_scope not in ("local", "remote"):
+        default_scope = "local"
+    default_device_id = str(session.get("device_id") or "").strip() if default_scope == "remote" else "local"
+    if default_scope == "remote" and not default_device_id:
+        default_scope = "local"
+        default_device_id = "local"
+    usage_currency = normalize_usage_currency(usage.get("currency") or "USD")
     for ev in events:
         if not isinstance(ev, dict):
             continue
@@ -640,25 +828,66 @@ def _normalize_token_usage_inplace(session):
             ts = float(ev.get("ts", session.get("updated_at", time.time())) or time.time())
         except Exception:
             ts = time.time()
-        inp = int(ev.get("input_tokens", 0) or 0)
-        out = int(ev.get("output_tokens", 0) or 0)
-        normalized_events.append(
-            {
-                "ts": ts,
-                "input_tokens": inp,
-                "output_tokens": out,
-                "total_tokens": int(ev.get("total_tokens", inp + out) or (inp + out)),
-                "channel_id": _normalize_usage_channel_id(ev.get("channel_id"), default_channel),
-                "model": str(ev.get("model") or "").strip(),
-                "usage_source": str(ev.get("usage_source") or "estimate").strip().lower() or "estimate",
-                "cached_tokens": int(ev.get("cached_tokens", 0) or 0),
-                "cache_creation_input_tokens": int(ev.get("cache_creation_input_tokens", 0) or 0),
-                "cache_read_input_tokens": int(ev.get("cache_read_input_tokens", 0) or 0),
-                "api_calls": int(ev.get("api_calls", 0) or 0),
-            }
-        )
+        inp = _safe_int(ev.get("input_tokens"))
+        out = _safe_int(ev.get("output_tokens"))
+        row_scope = str(ev.get("device_scope") or ev.get("target_scope") or default_scope).strip().lower()
+        if row_scope not in ("local", "remote"):
+            row_scope = default_scope
+        row_device_id = str(ev.get("device_id") or ev.get("target_device_id") or default_device_id).strip() if row_scope == "remote" else "local"
+        if row_scope == "remote" and not row_device_id:
+            row_scope = "local"
+            row_device_id = "local"
+        row = {
+            "ts": ts,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "total_tokens": _safe_int(ev.get("total_tokens"), inp + out) or (inp + out),
+            "channel_id": _normalize_usage_channel_id(ev.get("channel_id"), default_channel),
+            "model": str(ev.get("model") or "").strip(),
+            "usage_source": str(ev.get("usage_source") or "estimate").strip().lower() or "estimate",
+            "cached_tokens": _safe_int(ev.get("cached_tokens")),
+            "cache_creation_input_tokens": _safe_int(ev.get("cache_creation_input_tokens")),
+            "cache_read_input_tokens": _safe_int(ev.get("cache_read_input_tokens")),
+            "api_calls": _safe_int(ev.get("api_calls")),
+            "device_scope": row_scope,
+            "device_id": row_device_id,
+            "target_key": usage_pricing_target_key(row_scope, row_device_id),
+            "llm_idx": _safe_int(ev.get("llm_idx")) if "llm_idx" in ev else None,
+            "api_card_var": str(ev.get("api_card_var") or "").strip(),
+            "api_card_label": str(ev.get("api_card_label") or ev.get("api_card_var") or "").strip(),
+            "billing_mode": str(ev.get("billing_mode") or "").strip().lower(),
+        }
+        if row["llm_idx"] is None:
+            row.pop("llm_idx", None)
+        snapshot = ev.get("price_snapshot") if isinstance(ev.get("price_snapshot"), dict) else None
+        if snapshot:
+            snap = dict(snapshot)
+            snap["currency"] = normalize_usage_currency(snap.get("currency") or ev.get("currency") or usage_currency)
+            row["price_snapshot"] = snap
+            row["currency"] = snap["currency"]
+        elif ev.get("currency"):
+            row["currency"] = normalize_usage_currency(ev.get("currency"))
+        cost_input = _safe_cost(ev.get("cost_input"))
+        cost_output = _safe_cost(ev.get("cost_output"))
+        cost_cache_read = _safe_cost(ev.get("cost_cache_read"))
+        cost_cache_creation = _safe_cost(ev.get("cost_cache_creation"))
+        has_cost_fields = any(key in ev for key in ("cost_input", "cost_output", "cost_cache_read", "cost_cache_creation", "cost_total"))
+        if has_cost_fields:
+            row["cost_input"] = cost_input
+            row["cost_output"] = cost_output
+            row["cost_cache_read"] = cost_cache_read
+            row["cost_cache_creation"] = cost_cache_creation
+            row["cost_total"] = _safe_cost(ev.get("cost_total"), cost_input + cost_output + cost_cache_read + cost_cache_creation)
+        elif snapshot:
+            apply_usage_price_snapshot(row, row.get("price_snapshot"))
+        if usage_event_is_priced(row):
+            row["billing_mode"] = row.get("billing_mode") or "priced"
+            row["currency"] = normalize_usage_currency(row.get("currency") or usage_currency)
+        else:
+            row["billing_mode"] = row.get("billing_mode") or "legacy_unpriced"
+        normalized_events.append(row)
 
-    if not normalized_events and str(session.get("session_kind") or "").strip().lower() != "channel_process":
+    if (not normalized_events) and (not usage_cleared) and str(session.get("session_kind") or "").strip().lower() != "channel_process":
         normalized_events = _fallback_token_events_from_bubbles(
             session.get("bubbles") or [],
             base_ts=session.get("created_at") or session.get("updated_at") or time.time(),
@@ -668,6 +897,26 @@ def _normalize_token_usage_inplace(session):
 
     input_tokens = sum(int(ev.get("input_tokens", 0) or 0) for ev in normalized_events)
     output_tokens = sum(int(ev.get("output_tokens", 0) or 0) for ev in normalized_events)
+    cost_input = _safe_cost(sum(float(ev.get("cost_input", 0) or 0) for ev in normalized_events))
+    cost_output = _safe_cost(sum(float(ev.get("cost_output", 0) or 0) for ev in normalized_events))
+    cost_cache_read = _safe_cost(sum(float(ev.get("cost_cache_read", 0) or 0) for ev in normalized_events))
+    cost_cache_creation = _safe_cost(sum(float(ev.get("cost_cache_creation", 0) or 0) for ev in normalized_events))
+    cost_total = _safe_cost(sum(float(ev.get("cost_total", 0) or 0) for ev in normalized_events))
+    priced_event_count = sum(1 for ev in normalized_events if usage_event_is_priced(ev))
+    estimated_priced_event_count = sum(
+        1 for ev in normalized_events
+        if usage_event_is_priced(ev) and str(ev.get("usage_source") or "").strip().lower() != "provider"
+    )
+    legacy_unpriced_event_count = max(0, len(normalized_events) - priced_event_count)
+    currency_totals = {}
+    for ev in normalized_events:
+        if not usage_event_is_priced(ev):
+            continue
+        ev_cost = _safe_cost(ev.get("cost_total"))
+        if ev_cost == 0:
+            continue
+        ev_currency = normalize_usage_currency(ev.get("currency") or (ev.get("price_snapshot") or {}).get("currency") or usage_currency)
+        currency_totals[ev_currency] = _safe_cost(currency_totals.get(ev_currency, 0) + ev_cost)
     sources = {str(ev.get("usage_source") or "estimate").strip().lower() or "estimate" for ev in normalized_events}
     if sources == {"provider"}:
         mode = "provider_usage"
@@ -688,7 +937,20 @@ def _normalize_token_usage_inplace(session):
         "channel_label": _usage_channel_label(default_channel),
         "last_model": str(usage.get("last_model") or "").strip(),
         "api_calls": sum(int(ev.get("api_calls", 0) or 0) for ev in normalized_events),
+        "currency": usage_currency,
+        "cost_input": cost_input,
+        "cost_output": cost_output,
+        "cost_cache_read": cost_cache_read,
+        "cost_cache_creation": cost_cache_creation,
+        "cost_total": cost_total,
+        "currency_totals": currency_totals,
+        "mixed_currency": len(currency_totals) > 1,
+        "priced_event_count": priced_event_count,
+        "estimated_priced_event_count": estimated_priced_event_count,
+        "legacy_unpriced_event_count": legacy_unpriced_event_count,
     }
+    if usage_cleared and not normalized_events:
+        usage["launcher_usage_cleared"] = True
     session["channel_id"] = default_channel
     session["channel_label"] = _usage_channel_label(default_channel)
     session["token_usage"] = usage

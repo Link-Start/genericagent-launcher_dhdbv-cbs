@@ -44,6 +44,7 @@ from .common import (
 
 class ChannelRuntimeMixin:
     _REMOTE_CHANNEL_PROBE_TIMEOUT_SECONDS = 30.0
+    _LOCAL_CHANNEL_EXTERNAL_REFRESH_TTL_SECONDS = 4.0
 
     def _remote_channel_sync_is_stuck(self, device_id) -> bool:
         did = str(device_id or "").strip()
@@ -217,13 +218,6 @@ class ChannelRuntimeMixin:
         self._qt_channel_passthrough = list(parsed.get("passthrough") or [])
         self._qt_channel_extras = dict(parsed.get("extras") or {})
         self._qt_channel_states = {}
-        target_ctx_getter = getattr(self, "_settings_target_context", None)
-        target_ctx = target_ctx_getter() if callable(target_ctx_getter) else {"is_remote": False}
-        if not bool((target_ctx or {}).get("is_remote")):
-            try:
-                self._refresh_local_channel_external_running()
-            except Exception:
-                pass
         notices = [py_path]
         if self._qt_channel_parse_error:
             notices.append(f"当前解析失败：{self._qt_channel_parse_error}。继续保存会覆盖成可识别格式。")
@@ -313,6 +307,10 @@ class ChannelRuntimeMixin:
             self.cfg["communication_channels"] = bucket
         return bucket
 
+    def _channel_api_reference_errors(self):
+        configs = [dict(item) for item in (getattr(self, "_qt_channel_configs", []) or []) if isinstance(item, dict)]
+        return [str(err or "").strip() for err in lz.validate_api_config_references(configs) if str(err or "").strip()]
+
     def _channel_runtime_cfg(self, channel_id):
         bucket = self._channel_cfg_bucket()
         item = bucket.get(channel_id)
@@ -338,6 +336,114 @@ class ChannelRuntimeMixin:
 
     def _channel_external_running(self, channel_id):
         return bool(self._channel_runtime_cfg(channel_id).get("external_running", False))
+
+    def _local_channel_external_refresh_ttl_seconds(self):
+        try:
+            value = float(getattr(self, "_LOCAL_CHANNEL_EXTERNAL_REFRESH_TTL_SECONDS", 4.0) or 4.0)
+        except Exception:
+            value = 4.0
+        return max(0.5, value)
+
+    def _local_channel_external_refresh_is_fresh(self, *, max_age=None):
+        try:
+            scanned_at = float(getattr(self, "_local_channel_external_scan_at", 0.0) or 0.0)
+        except Exception:
+            scanned_at = 0.0
+        if scanned_at <= 0:
+            return False
+        try:
+            now = float(time.time())
+        except Exception:
+            return False
+        limit = self._local_channel_external_refresh_ttl_seconds() if max_age is None else max(0.0, float(max_age))
+        return (now - scanned_at) <= limit
+
+    def _scan_local_channel_external_snapshot(self):
+        return {
+            "external_map": self._local_channel_external_pids(),
+            "wechat_locked": bool(self._wechat_singleton_locked()),
+        }
+
+    def _apply_local_channel_external_snapshot(self, snapshot, *, persist=False):
+        payload = dict(snapshot or {})
+        external_map = dict(payload.get("external_map") or {})
+        wechat_locked = bool(payload.get("wechat_locked"))
+        changed = False
+        for spec in getattr(lz, "COMM_CHANNEL_SPECS", []):
+            cid = str(spec.get("id") or "").strip()
+            if not cid:
+                continue
+            active = bool(external_map.get(cid))
+            if cid == "wechat" and (not active):
+                active = wechat_locked
+            if self._channel_external_running(cid) != active:
+                self._channel_set_external_running(cid, active, persist=False)
+                changed = True
+        self._local_channel_external_last_map = {str(k): list(v or []) for k, v in external_map.items()}
+        try:
+            self._local_channel_external_scan_at = float(time.time())
+        except Exception:
+            self._local_channel_external_scan_at = 0.0
+        if changed and persist:
+            lz.save_config(self.cfg)
+        return external_map
+
+    def _request_local_channel_external_running_refresh(self, *, persist=False, force=False, refresh_ui=False, after=None):
+        if not lz.is_valid_agent_dir(self.agent_dir):
+            return False
+        if (not force) and self._local_channel_external_refresh_is_fresh():
+            return False
+        callbacks = getattr(self, "_local_channel_external_refresh_callbacks", None)
+        if not isinstance(callbacks, list):
+            callbacks = []
+            self._local_channel_external_refresh_callbacks = callbacks
+        if callable(after):
+            callbacks.append(after)
+        self._local_channel_external_refresh_persist = bool(
+            bool(getattr(self, "_local_channel_external_refresh_persist", False)) or bool(persist)
+        )
+        self._local_channel_external_refresh_ui = bool(
+            bool(getattr(self, "_local_channel_external_refresh_ui", False)) or bool(refresh_ui)
+        )
+        if bool(getattr(self, "_local_channel_external_refresh_inflight", False)):
+            return True
+        self._local_channel_external_refresh_inflight = True
+        context = capture_runtime_context(self)
+
+        def worker():
+            try:
+                snapshot = self._scan_local_channel_external_snapshot()
+            except Exception:
+                snapshot = {"external_map": {}, "wechat_locked": False}
+
+            def done():
+                callbacks_local = list(getattr(self, "_local_channel_external_refresh_callbacks", []) or [])
+                self._local_channel_external_refresh_callbacks = []
+                persist_flag = bool(getattr(self, "_local_channel_external_refresh_persist", False))
+                refresh_ui_flag = bool(getattr(self, "_local_channel_external_refresh_ui", False))
+                self._local_channel_external_refresh_persist = False
+                self._local_channel_external_refresh_ui = False
+                self._local_channel_external_refresh_inflight = False
+                if not runtime_context_matches(self, context):
+                    return
+                external_map = self._apply_local_channel_external_snapshot(snapshot, persist=persist_flag)
+                if refresh_ui_flag:
+                    refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
+                    if callable(refresher):
+                        try:
+                            refresher(force=True)
+                        except Exception:
+                            pass
+                for callback in callbacks_local:
+                    try:
+                        callback(dict(external_map))
+                    except Exception:
+                        pass
+
+            self._channel_post_ui(done, action_name="本地渠道状态刷新")
+
+        threading.Thread(target=worker, daemon=True, name="local-channel-external-refresh").start()
+        return True
 
     def _iter_local_channel_processes(self):
         if os.name == "nt":
@@ -461,6 +567,11 @@ class ChannelRuntimeMixin:
             return ""
         return ("frontends/" + script).replace("\\", "/")
 
+    def _channel_launch_mode(self, channel_id):
+        cid = str(channel_id or "").strip()
+        spec = lz.COMM_CHANNEL_INDEX.get(cid) or {}
+        return str(spec.get("launch_mode") or "").strip().lower()
+
     def _local_channel_external_pids(self):
         results: dict[str, list[int]] = {}
         agent_dir = str(self.agent_dir or "").strip()
@@ -536,21 +647,8 @@ class ChannelRuntimeMixin:
         return list(self._local_channel_external_pids().get("wechat") or [])
 
     def _refresh_local_channel_external_running(self, *, persist=False):
-        external_map = self._local_channel_external_pids()
-        changed = False
-        for spec in getattr(lz, "COMM_CHANNEL_SPECS", []):
-            cid = str(spec.get("id") or "").strip()
-            if not cid:
-                continue
-            active = bool(external_map.get(cid))
-            if cid == "wechat" and (not active):
-                active = bool(self._wechat_singleton_locked())
-            if self._channel_external_running(cid) != active:
-                self._channel_set_external_running(cid, active, persist=False)
-                changed = True
-        if changed and persist:
-            lz.save_config(self.cfg)
-        return external_map
+        snapshot = self._scan_local_channel_external_snapshot()
+        return self._apply_local_channel_external_snapshot(snapshot, persist=persist)
 
     def _terminate_pid_force(self, pid):
         p = int(pid or 0)
@@ -1757,6 +1855,11 @@ class ChannelRuntimeMixin:
                 continue
             if lz._normalize_usage_channel_id(meta.get("channel_id"), "launcher") != cid:
                 continue
+            session_scope = str(meta.get("device_scope") or "local").strip().lower()
+            if session_scope not in ("local", "remote"):
+                session_scope = "local"
+            if session_scope != "local":
+                continue
             ts = float(meta.get("updated_at", 0) or 0)
             if ts >= latest_ts:
                 latest_sid = str(meta.get("id") or "").strip()
@@ -1781,6 +1884,8 @@ class ChannelRuntimeMixin:
             "session_source_label": lz._usage_channel_label(channel_id),
             "channel_id": lz._normalize_usage_channel_id(channel_id, "launcher"),
             "channel_label": lz._usage_channel_label(channel_id),
+            "device_scope": "local",
+            "device_id": "local",
             "process_pid": int(getattr(proc, "pid", 0) or 0),
             "process_status": "运行中",
             "process_started_at": started_at,
@@ -2020,17 +2125,22 @@ class ChannelRuntimeMixin:
         if bool((target_ctx or {}).get("is_remote")):
             self._request_remote_channel_status_refresh()
             return
-        try:
-            self._refresh_local_channel_external_running(persist=True)
-        except Exception:
-            pass
-        self._sync_all_channel_process_sessions()
         refresher = getattr(self, "_refresh_channels_runtime_status_labels", None)
-        if callable(refresher):
-            try:
-                refresher(force=True)
-            except Exception:
-                pass
+
+        def after_refresh(_external_map=None):
+            self._sync_all_channel_process_sessions()
+            if callable(refresher):
+                try:
+                    refresher(force=True)
+                except Exception:
+                    pass
+
+        self._request_local_channel_external_running_refresh(
+            persist=True,
+            force=True,
+            refresh_ui=False,
+            after=after_refresh,
+        )
 
     def _show_remote_channel_status_detail(self, device_id, channel_id, title):
         did = str(device_id or "").strip()
@@ -2232,6 +2342,8 @@ class ChannelRuntimeMixin:
         missing = self._channel_missing_required(channel_id, values)
         if missing:
             return "待配置", C["danger_text"]
+        if self._channel_launch_mode(channel_id) == "terminal":
+            return "终端入口", C["muted"]
         info = self._channel_procs.get(channel_id) or {}
         proc = info.get("proc")
         if proc and proc.poll() is not None:
@@ -2300,6 +2412,8 @@ class ChannelRuntimeMixin:
             return ""
         if self._channel_external_running(channel_id):
             return f"当前是外部启动的 {self._remote_channel_label_text(channel_id)} 进程，启动器无法直接停止。"
+        if self._channel_launch_mode(channel_id) == "terminal":
+            return f"{self._remote_channel_label_text(channel_id)} 是终端入口，启动器不托管该进程；请直接关闭终端窗口。"
         return f"当前没有由启动器托管的 {self._remote_channel_label_text(channel_id)} 运行中进程。"
 
     def _channel_bind_disabled_reason(self, channel_id, *, target_ctx=None):
@@ -2365,10 +2479,11 @@ class ChannelRuntimeMixin:
         is_remote_target = bool((target_ctx or {}).get("is_remote"))
         self._refresh_channel_source_actions()
         if not is_remote_target:
-            try:
-                self._refresh_local_channel_external_running()
-            except Exception:
-                pass
+            self._request_local_channel_external_running_refresh(
+                persist=False,
+                force=False,
+                refresh_ui=True,
+            )
         if is_remote_target:
             did = str((target_ctx or {}).get("device_id") or "").strip()
             notice = getattr(self, "settings_channels_notice", None)
@@ -2389,6 +2504,7 @@ class ChannelRuntimeMixin:
         if not isinstance(states, dict):
             return
         for spec in lz.COMM_CHANNEL_SPECS:
+            terminal_mode = self._channel_launch_mode(spec["id"]) == "terminal"
             state = states.get(spec["id"]) or {}
             status_widget = state.get("status_label")
             hint_widget = state.get("status_hint_label")
@@ -2413,6 +2529,13 @@ class ChannelRuntimeMixin:
                 did = str((target_ctx or {}).get("device_id") or "").strip()
                 remote_dev = dict((target_ctx or {}).get("device") or {})
                 remote_actions_ready = bool(remote_dev)
+                if terminal_mode:
+                    self._apply_channel_button_state(
+                        start_btn,
+                        False,
+                        disabled_tooltip=f"{spec.get('label', spec['id'])} 仅支持在当前启动器本机打开终端。",
+                    )
+                    continue
                 remote_running = self._remote_channel_is_running(did, spec["id"])
                 remote_managed = self._remote_channel_is_launcher_managed(did, spec["id"])
                 remote_pid = self._remote_channel_process_pid(did, spec["id"])
@@ -2455,6 +2578,14 @@ class ChannelRuntimeMixin:
                     and (not conflict)
                     and (not missing)
                 )
+                if terminal_mode:
+                    self._apply_channel_button_state(
+                        start_btn,
+                        bool(can_start),
+                        enabled_tooltip=f"打开新终端并运行 {spec.get('label', spec['id'])}。",
+                        disabled_tooltip=self._channel_start_disabled_reason(spec["id"], values, target_ctx=target_ctx),
+                    )
+                    continue
                 self._apply_channel_button_state(
                     start_btn,
                     bool(can_start),
@@ -2556,6 +2687,7 @@ class ChannelRuntimeMixin:
         remote_dev = dict((target_ctx or {}).get("device") or {}) if is_remote_target else {}
         remote_actions_ready = (not is_remote_target) or bool(remote_dev)
         for spec in lz.COMM_CHANNEL_SPECS:
+            terminal_mode = self._channel_launch_mode(spec["id"]) == "terminal"
             values = {field["key"]: self._qt_channel_extras.get(field["key"]) for field in spec.get("fields", [])}
             status_text, status_color = self._channel_status(spec["id"], values, target_ctx=target_ctx)
             card = self._panel_card()
@@ -2619,7 +2751,7 @@ class ChannelRuntimeMixin:
             controls = QHBoxLayout()
             controls.setSpacing(8)
             auto_box = None
-            if not is_remote_target:
+            if (not is_remote_target) and (not terminal_mode):
                 auto_box = QCheckBox("自动启动")
                 auto_box.setChecked(self._channel_is_auto_start(spec["id"]))
                 auto_box.setEnabled(True)
@@ -2648,65 +2780,76 @@ class ChannelRuntimeMixin:
                     )
                 controls.addWidget(bind_btn, 0)
                 state["bind_btn"] = bind_btn
-            save_btn = QPushButton("保存")
-            save_btn.setStyleSheet(self._action_button_style())
-            save_btn.clicked.connect(
-                lambda _=False: self._safe_channel_ui_call(
-                    "保存渠道配置",
-                    lambda: self._qt_channels_save(silent=False),
+            if terminal_mode:
+                start_btn = QPushButton("打开终端")
+                start_btn.setStyleSheet(self._action_button_style(primary=True))
+                start_btn.clicked.connect(
+                    lambda _=False, cid=spec["id"]: self._safe_channel_ui_call(
+                        "打开终端",
+                        lambda: self._start_channel_process(cid),
+                    )
                 )
-            )
-            controls.addWidget(save_btn, 0)
-            start_btn = QPushButton("启动" if not is_remote_target else "远端启动")
-            start_btn.setStyleSheet(self._action_button_style(primary=True))
-            start_btn.clicked.connect(
-                lambda _=False, cid=spec["id"]: self._safe_channel_ui_call(
-                    "启动渠道",
-                    lambda: self._start_channel_process(cid),
+                controls.addWidget(start_btn, 0)
+            else:
+                save_btn = QPushButton("保存")
+                save_btn.setStyleSheet(self._action_button_style())
+                save_btn.clicked.connect(
+                    lambda _=False: self._safe_channel_ui_call(
+                        "保存渠道配置",
+                        lambda: self._qt_channels_save(silent=False),
+                    )
                 )
-            )
-            controls.addWidget(start_btn, 0)
-            stop_btn = QPushButton("停止" if not is_remote_target else "远端停止")
-            stop_btn.setStyleSheet(self._action_button_style())
-            stop_btn.clicked.connect(
-                lambda _=False, cid=spec["id"]: self._safe_channel_ui_call(
-                    "停止渠道",
-                    lambda: self._stop_channel_process(cid),
+                controls.addWidget(save_btn, 0)
+                start_btn = QPushButton("启动" if not is_remote_target else "远端启动")
+                start_btn.setStyleSheet(self._action_button_style(primary=True))
+                start_btn.clicked.connect(
+                    lambda _=False, cid=spec["id"]: self._safe_channel_ui_call(
+                        "启动渠道",
+                        lambda: self._start_channel_process(cid),
+                    )
                 )
-            )
-            controls.addWidget(stop_btn, 0)
-            log_btn = QPushButton("日志尾部" if not is_remote_target else "远端日志")
-            log_btn.setStyleSheet(self._action_button_style())
-            log_btn.clicked.connect(
-                lambda _=False, cid=spec["id"], title=spec["label"]: self._safe_channel_ui_call(
-                    "查看渠道日志",
-                    lambda: self._show_channel_log_tail(cid, title),
+                controls.addWidget(start_btn, 0)
+                stop_btn = QPushButton("停止" if not is_remote_target else "远端停止")
+                stop_btn.setStyleSheet(self._action_button_style())
+                stop_btn.clicked.connect(
+                    lambda _=False, cid=spec["id"]: self._safe_channel_ui_call(
+                        "停止渠道",
+                        lambda: self._stop_channel_process(cid),
+                    )
                 )
-            )
-            self._apply_channel_button_state(
-                log_btn,
-                remote_actions_ready,
-                enabled_tooltip=(f"查看远端 {spec['label']} 日志尾部。" if is_remote_target else f"查看 {spec['label']} 日志尾部。"),
-                disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
-            )
-            controls.addWidget(log_btn, 0)
-            if is_remote_target:
-                detail_btn = QPushButton("校验详情")
-                detail_btn.setStyleSheet(self._action_button_style(kind="subtle"))
-                detail_btn.clicked.connect(
-                    lambda _=False, cid=spec["id"], title=spec["label"], did=str((target_ctx or {}).get("device_id") or "").strip(): self._safe_channel_ui_call(
-                        "查看校验详情",
-                        lambda: self._show_remote_channel_status_detail(did, cid, title),
+                controls.addWidget(stop_btn, 0)
+                log_btn = QPushButton("日志尾部" if not is_remote_target else "远端日志")
+                log_btn.setStyleSheet(self._action_button_style())
+                log_btn.clicked.connect(
+                    lambda _=False, cid=spec["id"], title=spec["label"]: self._safe_channel_ui_call(
+                        "查看渠道日志",
+                        lambda: self._show_channel_log_tail(cid, title),
                     )
                 )
                 self._apply_channel_button_state(
-                    detail_btn,
+                    log_btn,
                     remote_actions_ready,
-                    enabled_tooltip=f"查看远端 {spec['label']} 的最近校验详情。",
+                    enabled_tooltip=(f"查看远端 {spec['label']} 日志尾部。" if is_remote_target else f"查看 {spec['label']} 日志尾部。"),
                     disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
                 )
-                controls.addWidget(detail_btn, 0)
-                state["detail_btn"] = detail_btn
+                controls.addWidget(log_btn, 0)
+                if is_remote_target:
+                    detail_btn = QPushButton("校验详情")
+                    detail_btn.setStyleSheet(self._action_button_style(kind="subtle"))
+                    detail_btn.clicked.connect(
+                        lambda _=False, cid=spec["id"], title=spec["label"], did=str((target_ctx or {}).get("device_id") or "").strip(): self._safe_channel_ui_call(
+                            "查看校验详情",
+                            lambda: self._show_remote_channel_status_detail(did, cid, title),
+                        )
+                    )
+                    self._apply_channel_button_state(
+                        detail_btn,
+                        remote_actions_ready,
+                        enabled_tooltip=f"查看远端 {spec['label']} 的最近校验详情。",
+                        disabled_tooltip=self._channel_remote_aux_disabled_reason(spec["id"], target_ctx=target_ctx),
+                    )
+                    controls.addWidget(detail_btn, 0)
+                    state["detail_btn"] = detail_btn
             body.addLayout(controls)
 
             self._qt_channel_states[spec["id"]] = state
@@ -2714,8 +2857,9 @@ class ChannelRuntimeMixin:
             state["status_label"] = status
             state["status_hint_label"] = status_hint
             state["start_btn"] = start_btn
-            state["stop_btn"] = stop_btn
-            state["log_btn"] = log_btn
+            if not terminal_mode:
+                state["stop_btn"] = stop_btn
+                state["log_btn"] = log_btn
             self.settings_channels_list_layout.addWidget(card)
         self.settings_channels_list_layout.addStretch(1)
         self._refresh_channels_runtime_status_labels()
@@ -2752,6 +2896,9 @@ class ChannelRuntimeMixin:
             if (not is_remote_target) and (auto is not None):
                 self._channel_set_auto_start(spec["id"], auto.isChecked(), persist=False)
         try:
+            ref_errors = self._channel_api_reference_errors()
+            if ref_errors:
+                raise RuntimeError("API 配置引用无效：\n" + "\n".join(ref_errors))
             txt = lz.serialize_mykey_py(
                 configs=self._qt_channel_configs,
                 extras=extras,
@@ -3124,9 +3271,11 @@ class ChannelRuntimeMixin:
             "package_import_map = {\n"
             "    'pycryptodome': 'Crypto',\n"
             "    'python-telegram-bot': 'telegram',\n"
+            "    'discord.py': 'discord',\n"
             "    'qq-botpy': 'botpy',\n"
             "    'lark-oapi': 'lark_oapi',\n"
             "    'dingtalk-stream': 'dingtalk_stream',\n"
+            "    'Pillow': 'PIL',\n"
             "}\n"
             "progress_lines = []\n"
             "report_lines = []\n"
@@ -3364,6 +3513,13 @@ class ChannelRuntimeMixin:
         if not isinstance(dev, dict) or (not dev):
             if show_errors:
                 self._channel_warning("无法启动", "当前远端设备信息不可用，请先检查设备配置。")
+            return False
+        ref_errors = self._channel_api_reference_errors()
+        if ref_errors:
+            msg = "当前 API 配置引用无效，请先到 API 页面修复后再启动渠道。"
+            self._set_status(msg)
+            if show_errors:
+                self._channel_warning("API 配置无效", msg, detail="\n".join(ref_errors))
             return False
         if not self._qt_channels_save(silent=True, apply_running=False):
             return False
@@ -3702,6 +3858,13 @@ class ChannelRuntimeMixin:
                     self._qt_channel_configs = list(parsed.get("configs") or [])
                     self._qt_channel_passthrough = list(parsed.get("passthrough") or [])
                     self._qt_channel_extras = dict(parsed.get("extras") or {})
+        ref_errors = self._channel_api_reference_errors()
+        if ref_errors:
+            msg = "当前 API 配置引用无效，请先到 API 页面修复后再启动渠道。"
+            self._set_status(msg)
+            if show_errors:
+                self._channel_warning("API 配置无效", msg, detail="\n".join(ref_errors))
+            return False
         if not self._qt_channels_save(silent=True, apply_running=False):
             return False
         restarting_managed = bool(self._channel_proc_alive(channel_id))
@@ -3758,7 +3921,7 @@ class ChannelRuntimeMixin:
                 if show_errors and not extra_packages:
                     self._channel_critical("缺少 Python", "未找到可用的系统 Python，或依赖检查失败。")
                 return False
-        py = lz._resolve_config_path(str(self.cfg.get("python_exe") or "").strip()) or lz._find_system_python()
+        py = lz._resolve_configured_python_exe(str(self.cfg.get("python_exe") or "").strip(), agent_dir=self.agent_dir) or lz._find_system_python(agent_dir=self.agent_dir)
         if not py or not os.path.isfile(py):
             if show_errors:
                 self._channel_critical("缺少 Python", "依赖检查完成后仍未找到可用的 Python 可执行文件。")
@@ -3774,6 +3937,21 @@ class ChannelRuntimeMixin:
             if show_errors:
                 self._channel_critical("脚本不存在", f"未找到渠道脚本：\n{script_path}")
             return False
+        if self._channel_launch_mode(channel_id) == "terminal":
+            try:
+                lz.launch_visible_terminal_script(
+                    py,
+                    script_path,
+                    cwd=self.agent_dir,
+                    env=lz._external_subprocess_env(),
+                    title=str(spec.get("label") or channel_id).strip() or channel_id,
+                )
+            except Exception as e:
+                if show_errors:
+                    self._channel_critical("启动失败", str(e))
+                return False
+            self._set_status(f"{spec.get('label', channel_id)} 已在新终端打开；启动器不托管该进程。")
+            return True
         log_path = self._channel_log_path(channel_id)
         try:
             log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
@@ -4021,10 +4199,13 @@ class ChannelRuntimeMixin:
             return
         if bool(getattr(self, "_autostart_channels_running", False)):
             return
-        try:
-            self._refresh_local_channel_external_running()
-        except Exception:
-            pass
+        if self._request_local_channel_external_running_refresh(
+            persist=False,
+            force=False,
+            refresh_ui=False,
+            after=lambda _external_map=None: self._start_autostart_channels(),
+        ):
+            return
         pending = []
         for spec in lz.COMM_CHANNEL_SPECS:
             cid = str(spec.get("id") or "").strip()

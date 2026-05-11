@@ -625,6 +625,28 @@ class SidebarSessionsMixin:
         lz._normalize_token_usage_inplace(payload)
         return payload
 
+    def _remote_session_has_newer_local_state(self, session, *, observed_remote_updated_at=0.0):
+        data = session if isinstance(session, dict) else {}
+        if self._is_channel_process_session(data):
+            return False
+        scope, _did = self._session_device_scope_id(data)
+        if scope != "remote":
+            return False
+        try:
+            local_updated_at = float(data.get("updated_at", 0) or 0)
+        except Exception:
+            local_updated_at = 0.0
+        try:
+            known_remote_updated_at = float(data.get("remote_updated_at", 0) or 0)
+        except Exception:
+            known_remote_updated_at = 0.0
+        try:
+            observed_remote_updated_at = float(observed_remote_updated_at or 0)
+        except Exception:
+            observed_remote_updated_at = 0.0
+        baseline_remote_updated_at = max(known_remote_updated_at, observed_remote_updated_at)
+        return local_updated_at > (baseline_remote_updated_at + 1e-6)
+
     def _sync_remote_device_launcher_sessions_blocking(self, *, force=False, device_id="", include_all_channels=False, include_usage=False, agent_dir="", runtime_context=None):
         root = self._remote_sync_cache_root(agent_dir=agent_dir)
         if not force:
@@ -663,6 +685,8 @@ class SidebarSessionsMixin:
                 cache_sid = self._remote_cache_session_id(did, remote_sid)
                 active_ids.add(cache_sid)
                 old = lz.load_session(root, cache_sid) or {}
+                if self._remote_session_has_newer_local_state(old, observed_remote_updated_at=row.get("updated_at")):
+                    continue
                 payload = self._remote_session_cache_payload(dev, row, old)
                 same_payload = (
                     str(old.get("title") or "") == str(payload.get("title") or "")
@@ -706,6 +730,8 @@ class SidebarSessionsMixin:
             if not remote_sid:
                 continue
             if sid in (active_ids_by_device.get(did) or set()):
+                continue
+            if self._remote_session_has_newer_local_state(lz.load_session(root, sid) or meta):
                 continue
             if not runtime_context_matches(self, runtime_context):
                 return False
@@ -1029,6 +1055,8 @@ class SidebarSessionsMixin:
         local_payload["channel_label"] = str(payload.get("channel_label") or data.get("channel_label") or lz._usage_channel_label(channel_id)).strip() or lz._usage_channel_label(channel_id)
         local_payload["remote_updated_at"] = float(payload.get("updated_at", 0) or 0)
         lz._normalize_token_usage_inplace(local_payload)
+        if self._remote_session_has_newer_local_state(data, observed_remote_updated_at=local_payload.get("remote_updated_at")):
+            return data, ""
         if not runtime_context_matches(self, runtime_context):
             return data, ""
         lz.save_session(root, local_payload, touch=False)
@@ -1063,6 +1091,9 @@ class SidebarSessionsMixin:
                     self._last_session_list_signature = None
                     current_sid = str((self.current_session or {}).get("id") or "").strip()
                     if current_sid == sid:
+                        if bool(getattr(self, "_busy", False)):
+                            self._refresh_sessions()
+                            return
                         self.current_session = fresh
                         self._render_session(self.current_session)
                         self._refresh_composer_enabled()

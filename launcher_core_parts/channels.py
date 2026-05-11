@@ -20,6 +20,8 @@ EXTRA_KEYS = {
     "langfuse_config",
     "tg_bot_token",
     "tg_allowed_users",
+    "discord_bot_token",
+    "discord_allowed_users",
     "qq_app_id",
     "qq_app_secret",
     "qq_allowed_users",
@@ -43,7 +45,7 @@ COMM_CHANNEL_SPECS = [
         "subtitle": "个人微信扫码登录",
         "script": "wechatapp.py",
         "log_name": "wechatapp.log",
-        "pip": "pycryptodome qrcode requests charset-normalizer",
+        "pip": "pycryptodome qrcode requests charset-normalizer Pillow",
         "fields": [],
         "required": [],
         "notes": "无需在 mykey.py 填 Key。首次启动会弹二维码完成绑定。",
@@ -62,6 +64,34 @@ COMM_CHANNEL_SPECS = [
         ],
         "required": ["tg_bot_token", "tg_allowed_users"],
         "notes": "Telegram 前端要求填写允许访问的用户 ID，留空会直接退出。",
+        "conflicts_with": [],
+    },
+    {
+        "id": "discord",
+        "label": "Discord",
+        "subtitle": "Discord Bot",
+        "script": "dcapp.py",
+        "log_name": "dcapp.log",
+        "pip": "discord.py",
+        "fields": [
+            {"key": "discord_bot_token", "label": "Bot Token", "kind": "password", "placeholder": "Discord bot token"},
+            {"key": "discord_allowed_users", "label": "允许用户", "kind": "list_str", "placeholder": "user_id，逗号分隔；可填 *"},
+        ],
+        "required": ["discord_bot_token"],
+        "notes": "需要在 Discord Developer Portal 开启 Message Content Intent。",
+        "conflicts_with": [],
+    },
+    {
+        "id": "tui",
+        "label": "终端 TUI",
+        "subtitle": "Textual 终端会话入口",
+        "script": "tuiapp.py",
+        "log_name": "tuiapp.log",
+        "pip": "textual",
+        "launch_mode": "terminal",
+        "fields": [],
+        "required": [],
+        "notes": "直接打开可见终端窗口运行 TUI。",
         "conflicts_with": [],
     },
     {
@@ -321,6 +351,8 @@ def serialize_mykey_py(configs, extras, passthrough=None):
             "langfuse_config",
             "tg_bot_token",
             "tg_allowed_users",
+            "discord_bot_token",
+            "discord_allowed_users",
             "qq_app_id",
             "qq_app_secret",
             "qq_allowed_users",
@@ -340,6 +372,52 @@ def serialize_mykey_py(configs, extras, passthrough=None):
                 parts.append(f"{name} = {extras[name]!r}\n")
 
     return "".join(parts)
+
+
+def validate_api_config_references(configs):
+    rows = [dict(item) for item in (configs or []) if isinstance(item, dict)]
+    session_names = []
+    session_names_set = set()
+    for row in rows:
+        kind = str(row.get("kind") or "").strip()
+        if kind == "mixin":
+            continue
+        data = dict(row.get("data") or {})
+        name = str(data.get("name") or "").strip()
+        if not name or name in session_names_set:
+            continue
+        session_names.append(name)
+        session_names_set.add(name)
+
+    errors = []
+    for row in rows:
+        kind = str(row.get("kind") or "").strip()
+        if kind != "mixin":
+            continue
+        var_name = str(row.get("var") or "mixin_config").strip() or "mixin_config"
+        data = dict(row.get("data") or {})
+        llm_nos = data.get("llm_nos")
+        if not isinstance(llm_nos, (list, tuple)) or not llm_nos:
+            errors.append(f"{var_name}.llm_nos 不能为空。")
+            continue
+        for idx, target in enumerate(llm_nos):
+            if isinstance(target, int):
+                if 0 <= int(target) < len(session_names):
+                    continue
+                errors.append(
+                    f"{var_name}.llm_nos[{idx}]={target} 超出可用会话范围；当前可引用 {len(session_names)} 个非 mixin API 会话。"
+                )
+                continue
+            target_name = str(target or "").strip()
+            if not target_name:
+                errors.append(f"{var_name}.llm_nos[{idx}] 不能为空字符串。")
+                continue
+            if target_name not in session_names_set:
+                available = "、".join(session_names) if session_names else "（无）"
+                errors.append(
+                    f"{var_name}.llm_nos[{idx}]={target_name!r} 找不到同名 API 会话；当前可引用 name 为：{available}。"
+                )
+    return errors
 
 
 def auto_config_var(kind, existing_vars):
@@ -403,6 +481,7 @@ SIMPLE_FORMAT_LABEL = {
     "claude_native": "Claude 原生",
     "oai_chat": "Chat Completions",
     "oai_responses": "Responses",
+    "mixin": "Mixin 故障转移",
 }
 
 SIMPLE_FORMAT_RULES = {
@@ -426,6 +505,13 @@ SIMPLE_FORMAT_RULES = {
         "default_template": "openai",
         "templates": ["openai", "oai-generic", "openrouter", "minimax-oai", "kimi", "custom-oai"],
         "hint": "走 OpenAI Responses 协议。",
+    },
+    "mixin": {
+        "kind": "mixin",
+        "api_mode": None,
+        "default_template": "mixin",
+        "templates": ["mixin"],
+        "hint": "按 llm_nos 顺序引用已有非 mixin API 卡片，启动时按顺序故障转移。",
     },
 }
 

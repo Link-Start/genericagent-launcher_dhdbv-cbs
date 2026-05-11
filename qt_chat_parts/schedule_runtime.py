@@ -1198,7 +1198,7 @@ class ScheduleRuntimeMixin:
         if not self._check_runtime_dependencies(purpose="启动定时任务调度器", visual=bool(show_errors)):
             return False
 
-        py = lz._resolve_config_path(str(self.cfg.get("python_exe") or "").strip()) or lz._find_system_python()
+        py = lz._resolve_configured_python_exe(str(self.cfg.get("python_exe") or "").strip(), agent_dir=self.agent_dir) or lz._find_system_python(agent_dir=self.agent_dir)
         if not py or not os.path.isfile(py):
             if show_errors:
                 QMessageBox.critical(self, "缺少 Python", "依赖检查完成后仍未找到可用的 Python 可执行文件。")
