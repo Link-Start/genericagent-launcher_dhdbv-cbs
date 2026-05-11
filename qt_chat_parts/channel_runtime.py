@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -3932,7 +3933,12 @@ class ChannelRuntimeMixin:
             if show_errors:
                 self._channel_warning("配置不完整", f"{spec.get('label', channel_id)} 还缺少这些字段：\n- " + "\n- ".join(missing))
             return False
-        script_path = os.path.join(self.agent_dir, "frontends", spec.get("script", ""))
+        agent_dir_text = str(self.agent_dir or "").strip()
+        script_name = str(spec.get("script", "") or "").strip()
+        if re.match(r"^[A-Za-z]:[\\/]", agent_dir_text):
+            script_path = ntpath.join(agent_dir_text, "frontends", script_name)
+        else:
+            script_path = os.path.join(agent_dir_text, "frontends", script_name)
         if not os.path.isfile(script_path):
             if show_errors:
                 self._channel_critical("脚本不存在", f"未找到渠道脚本：\n{script_path}")
