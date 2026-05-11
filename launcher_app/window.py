@@ -2565,7 +2565,11 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         can_abort = (not disabled) and self._busy and (not self._abort_requested)
         if isinstance(win, FloatingOrbWindow):
             session = self.current_session or {}
-            bubbles = self._display_session_bubbles(session)
+            bubbles_getter = getattr(self, "_display_session_bubbles", None)
+            if callable(bubbles_getter):
+                bubbles = bubbles_getter(session)
+            else:
+                bubbles = list(session.get("bubbles") or [])
             stream_text = str(self._pending_stream_text or self._current_stream_text or "")
             win.sync_view(
                 title=self._floating_chat_title(),

@@ -4,6 +4,7 @@ import base64
 import ctypes
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -172,7 +173,7 @@ def launch_visible_terminal_script(python_exe, script_path, *, cwd="", env=None,
         script_cmd = script
         if cwd_text:
             try:
-                rel_script = os.path.relpath(script, cwd_text)
+                rel_script = ntpath.relpath(script, cwd_text)
             except Exception:
                 rel_script = ""
             if rel_script and rel_script != "." and not rel_script.startswith(".."):
@@ -190,8 +191,7 @@ def launch_visible_terminal_script(python_exe, script_path, *, cwd="", env=None,
         kwargs = {"env": launch_env}
         if cwd_text:
             kwargs["cwd"] = cwd_text
-        if hasattr(subprocess, "CREATE_NEW_CONSOLE"):
-            kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_CONSOLE", 0) or 0)
         with _external_subprocess_runtime():
             subprocess.Popen(cmd, **kwargs)
         return True
