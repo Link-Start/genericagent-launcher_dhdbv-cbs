@@ -20,6 +20,7 @@ from launcher_app import theme as launcher_theme
 from launcher_core_parts import model_api
 from launcher_core_parts import python_env
 from launcher_core_parts import sessions as sessions_mod
+from launcher_core_parts import upstream_dependencies
 from qt_chat_parts import personal_usage as personal_usage_mod
 from qt_chat_parts.api_editor import ApiEditorMixin
 from qt_chat_parts import common
@@ -163,7 +164,7 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             python_env._should_sync_runtime_dependencies(
                 state_matches=False,
                 extra_packages=[],
-                requirements_path="",
+                sync_mode="",
                 force_sync=False,
             )
         )
@@ -171,7 +172,7 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             python_env._should_sync_runtime_dependencies(
                 state_matches=True,
                 extra_packages=[],
-                requirements_path="",
+                sync_mode="",
                 force_sync=False,
             )
         )
@@ -217,7 +218,32 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             with open(fp, "w", encoding="utf-8") as f:
                 f.write("requests>=2.31\nsimplejson>=3.19.3\n")
             sig2 = python_env._dependency_signature(td, extra_packages=["qrcode"])
-        self.assertNotEqual(sig1["requirements_hash"], sig2["requirements_hash"])
+        self.assertEqual(sig1["sync_mode"], "requirements")
+        self.assertEqual(sig2["sync_mode"], "requirements")
+        self.assertNotEqual(sig1["sync_hash"], sig2["sync_hash"])
+
+    def test_python_env_dependency_signature_tracks_pyproject_sync_hash(self):
+        with tempfile.TemporaryDirectory() as td:
+            fp = os.path.join(td, "pyproject.toml")
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(
+                    "[project]\n"
+                    "name = 'genericagent'\n"
+                    "version = '0.1.0'\n"
+                    "dependencies = ['requests>=2.28']\n"
+                )
+            sig1 = python_env._dependency_signature(td, extra_packages=[])
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(
+                    "[project]\n"
+                    "name = 'genericagent'\n"
+                    "version = '0.1.0'\n"
+                    "dependencies = ['requests>=2.28', 'beautifulsoup4>=4.12']\n"
+                )
+            sig2 = python_env._dependency_signature(td, extra_packages=[])
+        self.assertEqual(sig1["sync_mode"], "pyproject")
+        self.assertEqual(sig2["sync_mode"], "pyproject")
+        self.assertNotEqual(sig1["sync_hash"], sig2["sync_hash"])
 
     def test_python_env_macos_absolute_candidates_cover_homebrew_and_pyenv(self):
         existing = {
@@ -549,6 +575,11 @@ tg_bot_token = '123'
                 "data": {"name": "OpenAI First", "apikey": "sk-a", "apibase": "https://api.openai.com/v1", "model": "gpt-5.4"},
             },
             {
+                "var": "mixin_config",
+                "kind": "mixin",
+                "data": {"name": "Failover", "llm_nos": ["OpenAI First", "OpenAI Last"], "max_retries": 3, "base_delay": 0.5},
+            },
+            {
                 "var": "native_claude_config",
                 "kind": "native_claude",
                 "data": {"name": "Claude Middle", "apikey": "sk-b", "apibase": "https://api.anthropic.com", "model": "claude-opus-4-7[1m]"},
@@ -569,8 +600,48 @@ tg_bot_token = '123'
         self.assertIsNone(parsed["error"])
         self.assertEqual(
             [cfg["var"] for cfg in parsed["configs"]],
-            ["native_oai_config", "native_claude_config", "native_oai_config2"],
+            ["native_oai_config", "mixin_config", "native_claude_config", "native_oai_config2"],
         )
+        self.assertEqual(parsed["configs"][1]["kind"], "mixin")
+        self.assertEqual(parsed["configs"][1]["data"]["llm_nos"], ["OpenAI First", "OpenAI Last"])
+
+    def test_validate_api_config_references_accepts_named_and_indexed_mixin_targets(self):
+        configs = [
+            {
+                "var": "native_oai_config",
+                "kind": "native_oai",
+                "data": {"name": "primary", "apikey": "sk-a", "apibase": "https://api.openai.com/v1", "model": "gpt-5.4"},
+            },
+            {
+                "var": "native_oai_config2",
+                "kind": "native_oai",
+                "data": {"name": "backup", "apikey": "sk-b", "apibase": "https://api.openai.com/v1", "model": "gpt-5.4-mini"},
+            },
+            {
+                "var": "mixin_config",
+                "kind": "mixin",
+                "data": {"llm_nos": ["primary", 1], "max_retries": 3},
+            },
+        ]
+        self.assertEqual(lz.validate_api_config_references(configs), [])
+
+    def test_validate_api_config_references_reports_missing_named_target(self):
+        configs = [
+            {
+                "var": "native_oai_config",
+                "kind": "native_oai",
+                "data": {"name": "mimo", "apikey": "sk-a", "apibase": "https://api.openai.com/v1", "model": "gpt-5.4"},
+            },
+            {
+                "var": "mixin_config",
+                "kind": "mixin",
+                "data": {"llm_nos": ["gpt-native"], "max_retries": 3},
+            },
+        ]
+        errors = lz.validate_api_config_references(configs)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("gpt-native", errors[0])
+        self.assertIn("mimo", errors[0])
 
     def test_api_editor_save_keeps_claude_card_as_native_claude_after_reload(self):
         class DummyApiEditor(ApiEditorMixin):
@@ -1099,7 +1170,7 @@ tg_bot_token = '123'
         path = os.path.join(root, "qt_chat_parts", "api_editor.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertIn('for key in ("name", "apikey", "apibase", "model", "user_agent")', src)
+        self.assertIn('for key in ("name", "apikey", "apibase", "model", "user_agent", "llm_nos")', src)
         self.assertIn('"advanced_values": advanced_values', src)
         self.assertIn("def _api_advanced_field_keys", src)
         self.assertIn("def _api_normalize_advanced_value", src)
@@ -1376,9 +1447,17 @@ tg_bot_token = '123'
         self.assertIn("日志来源", personal_src)
         self.assertIn("高消耗会话", personal_src)
         self.assertIn("最近活动", personal_src)
+        self.assertIn("Token / 费用", personal_src)
+        self.assertIn("清空当前目标日志", personal_src)
+        self.assertIn("7 日 Token 趋势", personal_src)
+        self.assertIn("渠道费用结构", personal_src)
         self.assertIn("高级模式 · Langfuse", personal_src)
         self.assertIn("def _usage_table_card", personal_src)
         self.assertIn("def _usage_metric_card", personal_src)
+        self.assertIn("def _usage_chart_card", personal_src)
+        self.assertIn("def _usage_line_chart_pixmap", personal_src)
+        self.assertIn("def _usage_bar_chart_pixmap", personal_src)
+        self.assertIn("def _clear_usage_logs_for_target", personal_src)
         self.assertIn("def _usage_cache_label", personal_src)
         self.assertIn("数据不足", personal_src)
         self.assertIn("def _load_langfuse_status", personal_src)
@@ -1778,6 +1857,8 @@ tg_bot_token = '123'
         self.assertIn("def _append_vps_terminal_dependency_output", settings_src)
         self.assertIn("normalize_remote_agent_dir", settings_src)
         self.assertIn("remote_agent_dir_default", settings_src)
+        self.assertIn("resolve_remote_fallback_requirement_specs", settings_src)
+        self.assertIn("上游未提供 requirements.txt；当前改用 pyproject.toml 生成 fallback requirements。", settings_src)
         self.assertIn("上游未提供 requirements.txt；当前改用启动器维护的上游依赖表。", settings_src)
         self.assertIn("检测到远端 requirements.txt，优先使用仓库自带依赖表。", settings_src)
         self.assertIn("远端项目缺少 agentmain.py。", settings_src)
@@ -2275,7 +2356,9 @@ tg_bot_token = '123'
         self.assertIn("UPSTREAM_DEPENDENCY_SOURCES", dep_src)
         self.assertIn("UPSTREAM_FRONTEND_DEPENDENCY_GROUPS", dep_src)
         self.assertIn("pywebview", dep_src)
+        self.assertIn("resolve_upstream_dependency_manifest", dep_src)
         self.assertIn("上游未提供 requirements.txt；当前改用启动器维护的上游依赖表", pyenv_src)
+        self.assertIn("上游未提供 requirements.txt；当前优先改用 pyproject.toml 依赖声明", pyenv_src)
         self.assertIn("上游依赖来源", pyenv_src)
 
     def test_upstream_dependency_groups_use_user_facing_categories(self):
@@ -2287,6 +2370,79 @@ tg_bot_token = '123'
         self.assertIn("上游默认 GUI 可选", dep_src)
         self.assertIn("Qt 前端可选", dep_src)
         self.assertIn("Streamlit 前端可选", dep_src)
+
+    def test_upstream_dependency_manifest_prefers_pyproject_and_expands_remote_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "pyproject.toml"), "w", encoding="utf-8") as f:
+                f.write(
+                    "[project]\n"
+                    "name = 'genericagent'\n"
+                    "version = '0.1.0'\n"
+                    "requires-python = '>=3.10,<3.14'\n"
+                    "dependencies = [\n"
+                    "  'requests>=2.28',\n"
+                    "  'beautifulsoup4>=4.12',\n"
+                    "  'bottle>=0.12',\n"
+                    "]\n"
+                    "[project.optional-dependencies]\n"
+                    "ui = ['streamlit>=1.28', 'pywebview>=4.0', 'textual>=0.70']\n"
+                    "all-frontends = ['pycryptodome>=3.19', 'qrcode>=7.4']\n"
+                )
+            manifest = upstream_dependencies.resolve_upstream_dependency_manifest(td)
+        self.assertTrue(manifest["pyproject_used"])
+        self.assertEqual(manifest["sync_mode"], "pyproject")
+        self.assertIn("beautifulsoup4>=4.12", manifest["sync_specs"])
+        self.assertIn("charset-normalizer>=3.3", manifest["sync_specs"])
+        self.assertIn("streamlit>=1.28", manifest["remote_fallback_specs"])
+        self.assertIn("qrcode>=7.4", manifest["remote_fallback_specs"])
+        groups = {str(group.get("id") or ""): group for group in manifest["frontend_groups"]}
+        launch_items = [str(item.get("package") or "") for item in groups["launch_web_ui"]["items"]]
+        self.assertTrue(any(item.startswith("pywebview") for item in launch_items))
+        self.assertTrue(any(item.startswith("streamlit") for item in launch_items))
+
+    def test_channel_registry_includes_terminal_tui_channel(self):
+        spec = lz.COMM_CHANNEL_INDEX.get("tui") or {}
+        self.assertEqual(spec.get("script"), "tuiapp.py")
+        self.assertEqual(spec.get("pip"), "textual")
+        self.assertEqual(spec.get("launch_mode"), "terminal")
+        self.assertEqual(spec.get("fields"), [])
+        self.assertEqual(spec.get("required"), [])
+        self.assertEqual(lz.COMM_CHANNEL_INDEX.get("discord", {}).get("launch_mode"), None)
+
+    def test_dependency_reporting_no_longer_duplicates_tui_as_frontend_category(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        dep_path = os.path.join(root, "launcher_core_parts", "upstream_dependencies.py")
+        with open(dep_path, "r", encoding="utf-8") as f:
+            dep_src = f.read()
+        self.assertNotIn("terminal_frontend", dep_src)
+        self.assertIn("frontends/tuiapp.py", dep_src)
+
+        ok_result = mock.Mock(returncode=0, stdout="demo\n", stderr="")
+        with mock.patch.object(
+            python_env, "_probe_command_version", return_value={"status": "ok", "name": "mock", "detail": "ok"}
+        ), mock.patch.object(
+            python_env, "_run_python_command", return_value=ok_result
+        ), mock.patch.object(
+            python_env, "_probe_python_dependency", return_value=(True, "ok", {})
+        ), mock.patch.object(
+            python_env, "_probe_python_compile", return_value=(True, "语法检查通过")
+        ), mock.patch.object(
+            python_env, "_probe_python_import", return_value=(True, "可导入")
+        ):
+            report = python_env._build_dependency_report(
+                agent_dir="C:\\demo",
+                py=sys.executable,
+                candidate_meta={},
+                failures=[],
+                extra_packages=[],
+                error="",
+            )
+
+        titles = [str(section.get("title") or "") for section in report.get("sections") or []]
+        self.assertNotIn("终端前端可选", titles)
+        optional_section = next((section for section in report.get("sections") or [] if section.get("title") == "渠道专属可选"), {})
+        items = list(optional_section.get("items") or [])
+        self.assertTrue(any(str(item.get("name") or "") == "终端 TUI 依赖 textual" for item in items))
 
     def test_private_python_installer_has_source_precheck_logs(self):
         root = os.path.dirname(os.path.dirname(__file__))
