@@ -20,6 +20,10 @@ launcher_config.json
 .idea/
 .vscode/
 .claude/
+.agents/
+.codex/
+.trellis/
+AGENTS.md
 
 # Project-local AI/Trellis runtime state and private task memory
 .trellis/.developer
