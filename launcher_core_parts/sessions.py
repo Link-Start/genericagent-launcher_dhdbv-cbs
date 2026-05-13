@@ -10,6 +10,9 @@ from .channels import COMM_CHANNEL_INDEX
 from .constants import TOKEN_ESTIMATE_DIVISOR, TOKEN_USAGE_VERSION
 
 
+_SESSION_INDEX_CACHE = {}
+
+
 def sessions_dir(agent_dir):
     d = os.path.join(agent_dir, "temp", "launcher_sessions")
     os.makedirs(d, exist_ok=True)
@@ -303,9 +306,39 @@ def _write_session_meta_file(path, payload):
         json.dump(payload if isinstance(payload, dict) else {}, f, ensure_ascii=False, indent=2)
 
 
+def _session_index_cache_key(agent_dir):
+    root = str(agent_dir or "").strip()
+    if not root:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(root))
+    except Exception:
+        return os.path.normcase(root)
+
+
+def _copy_session_index_rows(index):
+    out = {}
+    for sid, row in (index or {}).items():
+        key = str(sid or "").strip()
+        if not key or not isinstance(row, dict):
+            continue
+        out[key] = dict(row)
+    return out
+
+
 def _load_sessions_index(agent_dir):
     fp = sessions_index_path(agent_dir)
+    cache_key = _session_index_cache_key(agent_dir)
+    try:
+        mtime = float(os.path.getmtime(fp)) if os.path.isfile(fp) else 0.0
+    except Exception:
+        mtime = 0.0
+    cached = _SESSION_INDEX_CACHE.get(cache_key) if cache_key else None
+    if isinstance(cached, dict) and float(cached.get("mtime", 0.0) or 0.0) == mtime:
+        return _copy_session_index_rows(cached.get("index"))
     if not os.path.isfile(fp):
+        if cache_key:
+            _SESSION_INDEX_CACHE[cache_key] = {"mtime": 0.0, "index": {}}
         return {}
     try:
         with open(fp, "r", encoding="utf-8") as f:
@@ -322,6 +355,8 @@ def _load_sessions_index(agent_dir):
         if not isinstance(row, dict):
             continue
         out[key] = _session_meta_from_payload(row, sid=key, path=row.get("path"))
+    if cache_key:
+        _SESSION_INDEX_CACHE[cache_key] = {"mtime": mtime, "index": _copy_session_index_rows(out)}
     return out
 
 
@@ -336,6 +371,13 @@ def _save_sessions_index(agent_dir, index):
         payload[key] = _session_meta_from_payload(row, sid=key, path=row.get("path"))
     with open(fp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    cache_key = _session_index_cache_key(agent_dir)
+    if cache_key:
+        try:
+            mtime = float(os.path.getmtime(fp))
+        except Exception:
+            mtime = 0.0
+        _SESSION_INDEX_CACHE[cache_key] = {"mtime": mtime, "index": _copy_session_index_rows(payload)}
 
 
 def _update_session_index_row(agent_dir, sid, row):
@@ -364,8 +406,13 @@ def _sync_session_meta_for_file(fp, payload):
     if not meta_fp:
         return
     meta = _session_meta_from_payload(payload, sid=os.path.splitext(os.path.basename(fp))[0], path=fp)
-    _write_session_meta_file(meta_fp, meta)
     agent_dir = _agent_dir_from_session_file(fp)
+    if agent_dir:
+        current_index = _load_sessions_index(agent_dir)
+        current_meta = current_index.get(str(meta.get("id") or "").strip())
+        if isinstance(current_meta, dict) and _session_meta_from_payload(current_meta, sid=meta.get("id"), path=fp) == meta:
+            return
+    _write_session_meta_file(meta_fp, meta)
     if agent_dir:
         _update_session_index_row(agent_dir, meta.get("id"), meta)
 
@@ -481,7 +528,6 @@ def _canon_path(path):
 
 def list_sessions(agent_dir):
     d = sessions_dir(agent_dir)
-    meta_dir = sessions_meta_dir(agent_dir)
     index = _load_sessions_index(agent_dir)
     changed_index = False
     out = []
@@ -494,18 +540,7 @@ def list_sessions(agent_dir):
         if sid:
             present_ids.add(sid)
         indexed = index.get(sid)
-        meta_fp = os.path.join(meta_dir, f"{sid}.json")
-        cached = _load_session_meta_file(meta_fp)
         payload = None
-        if isinstance(cached, dict):
-            row = dict(cached)
-            row["id"] = str(row.get("id") or sid)
-            row["path"] = fp
-            out.append(row)
-            if not isinstance(indexed, dict) or _session_meta_from_payload(indexed, sid=sid, path=fp) != row:
-                index[sid] = row
-                changed_index = True
-            continue
         if isinstance(indexed, dict):
             row = dict(indexed)
             row["id"] = str(row.get("id") or sid)
@@ -524,6 +559,16 @@ def list_sessions(agent_dir):
                         changed_index = True
             out.append(row)
             continue
+        meta_fp = _session_meta_path_for_file(fp)
+        cached = _load_session_meta_file(meta_fp)
+        if isinstance(cached, dict):
+            row = dict(cached)
+            row["id"] = str(row.get("id") or sid)
+            row["path"] = fp
+            out.append(row)
+            index[sid] = row
+            changed_index = True
+            continue
         quick = _quick_read_session_meta(fp, sid)
         if isinstance(quick, dict):
             out.append(quick)
@@ -541,13 +586,6 @@ def list_sessions(agent_dir):
             index[sid] = row
             changed_index = True
             continue
-        if isinstance(cached, dict):
-            row = dict(cached)
-            row["id"] = str(row.get("id") or sid)
-            row["path"] = fp
-            out.append(row)
-            index[sid] = row
-            changed_index = True
     stale_ids = [sid for sid in list(index.keys()) if sid not in present_ids]
     if stale_ids:
         for sid in stale_ids:

@@ -1266,9 +1266,9 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain_events)
         self._drain_timer.start(40)
+        self._drain_events_rescheduled = False
         self._server_status_timer = QTimer(self)
         self._server_status_timer.timeout.connect(self._request_server_connection_probe)
-        self._server_status_timer.start(15000)
         self._subagent_status_timer = QTimer(self)
         self._subagent_status_timer.timeout.connect(self._tick_subagent_status)
         self._subagent_status_timer.start(250)
@@ -1416,16 +1416,6 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 startup_install_hinter()
             except Exception:
                 pass
-        QTimer.singleShot(1800, self, self._startup_server_connection_probe)
-
-    def _startup_server_connection_probe(self):
-        if bool(getattr(self, "_closing_in_progress", False)):
-            return
-        try:
-            self._request_server_connection_probe(force=True)
-        except Exception:
-            pass
-
     def _begin_window_trace(self, context: str, *, duration_ms: int = 2600, suppress_blank_dialogs: bool = False):
         duration = max(200, int(duration_ms or 2600))
         self._window_trace_context = str(context or "").strip()

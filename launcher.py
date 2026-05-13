@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import faulthandler
+import importlib.util
 import json
 import os
 import sys
@@ -38,12 +39,23 @@ def _packaged_import_smoke_payload() -> dict[str, object]:
     if not any(os.path.isfile(path) for path in asset_candidates):
         raise RuntimeError(f"packaged import smoke could not resolve launcher icon asset: {asset_candidates}")
 
+    def _module_origin(name: str) -> str:
+        loaded = sys.modules.get(name)
+        origin = str(getattr(loaded, "__file__", "") or "").strip()
+        if origin:
+            return origin
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception:
+            spec = None
+        return str(getattr(spec, "origin", "") or "").strip()
+
     modules = {
         "bridge": str(getattr(bridge, "__file__", "") or "").strip(),
         "charset_normalizer": str(getattr(charset_normalizer, "__file__", "") or "").strip(),
         "cryptography": str(getattr(cryptography, "__file__", "") or "").strip(),
         "qrcode": str(getattr(_core.qrcode, "__file__", "") or "").strip(),
-        "requests": str(getattr(_core.requests, "__file__", "") or "").strip(),
+        "requests": _module_origin("requests"),
         "simplejson": str(getattr(simplejson, "__file__", "") or "").strip(),
         "PySide6.QtCore": str(getattr(QtCore, "__file__", "") or "").strip(),
         "PySide6.QtGui": str(getattr(QtGui, "__file__", "") or "").strip(),

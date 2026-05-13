@@ -17,7 +17,7 @@ from PySide6.QtTest import QTest
 from launcher_app import core as lz
 from launcher_app import window as launcher_window
 from launcher_core_parts import constants
-from launcher_core_parts import model_api, runtime
+from launcher_core_parts import model_api, runtime, update_manager
 from qt_chat_parts import api_editor
 from qt_chat_parts import common as chat_common
 from qt_chat_parts import bridge_runtime
@@ -79,6 +79,22 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         ]
         for name in required:
             self.assertTrue(hasattr(lz, name), msg=f"missing symbol: {name}")
+
+    def test_create_update_job_normalizes_proxy_url(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(update_manager, "UPDATE_JOBS_DIR", td):
+            created = update_manager.create_update_job(
+                {
+                    "target_version": "1.2.4",
+                    "package_url": "https://example.com/update.zip",
+                    "package_sha256": "a" * 64,
+                    "proxy_url": "127.0.0.1:7890",
+                }
+            )
+
+            self.assertEqual(created["job"]["proxy_url"], "http://127.0.0.1:7890")
+            with open(created["job_path"], "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(payload["proxy_url"], "http://127.0.0.1:7890")
 
     def test_runtime_path_helpers_round_trip(self):
         with tempfile.TemporaryDirectory() as td:

@@ -1934,11 +1934,18 @@ class BridgeRuntimeMixin:
             QMessageBox.warning(self, "中断失败", str(e))
 
     def _drain_events(self):
+        self._drain_events_rescheduled = False
+        started_at = time.perf_counter()
+        processed = 0
+        budget_seconds = 0.012
+        max_events = 160
+        more_pending = False
         while True:
             try:
                 ev = self._event_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if isinstance(ev, str):
                 text = ev.strip()
                 if not text:
@@ -1952,6 +1959,21 @@ class BridgeRuntimeMixin:
             elif not isinstance(ev, dict):
                 ev = {"event": "bridge_text", "text": str(ev)}
             self._handle_event(ev)
+            if processed >= max_events or (time.perf_counter() - started_at) >= budget_seconds:
+                try:
+                    more_pending = not self._event_queue.empty()
+                except Exception:
+                    more_pending = True
+                break
+        if more_pending and (not bool(getattr(self, "_drain_events_rescheduled", False))):
+            self._drain_events_rescheduled = True
+            try:
+                QTimer.singleShot(0, self, self._drain_events)
+            except Exception:
+                try:
+                    QTimer.singleShot(0, self._drain_events)
+                except Exception:
+                    self._drain_events_rescheduled = False
         proc = self.bridge_proc
         if proc is not None and proc.poll() is not None and not self._bridge_ready and not self._busy:
             self._clear_active_turn_attachments()

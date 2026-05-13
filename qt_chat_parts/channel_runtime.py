@@ -359,9 +359,16 @@ class ChannelRuntimeMixin:
         limit = self._local_channel_external_refresh_ttl_seconds() if max_age is None else max(0.0, float(max_age))
         return (now - scanned_at) <= limit
 
-    def _scan_local_channel_external_snapshot(self):
+    def _local_process_snapshot_ttl_seconds(self):
+        try:
+            value = float(getattr(self, "_LOCAL_PROCESS_SNAPSHOT_TTL_SECONDS", 2.0) or 2.0)
+        except Exception:
+            value = 2.0
+        return max(0.25, value)
+
+    def _scan_local_channel_external_snapshot(self, *, force=False):
         return {
-            "external_map": self._local_channel_external_pids(),
+            "external_map": self._local_channel_external_pids(force=force),
             "wechat_locked": bool(self._wechat_singleton_locked()),
         }
 
@@ -410,10 +417,11 @@ class ChannelRuntimeMixin:
             return True
         self._local_channel_external_refresh_inflight = True
         context = capture_runtime_context(self)
+        force_scan = bool(force)
 
         def worker():
             try:
-                snapshot = self._scan_local_channel_external_snapshot()
+                snapshot = self._scan_local_channel_external_snapshot(force=force_scan)
             except Exception:
                 snapshot = {"external_map": {}, "wechat_locked": False}
 
@@ -446,7 +454,17 @@ class ChannelRuntimeMixin:
         threading.Thread(target=worker, daemon=True, name="local-channel-external-refresh").start()
         return True
 
-    def _iter_local_channel_processes(self):
+    def _iter_local_channel_processes(self, *, force=False, max_age=None):
+        if not force:
+            try:
+                scanned_at = float(getattr(self, "_local_process_snapshot_scanned_at", 0.0) or 0.0)
+            except Exception:
+                scanned_at = 0.0
+            ttl = self._local_process_snapshot_ttl_seconds() if max_age is None else max(0.0, float(max_age))
+            if scanned_at > 0 and (time.time() - scanned_at) <= ttl:
+                cached = getattr(self, "_local_process_snapshot_cache", None)
+                if isinstance(cached, list):
+                    return [dict(item) for item in cached]
         if os.name == "nt":
             cmd = (
                 "$ErrorActionPreference='SilentlyContinue'; "
@@ -552,6 +570,11 @@ class ChannelRuntimeMixin:
                     "cwd_real": cwd_real,
                 }
             )
+        self._local_process_snapshot_cache = [dict(item) for item in processes]
+        try:
+            self._local_process_snapshot_scanned_at = float(time.time())
+        except Exception:
+            self._local_process_snapshot_scanned_at = 0.0
         return processes
 
     def _channel_script_rel(self, channel_id):
@@ -573,7 +596,7 @@ class ChannelRuntimeMixin:
         spec = lz.COMM_CHANNEL_INDEX.get(cid) or {}
         return str(spec.get("launch_mode") or "").strip().lower()
 
-    def _local_channel_external_pids(self):
+    def _local_channel_external_pids(self, *, force=False):
         results: dict[str, list[int]] = {}
         agent_dir = str(self.agent_dir or "").strip()
         if not agent_dir:
@@ -592,7 +615,11 @@ class ChannelRuntimeMixin:
                 pid = 0
             if pid > 0:
                 managed_by_channel.setdefault(str(cid or "").strip(), set()).add(pid)
-        for proc_info in self._iter_local_channel_processes():
+        try:
+            proc_rows = self._iter_local_channel_processes(force=force)
+        except TypeError:
+            proc_rows = self._iter_local_channel_processes()
+        for proc_info in proc_rows:
             pid = int(proc_info.get("pid") or 0)
             if pid <= 0:
                 continue
@@ -647,8 +674,8 @@ class ChannelRuntimeMixin:
     def _find_local_wechat_process_pids(self):
         return list(self._local_channel_external_pids().get("wechat") or [])
 
-    def _refresh_local_channel_external_running(self, *, persist=False):
-        snapshot = self._scan_local_channel_external_snapshot()
+    def _refresh_local_channel_external_running(self, *, persist=False, force=False):
+        snapshot = self._scan_local_channel_external_snapshot(force=force)
         return self._apply_local_channel_external_snapshot(snapshot, persist=persist)
 
     def _terminate_pid_force(self, pid):

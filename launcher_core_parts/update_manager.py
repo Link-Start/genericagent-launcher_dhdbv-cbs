@@ -29,9 +29,11 @@ from .runtime import (
     launch_installed_updater,
     launcher_data_path,
     load_version_state,
+    normalize_proxy_url,
     resolved_versions_dir,
     save_version_state,
     updater_log,
+    urlopen_with_proxy,
     verify_authenticode_signature,
     verify_manifest_signature,
     verify_sha256,
@@ -193,7 +195,7 @@ def _call_with_retry(func, *, attempts=3, retry_if=None):
     raise final_err if final_err is not None else RuntimeError("retry failed without exception")
 
 
-def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, attempts_per_url=3):
+def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, attempts_per_url=3, proxy_url=""):
     last_errors: list[str] = []
     for url in _build_github_api_urls(path, custom_candidates=custom_candidates):
         req = urllib.request.Request(
@@ -206,7 +208,7 @@ def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, a
         )
 
         def _request():
-            with urllib.request.urlopen(req, timeout=max(4, int(timeout or 12))) as resp:
+            with urlopen_with_proxy(req, timeout=max(4, int(timeout or 12)), proxy_url=proxy_url) as resp:
                 return resp.read().decode("utf-8", errors="replace")
 
         try:
@@ -222,7 +224,7 @@ def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, a
     return None, "", last_errors
 
 
-def _fetch_text(url: str, *, timeout=20, attempts=3):
+def _fetch_text(url: str, *, timeout=20, attempts=3, proxy_url=""):
     req = urllib.request.Request(
         str(url or "").strip(),
         headers={"User-Agent": "GenericAgentLauncher-Updater", "Accept": "application/json, text/plain, */*"},
@@ -230,7 +232,7 @@ def _fetch_text(url: str, *, timeout=20, attempts=3):
     )
 
     def _request():
-        with urllib.request.urlopen(req, timeout=max(5, int(timeout or 20))) as resp:
+        with urlopen_with_proxy(req, timeout=max(5, int(timeout or 20)), proxy_url=proxy_url) as resp:
             return resp.read()
 
     return _call_with_retry(_request, attempts=max(1, int(attempts or 3)))
@@ -261,7 +263,7 @@ def _is_newer_version(target: str, current: str):
     return _version_tuple(target) > _version_tuple(current)
 
 
-def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
+def _release_to_launcher_update_info(release: dict, *, public_key_pem: str, proxy_url: str = ""):
     if not isinstance(release, dict):
         raise UpdateError(ERR_RELEASE_FETCH, "GitHub release payload 无效", phase="query")
     manifest_asset = _asset_by_name(release, _MANIFEST_NAMES)
@@ -271,7 +273,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
     if not manifest_url:
         raise UpdateError(ERR_MANIFEST_INVALID, "manifest 资产缺少下载地址", phase="manifest")
     try:
-        manifest_bytes = _fetch_text(manifest_url, timeout=20, attempts=3)
+        manifest_bytes = _fetch_text(manifest_url, timeout=20, attempts=3, proxy_url=proxy_url)
         manifest = json.loads(manifest_bytes.decode("utf-8", errors="replace"))
     except Exception as e:
         raise UpdateError(ERR_MANIFEST_INVALID, "读取或解析 manifest 失败", phase="manifest", detail=str(e)) from e
@@ -285,7 +287,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
             raise UpdateError(ERR_MANIFEST_SIGNATURE, "release 缺少 manifest.sig", phase="manifest-signature")
         signature_url = str(signature_asset.get("browser_download_url") or "").strip()
         try:
-            signature_text = _fetch_text(signature_url, timeout=20, attempts=3).decode("utf-8", errors="replace").strip()
+            signature_text = _fetch_text(signature_url, timeout=20, attempts=3, proxy_url=proxy_url).decode("utf-8", errors="replace").strip()
         except Exception as e:
             raise UpdateError(ERR_MANIFEST_SIGNATURE, "下载 manifest.sig 失败", phase="manifest-signature", detail=str(e)) from e
     if not signature_text:
@@ -339,25 +341,28 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
     }
 
 
-def query_launcher_update(*, repo_url: str = "", current_version: str = "", public_key_pem: str = "", api_candidates=None):
+def query_launcher_update(*, repo_url: str = "", current_version: str = "", public_key_pem: str = "", api_candidates=None, proxy_url: str = ""):
     repo = str(repo_url or "").strip() or LAUNCHER_REPO_URL
     slug = _repo_slug_from_url(repo)
     if not slug:
         raise UpdateError(ERR_REPO_INVALID, "launcher_repo_url 不是合法 GitHub 仓库地址", phase="query")
+    normalized_proxy = normalize_proxy_url(proxy_url)
     payload, source, errors = _http_json_with_fallback(
         f"/repos/{slug}/releases/latest",
         custom_candidates=api_candidates,
         timeout=12,
         attempts_per_url=3,
+        proxy_url=normalized_proxy,
     )
     if not isinstance(payload, dict):
         detail = "; ".join(errors[-3:]) if errors else "no_response"
         raise UpdateError(ERR_RELEASE_FETCH, "拉取最新 Release 失败", phase="query", detail=detail)
-    info = _release_to_launcher_update_info(payload, public_key_pem=public_key_pem)
+    info = _release_to_launcher_update_info(payload, public_key_pem=public_key_pem, proxy_url=normalized_proxy)
     cur = str(current_version or "").strip() or current_launcher_version()
     info["current_version"] = cur
     info["is_update_available"] = _is_newer_version(info["target_version"], cur)
     info["api_source"] = source
+    info["proxy_url"] = normalized_proxy
     return info
 
 
@@ -388,6 +393,7 @@ def create_update_job(update_info: dict):
         "release_url": str(info.get("release_url") or "").strip(),
         "release_tag": str(info.get("release_tag") or "").strip(),
         "manifest_url": str(info.get("manifest_url") or "").strip(),
+        "proxy_url": normalize_proxy_url(info.get("proxy_url")),
         "status": "queued",
         "phase": "queued",
         "error_code": "",
@@ -679,9 +685,9 @@ def _rollback_to_previous(job_file: str, job: dict, *, previous_version: str, er
     }
 
 
-def _download_package_with_retry(package_url: str, package_file: str, *, attempts: int, timeout_seconds: int):
+def _download_package_with_retry(package_url: str, package_file: str, *, attempts: int, timeout_seconds: int, proxy_url: str = ""):
     def _do_download():
-        return download_to_file(package_url, package_file, timeout=timeout_seconds)
+        return download_to_file(package_url, package_file, timeout=timeout_seconds, proxy_url=proxy_url)
 
     try:
         return _call_with_retry(_do_download, attempts=max(1, int(attempts or 1)))
@@ -761,6 +767,7 @@ def apply_update_job(job_path: str):
                 package_file,
                 attempts=_int_or(job.get("download_attempts"), 3, minimum=1, maximum=8),
                 timeout_seconds=180,
+                proxy_url=str(job.get("proxy_url") or "").strip(),
             )
             try:
                 verify_sha256(package_file, package_sha256)

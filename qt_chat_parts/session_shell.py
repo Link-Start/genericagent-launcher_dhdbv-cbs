@@ -457,6 +457,29 @@ class SessionShellMixin:
 
         threading.Thread(target=worker, name="subagent-runtime-scan", daemon=True).start()
 
+    def _start_local_subagent_runtime_refresh(self, target_key):
+        event_queue = getattr(self, "_event_queue", None)
+        if event_queue is None:
+            count = self._count_running_subagents()
+            self._apply_subagent_runtime_count(count, target_key=target_key, scanned_at=time.time())
+            return
+
+        def worker():
+            try:
+                count = self._count_running_subagents()
+            except Exception:
+                count = 0
+            event_queue.put(
+                {
+                    "event": "subagent_runtime_count",
+                    "target_key": str(target_key or "").strip(),
+                    "count": int(count or 0),
+                    "scanned_at": float(time.time()),
+                }
+            )
+
+        threading.Thread(target=worker, name="subagent-runtime-scan-local", daemon=True).start()
+
     def _refresh_subagent_runtime_state(self):
         target_key = str(self._subagent_runtime_target_key() or "").strip() or "local:local"
         previous_key = str(getattr(self, "_subagent_runtime_bound_key", "") or "").strip()
@@ -464,21 +487,21 @@ class SessionShellMixin:
             self._subagent_runtime_bound_key = target_key
             self._subagent_runtime_count = 0
             self._subagent_runtime_scan_ts = 0.0
+            self._subagent_runtime_refresh_inflight_key = ""
             self._refresh_info_tooltip()
             refresher = getattr(self, "_refresh_info_button_icon", None)
             if callable(refresher):
                 refresher()
+        inflight_key = str(getattr(self, "_subagent_runtime_refresh_inflight_key", "") or "").strip()
+        if inflight_key == target_key:
+            return
+        self._subagent_runtime_refresh_inflight_key = target_key
         if self._subagent_runtime_target_scope() == "remote":
-            inflight_key = str(getattr(self, "_subagent_runtime_refresh_inflight_key", "") or "").strip()
-            if inflight_key == target_key:
-                return
-            self._subagent_runtime_refresh_inflight_key = target_key
             current_session = getattr(self, "current_session", None)
             session = dict(current_session or {}) if isinstance(current_session, dict) else {}
             self._start_remote_subagent_runtime_refresh(target_key, session)
             return
-        self._subagent_runtime_refresh_inflight_key = ""
-        self._apply_subagent_runtime_count(self._count_running_subagents(), target_key=target_key, scanned_at=time.time())
+        self._start_local_subagent_runtime_refresh(target_key)
 
     def _subagent_runtime_summary_text(self) -> str:
         count = int(getattr(self, "_subagent_runtime_count", 0) or 0)

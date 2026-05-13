@@ -1733,6 +1733,26 @@ tg_bot_token = '123'
         self.assertIn("打开 Release 页面", src)
         self.assertIn("QDesktopServices.openUrl", src)
 
+    def test_launcher_update_proxy_ui_and_download_chain_are_wired(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        personal_path = os.path.join(root, "qt_chat_parts", "personal_usage.py")
+        update_path = os.path.join(root, "launcher_core_parts", "update_manager.py")
+        runtime_path = os.path.join(root, "launcher_core_parts", "runtime.py")
+        with open(personal_path, "r", encoding="utf-8") as f:
+            personal_src = f.read()
+        with open(update_path, "r", encoding="utf-8") as f:
+            update_src = f.read()
+        with open(runtime_path, "r", encoding="utf-8") as f:
+            runtime_src = f.read()
+        self.assertIn("更新代理", personal_src)
+        self.assertIn("保存代理", personal_src)
+        self.assertIn("launcher_update_proxy_url", personal_src)
+        self.assertIn("proxy_url=proxy_url", personal_src)
+        self.assertIn('"proxy_url": normalize_proxy_url(info.get("proxy_url"))', update_src)
+        self.assertIn("download_to_file(package_url, package_file, timeout=timeout_seconds, proxy_url=proxy_url)", update_src)
+        self.assertIn("def normalize_proxy_url", runtime_src)
+        self.assertIn("def urlopen_with_proxy", runtime_src)
+
     def test_kernel_update_check_handles_unsynced_remote_without_false_diverged(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "qt_chat_parts", "personal_usage.py")

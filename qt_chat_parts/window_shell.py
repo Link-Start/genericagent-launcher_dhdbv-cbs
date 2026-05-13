@@ -811,46 +811,110 @@ class WindowShellMixin:
             suffix = "…" if end < len(raw) else ""
             return prefix + raw[start:end] + suffix
 
-        def populate():
+        search_state = {"seq": 0, "active": True}
+        debounce = QTimer(dlg)
+        debounce.setSingleShot(True)
+
+        def show_placeholder(text: str):
+            results.clear()
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.NoItemFlags)
+            results.addItem(item)
+
+        def populate_async(*, immediate=False):
             kw = str(entry.text() or "").strip()
             self._session_filter_keyword = kw
-            results.clear()
+            search_state["seq"] = int(search_state.get("seq", 0) or 0) + 1
+            token = int(search_state["seq"])
             if not kw:
-                item = QListWidgetItem("输入关键词开始检索")
-                item.setFlags(Qt.NoItemFlags)
-                results.addItem(item)
-                return
-            hits = 0
-            for meta in lz.list_sessions(self.agent_dir):
-                if hits >= 80:
-                    break
                 try:
-                    data = lz.load_session(self.agent_dir, meta["id"])
+                    debounce.stop()
                 except Exception:
-                    data = None
-                if not data:
-                    continue
-                for idx, bubble in enumerate(data.get("bubbles") or []):
-                    if hits >= 80:
-                        break
-                    text = str(bubble.get("text") or "")
-                    if kw.lower() not in text.lower():
-                        continue
-                    role = "🙂" if bubble.get("role") == "user" else "🤖"
-                    title_text = str(meta.get("title") or "(未命名)")[:38]
-                    when = time.strftime("%m-%d %H:%M", time.localtime(meta.get("updated_at", 0) or 0))
-                    source = _session_source_label(data)
-                    body = snippet(text, kw)
-                    item_text = f"{role}  {title_text} · 第 {idx + 1} 条消息\n{source} · {when}\n{body}"
-                    item = QListWidgetItem(item_text)
-                    item.setData(Qt.UserRole, {"sid": meta.get("id"), "bubble_index": idx})
-                    item.setToolTip(body)
-                    results.addItem(item)
-                    hits += 1
-            if hits == 0:
-                item = QListWidgetItem(f"未找到包含“{kw}”的消息")
-                item.setFlags(Qt.NoItemFlags)
-                results.addItem(item)
+                    pass
+                show_placeholder("输入关键词开始检索")
+                return
+            show_placeholder("正在检索会话内容…")
+
+            def launch(expected_token: int, keyword: str):
+                agent_dir = str(self.agent_dir or "").strip()
+
+                def worker():
+                    hits = []
+                    if agent_dir:
+                        for meta in lz.list_sessions(agent_dir):
+                            if len(hits) >= 80:
+                                break
+                            try:
+                                data = lz.load_session(agent_dir, meta["id"])
+                            except Exception:
+                                data = None
+                            if not data:
+                                continue
+                            for idx, bubble in enumerate(data.get("bubbles") or []):
+                                if len(hits) >= 80:
+                                    break
+                                text = str(bubble.get("text") or "")
+                                if keyword.lower() not in text.lower():
+                                    continue
+                                hits.append(
+                                    {
+                                        "sid": meta.get("id"),
+                                        "bubble_index": idx,
+                                        "role": "🙂" if bubble.get("role") == "user" else "🤖",
+                                        "title": str(meta.get("title") or "(未命名)")[:38],
+                                        "when": time.strftime("%m-%d %H:%M", time.localtime(meta.get("updated_at", 0) or 0)),
+                                        "source": _session_source_label(data),
+                                        "body": snippet(text, keyword),
+                                    }
+                                )
+
+                    def apply():
+                        if (not bool(search_state.get("active", False))) or expected_token != int(search_state.get("seq", 0) or 0):
+                            return
+                        results.clear()
+                        if not hits:
+                            item = QListWidgetItem(f"未找到包含“{keyword}”的消息")
+                            item.setFlags(Qt.NoItemFlags)
+                            results.addItem(item)
+                            return
+                        for row in hits:
+                            item_text = (
+                                f"{row['role']}  {row['title']} · 第 {int(row['bubble_index']) + 1} 条消息\n"
+                                f"{row['source']} · {row['when']}\n{row['body']}"
+                            )
+                            item = QListWidgetItem(item_text)
+                            item.setData(Qt.UserRole, {"sid": row["sid"], "bubble_index": row["bubble_index"]})
+                            item.setToolTip(row["body"])
+                            results.addItem(item)
+
+                    try:
+                        QTimer.singleShot(0, dlg, apply)
+                    except Exception:
+                        QTimer.singleShot(0, apply)
+
+                threading.Thread(target=worker, name=f"session-search-{expected_token}", daemon=True).start()
+
+            if immediate:
+                try:
+                    debounce.stop()
+                except Exception:
+                    pass
+                launch(token, kw)
+                return
+            try:
+                debounce.timeout.disconnect()
+            except Exception:
+                pass
+            debounce.timeout.connect(lambda expected_token=token, keyword=kw: launch(expected_token, keyword))
+            debounce.start(160)
+
+        def _mark_search_inactive():
+            search_state["active"] = False
+
+        try:
+            dlg.finished.connect(_mark_search_inactive)
+        except Exception:
+            pass
 
         def activate(item):
             data = item.data(Qt.UserRole)
@@ -863,10 +927,11 @@ class WindowShellMixin:
             QTimer.singleShot(220, lambda: self._jump_to_bubble(bubble_index))
 
         clear_btn.clicked.connect(lambda: (entry.clear(), entry.setFocus()))
-        entry.textChanged.connect(lambda _text: populate())
-        entry.returnPressed.connect(populate)
+        entry.textChanged.connect(lambda _text: populate_async())
+        entry.returnPressed.connect(lambda: populate_async(immediate=True))
         results.itemActivated.connect(activate)
         results.itemDoubleClicked.connect(activate)
-        populate()
+        show_placeholder("输入关键词开始检索")
+        populate_async(immediate=True)
         entry.setFocus()
         dlg.exec()

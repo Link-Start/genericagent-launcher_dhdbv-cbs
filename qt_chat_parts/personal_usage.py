@@ -48,6 +48,25 @@ class PersonalUsageMixin:
         except Exception:
             pass
 
+    def _launcher_update_proxy_url(self) -> str:
+        return str(lz.normalize_proxy_url((getattr(self, "cfg", {}) or {}).get("launcher_update_proxy_url")) or "").strip()
+
+    def _save_launcher_update_proxy(self):
+        edit = getattr(self, "settings_about_update_proxy_edit", None)
+        if edit is None:
+            return
+        proxy_url = str(lz.normalize_proxy_url(edit.text()) or "").strip()
+        self.cfg["launcher_update_proxy_url"] = proxy_url
+        try:
+            edit.setText(proxy_url)
+        except Exception:
+            pass
+        lz.save_config(self.cfg)
+        if proxy_url:
+            self._set_status(f"已保存更新代理：{proxy_url}")
+        else:
+            self._set_status("已清空更新代理，后续更新检测与安装将改为直连。")
+
     def _lan_interface_form_disabled_reason(self, *, valid_agent_dir=False):
         return "" if valid_agent_dir else "请先选择有效的 GenericAgent 目录。"
 
@@ -278,6 +297,7 @@ class PersonalUsageMixin:
 
     def _github_json_with_fallback(self, path: str, *, allow_404: bool = False, timeout: int = 8):
         last_errors = []
+        proxy_url = self._launcher_update_proxy_url()
         for url in self._build_github_api_urls(path):
             req = Request(
                 url,
@@ -288,7 +308,7 @@ class PersonalUsageMixin:
                 method="GET",
             )
             try:
-                with urlopen(req, timeout=max(2, int(timeout or 8))) as resp:
+                with lz.urlopen_with_proxy(req, timeout=max(2, int(timeout or 8)), proxy_url=proxy_url) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 payload = json.loads(raw) if raw.strip() else {}
                 return payload, url, last_errors
@@ -962,6 +982,7 @@ class PersonalUsageMixin:
         api_candidates = self.cfg.get("github_update_api_urls")
         if not isinstance(api_candidates, list):
             api_candidates = []
+        proxy_url = self._launcher_update_proxy_url()
         public_key_pem = (
             str(self.cfg.get("update_signing_public_key_pem") or "").strip()
             or str(os.environ.get("GA_LAUNCHER_UPDATE_PUBLIC_KEY_PEM") or "").strip()
@@ -993,6 +1014,7 @@ class PersonalUsageMixin:
                     current_version=lz.current_launcher_version(),
                     public_key_pem=public_key_pem,
                     api_candidates=api_candidates,
+                    proxy_url=proxy_url,
                 )
                 launcher["latest_release_tag"] = str(info.get("release_tag") or "").strip()
                 launcher["remote_sha"] = launcher["latest_release_tag"]
@@ -1898,6 +1920,10 @@ class PersonalUsageMixin:
         ):
             return
         try:
+            info = dict(info)
+            proxy_url = self._launcher_update_proxy_url()
+            if proxy_url and (not str(info.get("proxy_url") or "").strip()):
+                info["proxy_url"] = proxy_url
             created = lz.create_update_job(info)
             job_path = str(created.get("job_path") or "").strip()
             if not job_path:
@@ -4765,6 +4791,7 @@ class PersonalUsageMixin:
         update_desc = QLabel(
             "支持分别检查“启动器仓库”和“agant 内核仓库（GenericAgent）”是否有新提交。"
             "检测会优先直连 GitHub API，失败后自动尝试镜像代理地址（更适合国内网络）。"
+            "如果当前网络需要代理，可在这里填写，检测和安装更新都会复用它。"
         )
         update_desc.setWordWrap(True)
         update_desc.setObjectName("cardDesc")
@@ -4782,6 +4809,26 @@ class PersonalUsageMixin:
         self.settings_about_auto_fetch_kernel.setChecked(bool(self.cfg.get("kernel_update_auto_fetch_enabled", True)))
         self.settings_about_auto_fetch_kernel.toggled.connect(self._on_toggle_kernel_update_auto_fetch)
         update_box.addWidget(self.settings_about_auto_fetch_kernel)
+        self.settings_about_update_proxy_edit = QLineEdit()
+        self.settings_about_update_proxy_edit.setPlaceholderText("例如：http://127.0.0.1:7890")
+        self.settings_about_update_proxy_edit.setText(self._launcher_update_proxy_url())
+        update_box.addWidget(self._langfuse_input_row("更新代理", self.settings_about_update_proxy_edit))
+        update_proxy_hint = QLabel("留空表示直连；填写后会同时用于 GitHub API、manifest / signature 和更新包下载。")
+        update_proxy_hint.setWordWrap(True)
+        update_proxy_hint.setObjectName("mutedText")
+        update_box.addWidget(update_proxy_hint)
+        update_proxy_row = QHBoxLayout()
+        update_proxy_row.setSpacing(8)
+        save_proxy_btn = QPushButton("保存代理")
+        save_proxy_btn.setStyleSheet(self._action_button_style())
+        save_proxy_btn.clicked.connect(self._save_launcher_update_proxy)
+        update_proxy_row.addWidget(save_proxy_btn, 0)
+        clear_proxy_btn = QPushButton("清空代理")
+        clear_proxy_btn.setStyleSheet(self._action_button_style(kind="subtle"))
+        clear_proxy_btn.clicked.connect(lambda: (self.settings_about_update_proxy_edit.setText(""), self._save_launcher_update_proxy()))
+        update_proxy_row.addWidget(clear_proxy_btn, 0)
+        update_proxy_row.addStretch(1)
+        update_box.addLayout(update_proxy_row)
         update_action_row = QHBoxLayout()
         update_action_row.setSpacing(8)
         self.settings_about_check_updates_btn = QPushButton("立即检测 GitHub 更新")

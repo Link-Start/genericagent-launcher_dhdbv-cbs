@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
@@ -1105,10 +1106,38 @@ def _sha256_file(path):
     return h.hexdigest().lower()
 
 
-def download_to_file(url, dest_path, *, timeout=120):
+def normalize_proxy_url(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return "http:" + text
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return text
+    if parsed.scheme and (not parsed.netloc) and parsed.path:
+        return text
+    if "://" not in text and re.match(r"^[A-Za-z0-9_.-]+:\d+$", text):
+        return "http://" + text
+    if "://" not in text and re.match(r"^(localhost|\d{1,3}(?:\.\d{1,3}){3}):\d+$", text, flags=re.IGNORECASE):
+        return "http://" + text
+    return text
+
+
+def urlopen_with_proxy(request, *, timeout=30, proxy_url=""):
+    normalized_proxy = normalize_proxy_url(proxy_url)
+    if normalized_proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": normalized_proxy, "https": normalized_proxy})
+        )
+        return opener.open(request, timeout=max(1, int(timeout or 30)))
+    return urllib.request.urlopen(request, timeout=max(1, int(timeout or 30)))
+
+
+def download_to_file(url, dest_path, *, timeout=120, proxy_url=""):
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     request = urllib.request.Request(str(url or "").strip(), headers={"User-Agent": "GenericAgentLauncher-Updater"})
-    with urllib.request.urlopen(request, timeout=max(10, int(timeout or 120))) as resp:
+    with urlopen_with_proxy(request, timeout=max(10, int(timeout or 120)), proxy_url=proxy_url) as resp:
         fd, temp_path = tempfile.mkstemp(prefix=".part-", suffix=".tmp", dir=os.path.dirname(dest_path))
         try:
             with os.fdopen(fd, "wb") as out:
