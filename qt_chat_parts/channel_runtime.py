@@ -36,6 +36,7 @@ from .common import (
     normalize_remote_agent_dir,
     normalize_ssh_error_text,
     process_cmdline_matches_agent_script,
+    process_path_looks_absolute,
     process_matcher_script_source,
     remote_device_agent_dir,
     remote_device_agent_mode,
@@ -795,7 +796,7 @@ class ChannelRuntimeMixin:
                     continue
                 script_rels = list(lz.channel_script_rel_candidates(spec) or [])
                 launcher_script = str(lz.channel_script_path(agent_dir, spec, existing_only=True) or "").strip()
-                if launcher_script and os.path.isabs(launcher_script) and launcher_script not in script_rels:
+                if launcher_script and process_path_looks_absolute(launcher_script) and launcher_script not in script_rels:
                     script_rels.append(launcher_script)
                 if not script_rels:
                     continue
