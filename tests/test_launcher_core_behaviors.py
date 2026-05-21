@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import ctypes
 import json
 import types
@@ -357,6 +358,33 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         finally:
             bridge.__file__ = original_file
             bridge.sys.path[:] = original_sys_path
+
+    def test_bridge_runtime_sanitizer_is_not_called_at_import_time(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "bridge.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        module = ast.parse(src, filename=path)
+        strip_name = "_strip_incompatible_pyinstaller_runtime_from_sys_path"
+        strip_defs = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == strip_name]
+        self.assertEqual(len(strip_defs), 1)
+        top_level_calls = [
+            node for node in module.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == strip_name
+        ]
+        self.assertEqual(top_level_calls, [])
+        main_defs = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main"]
+        self.assertEqual(len(main_defs), 1)
+        main_calls = [
+            node for node in ast.walk(main_defs[0])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == strip_name
+        ]
+        self.assertEqual(len(main_calls), 1)
 
     def test_theme_font_helpers_return_platform_appropriate_defaults(self):
         mac_ui = launcher_theme._default_ui_font_family("darwin")
@@ -2011,9 +2039,48 @@ tg_bot_token = '123'
                 exec(compile(src, path, "exec"), namespace)
                 self.assertEqual(namespace["datas"], [(f"{package_name}-data", ".")])
                 self.assertEqual(namespace["binaries"], [f"{package_name}-bin"])
-                self.assertEqual(namespace["hiddenimports"], [f"{package_name}.hidden"])
+                self.assertIn(f"{package_name}.hidden", namespace["hiddenimports"])
 
         self.assertEqual(calls, ["charset_normalizer", "simplejson"])
+
+    def test_custom_charset_normalizer_hook_collects_mypyc_helper_module(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        path = os.path.join(root, "hooks", "hook-charset_normalizer.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('endswith("__mypyc")', src)
+        self.assertIn('importlib.import_module("charset_normalizer")', src)
+
+        pyinstaller_hooks_module = types.ModuleType("PyInstaller.utils.hooks")
+
+        def _collect_all(name):
+            return [(f"{name}-data", ".")], [f"{name}-bin"], [f"{name}.hidden"]
+
+        pyinstaller_hooks_module.collect_all = _collect_all
+        namespace = {"__builtins__": __builtins__}
+        with tempfile.TemporaryDirectory() as td:
+            site_root = os.path.join(td, "site-packages")
+            os.makedirs(os.path.join(site_root, "charset_normalizer"), exist_ok=True)
+            package_mod = types.ModuleType("charset_normalizer")
+            package_mod.__file__ = os.path.join(site_root, "charset_normalizer", "__init__.py")
+            helper_name = "demo_hash__mypyc"
+            helper_mod = types.ModuleType(helper_name)
+            helper_mod.__file__ = os.path.join(site_root, f"{helper_name}.cp312-win_amd64.pyd")
+            other_mod = types.ModuleType("unrelated__mypyc")
+            other_mod.__file__ = os.path.join(td, "unrelated__mypyc.cp312-win_amd64.pyd")
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "PyInstaller.utils.hooks": pyinstaller_hooks_module,
+                    "charset_normalizer": package_mod,
+                    helper_name: helper_mod,
+                    "unrelated__mypyc": other_mod,
+                },
+                clear=False,
+            ):
+                exec(compile(src, path, "exec"), namespace)
+        self.assertIn(helper_name, namespace["hiddenimports"])
+        self.assertNotIn("unrelated__mypyc", namespace["hiddenimports"])
 
     def test_private_python_installer_has_atomic_download_and_retry(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -3173,8 +3240,14 @@ tg_bot_token = '123'
         self.assertIn("MACOS_ICON_PATH", src)
         self.assertIn("icon=MACOS_ICON_PATH if os.path.isfile(MACOS_ICON_PATH) else None", src)
 
+        collect_all_calls = []
+
         def _collect_data_files(_package, subdir=None):
             return [(f"stub:{subdir}", subdir or ".")]
+
+        def _collect_all(package):
+            collect_all_calls.append(str(package))
+            return [(f"{package}-data", ".")], [f"{package}-bin"], [f"{package}.hidden"]
 
         class _AnalysisResult:
             def __init__(self, *args, **kwargs):
@@ -3187,6 +3260,7 @@ tg_bot_token = '123'
 
         pyinstaller_hooks_module = types.ModuleType("PyInstaller.utils.hooks")
         pyinstaller_hooks_module.collect_data_files = _collect_data_files
+        pyinstaller_hooks_module.collect_all = _collect_all
         namespace_base = {
             "__builtins__": __builtins__,
             "Analysis": _AnalysisResult,
@@ -3224,6 +3298,27 @@ tg_bot_token = '123'
                 namespace = dict(namespace_base)
                 exec(compile(src, path, "exec"), namespace)
             self.assertEqual(namespace["ROOT_DIR"], root)
+            self.assertEqual(
+                collect_all_calls,
+                [
+                    "requests",
+                    "simplejson",
+                    "charset_normalizer",
+                    "cryptography",
+                    "requests",
+                    "simplejson",
+                    "charset_normalizer",
+                    "cryptography",
+                    "requests",
+                    "simplejson",
+                    "charset_normalizer",
+                    "cryptography",
+                    "requests",
+                    "simplejson",
+                    "charset_normalizer",
+                    "cryptography",
+                ],
+            )
 
     def test_macos_build_script_creates_dmg_and_sha256(self):
         root = os.path.dirname(os.path.dirname(__file__))

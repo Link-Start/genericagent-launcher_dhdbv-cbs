@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 
 def _resolve_root_dir():
@@ -30,6 +30,11 @@ hiddenimports = [
     "cryptography",
 ]
 binaries = []
+for _package in ("requests", "simplejson", "charset_normalizer", "cryptography"):
+    _package_datas, _package_binaries, _package_hiddenimports = collect_all(_package)
+    datas += _package_datas
+    binaries += _package_binaries
+    hiddenimports += _package_hiddenimports
 
 hiddenimports += [
     "PySide6.QtCore",
