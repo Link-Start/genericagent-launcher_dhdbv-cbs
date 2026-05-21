@@ -4,6 +4,16 @@
 
 它不重新实现 GenericAgent 内核，而是把下载、配置、启动、聊天、渠道管理、远程设备接入和常用运维入口整理成一个更适合普通用户使用的桌面界面。当前公开发布面向 `Windows` 和 `macOS`。
 
+## 界面预览
+
+### 聊天主页
+
+![聊天主页预览](docs/screenshots/launcher-chat.png)
+
+### 使用日志
+
+![使用日志预览](docs/screenshots/launcher-usage-log.png)
+
 ## 这个项目解决什么问题
 
 如果你直接使用上游 GenericAgent，通常还要自己处理这些事情：
@@ -269,7 +279,7 @@ tools/build_macos_release.py       macOS release bundle 生成脚本
 
 本项目目前也在这个社区持续推广和交流：
 
-- [LINUX DO](https://linux.do)
+- [LINUX DO 社区友链，同时也指向本启动器教程贴](https://linux.do/t/topic/1998596?u=dvdbv)
 
 ## 致谢
 
