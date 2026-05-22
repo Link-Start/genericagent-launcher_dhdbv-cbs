@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout
 
@@ -19,6 +19,7 @@ from launcher_app.theme import C
 
 from .common import (
     _session_copy,
+    chat_auto_jump_latest_enabled,
     normalize_remote_agent_dir,
     normalize_ssh_error_text,
     remote_device_agent_dir,
@@ -39,6 +40,60 @@ _RUNTIME_REASONING_EFFORT_VALUES = {value for value, _label in _RUNTIME_REASONIN
 
 
 class BridgeRuntimeMixin:
+    def _set_tray_message_ready(self, tray, ready: bool):
+        if tray is None:
+            return
+        try:
+            tray.setProperty("_ga_launcher_tray_message_ready", bool(ready))
+            return
+        except Exception:
+            pass
+        try:
+            setattr(tray, "_ga_launcher_tray_message_ready", bool(ready))
+        except Exception:
+            pass
+
+    def _tray_message_ready(self, tray) -> bool:
+        if tray is None:
+            return False
+        try:
+            prop = tray.property("_ga_launcher_tray_message_ready")
+        except Exception:
+            prop = getattr(tray, "_ga_launcher_tray_message_ready", None)
+        if prop is not None:
+            return bool(prop)
+        visible_getter = getattr(tray, "isVisible", None)
+        if callable(visible_getter):
+            try:
+                return bool(visible_getter())
+            except Exception:
+                pass
+        return True
+
+    def _show_tray_message(self, tray, title: str, message: str, *, timeout_ms: int = 1500):
+        if tray is None:
+            return
+        try:
+            tray.show()
+        except Exception:
+            pass
+
+        def _deliver():
+            self._set_tray_message_ready(tray, True)
+            try:
+                tray.showMessage(str(title or ""), str(message or ""), QSystemTrayIcon.Information, int(timeout_ms or 0))
+            except Exception:
+                pass
+
+        if self._tray_message_ready(tray):
+            _deliver()
+            return
+        delay_ms = 180 if os.name == "nt" else 0
+        try:
+            QTimer.singleShot(delay_ms, _deliver)
+        except Exception:
+            _deliver()
+
     def _upstream_optional_slash_command_items(self):
         agent_dir = str(getattr(self, "agent_dir", "") or "").strip()
         if (not agent_dir) or (not lz.is_valid_agent_dir(agent_dir)):
@@ -668,15 +723,41 @@ class BridgeRuntimeMixin:
         return None
 
     def _resolve_bridge_python(self):
+        def _norm_path(value):
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            return os.path.normcase(os.path.normpath(text))
+
         cfg_py = str((getattr(self, "cfg", {}) or {}).get("python_exe") or "").strip()
+        cfg_resolved = ""
         if cfg_py:
-            resolved = lz._resolve_configured_python_exe(cfg_py, agent_dir=self.agent_dir)
-            if resolved and os.path.isfile(resolved):
-                return resolved, None
+            cfg_resolved = lz._resolve_configured_python_exe(cfg_py, agent_dir=self.agent_dir)
 
         cached = getattr(self, "_last_dependency_check", None) or {}
         cached_py = str(cached.get("python") or "").strip()
-        if cached_py and os.path.isfile(cached_py):
+        cache_ok = bool(cached.get("ok"))
+        cache_matches = cache_ok
+        cache_key_getter = getattr(self, "_dependency_check_cache_key", None)
+        if cache_ok and callable(cache_key_getter):
+            try:
+                cache_matches = cached.get("key") == cache_key_getter(extra_packages=[])
+            except TypeError:
+                cache_matches = cached.get("key") == cache_key_getter()
+            except Exception:
+                cache_matches = False
+
+        if cfg_resolved and os.path.isfile(cfg_resolved):
+            if cache_ok and cache_matches and _norm_path(cached_py) == _norm_path(cfg_resolved):
+                return cfg_resolved, None
+            try:
+                ok, _detail = lz._probe_python_agent_compat(cfg_resolved, self.agent_dir)
+            except Exception:
+                ok = False
+            if ok:
+                return cfg_resolved, None
+
+        if cache_ok and cache_matches and cached_py and os.path.isfile(cached_py):
             return cached_py, None
 
         return lz._find_compatible_system_python(self.agent_dir)
@@ -956,6 +1037,7 @@ class BridgeRuntimeMixin:
         tray = QSystemTrayIcon(icon, self)
         tray.setToolTip("GenericAgent 启动器")
         tray.show()
+        self._set_tray_message_ready(tray, False)
         self._reply_notify_tray = tray
         return tray
 
@@ -964,6 +1046,28 @@ class BridgeRuntimeMixin:
 
     def _reply_message_enabled(self):
         return not bool(self.cfg.get("disable_reply_message", False))
+
+    def _chat_auto_jump_latest_enabled(self):
+        return chat_auto_jump_latest_enabled(getattr(self, "cfg", None))
+
+    def _set_turn_auto_jump_latest(self, enabled: bool):
+        self._turn_auto_jump_latest = bool(enabled)
+
+    def _turn_auto_jump_latest_enabled(self):
+        return bool(getattr(self, "_turn_auto_jump_latest", False)) and self._chat_auto_jump_latest_enabled()
+
+    def _arm_current_turn_auto_jump(self, user_row):
+        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
+        if callable(anchor_setter):
+            anchor_setter(user_row)
+        auto_jump = self._chat_auto_jump_latest_enabled()
+        self._set_turn_auto_jump_latest(auto_jump)
+        follower = getattr(self, "_set_follow_latest_user", None)
+        if callable(follower):
+            follower(auto_jump)
+        if auto_jump:
+            self._user_scrolled_up = False
+            self._scroll_row_to_top(user_row, preserve_scroll_state=True)
 
     def _play_reply_done_sound(self):
         if not self._reply_sound_enabled():
@@ -1016,14 +1120,7 @@ class BridgeRuntimeMixin:
                     except Exception:
                         pass
             return
-        try:
-            tray.show()
-        except Exception:
-            pass
-        try:
-            tray.showMessage("GenericAgent 启动器", msg, QSystemTrayIcon.Information, 1500)
-        except Exception:
-            pass
+        self._show_tray_message(tray, "GenericAgent 启动器", msg, timeout_ms=1500)
 
     def _request_backend_state(self, session_id=None):
         sid = session_id or ((self.current_session or {}).get("id"))
@@ -1829,14 +1926,7 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
-        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
-        if callable(anchor_setter):
-            anchor_setter(user_row)
-        self._user_scrolled_up = False
-        follower = getattr(self, "_set_follow_latest_user", None)
-        if callable(follower):
-            follower(True)
-        self._scroll_row_to_top(user_row, preserve_scroll_state=True)
+        self._arm_current_turn_auto_jump(user_row)
         self._busy = True
         self._abort_requested = False
         self._current_stream_text = ""
@@ -1998,14 +2088,7 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
-        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
-        if callable(anchor_setter):
-            anchor_setter(user_row)
-        self._user_scrolled_up = False
-        follower = getattr(self, "_set_follow_latest_user", None)
-        if callable(follower):
-            follower(True)
-        self._scroll_row_to_top(user_row, preserve_scroll_state=True)
+        self._arm_current_turn_auto_jump(user_row)
         self._busy = True
         self._abort_requested = False
         self._current_stream_text = ""
@@ -2051,6 +2134,7 @@ class BridgeRuntimeMixin:
             self._current_stream_text = ""
             self._pending_stream_text = None
             self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
             follower = getattr(self, "_set_follow_latest_user", None)
             if callable(follower):
                 follower(False)
@@ -2091,11 +2175,12 @@ class BridgeRuntimeMixin:
             return
         self._stream_row.update_content(pending, finished=False)
         self._update_stream_row_tokens(live=True)
-        sync_view = getattr(self, "_sync_current_turn_view", None)
-        if callable(sync_view):
-            sync_view()
-        else:
-            self._scroll_to_bottom()
+        if self._turn_auto_jump_latest_enabled():
+            sync_view = getattr(self, "_sync_current_turn_view", None)
+            if callable(sync_view):
+                sync_view()
+            else:
+                self._scroll_to_bottom()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
             refresher()
@@ -2188,17 +2273,20 @@ class BridgeRuntimeMixin:
             if not self._is_remote_session(self.current_session):
                 self._request_backend_state(self.current_session.get("id"))
         self._refresh_token_label()
+        turn_auto_jump = self._turn_auto_jump_latest_enabled()
         follower = getattr(self, "_set_follow_latest_user", None)
         if callable(follower):
             follower(False)
-        sync_view = getattr(self, "_sync_current_turn_view", None)
-        if callable(sync_view):
-            sync_view(force=True)
+        if turn_auto_jump:
+            sync_view = getattr(self, "_sync_current_turn_view", None)
+            if callable(sync_view):
+                sync_view(force=True)
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
             refresher()
-        else:
+        elif turn_auto_jump:
             self._scroll_to_bottom()
+        self._set_turn_auto_jump_latest(False)
 
     def _abort(self):
         if not self._busy or self._abort_requested:
@@ -2341,6 +2429,7 @@ class BridgeRuntimeMixin:
             self._current_stream_text = ""
             self._pending_stream_text = None
             self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
             follower = getattr(self, "_set_follow_latest_user", None)
             if callable(follower):
                 follower(False)
@@ -2474,6 +2563,7 @@ class BridgeRuntimeMixin:
             self._current_stream_text = ""
             self._pending_stream_text = None
             self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
             follower = getattr(self, "_set_follow_latest_user", None)
             if callable(follower):
                 follower(False)

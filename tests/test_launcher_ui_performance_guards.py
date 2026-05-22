@@ -660,6 +660,108 @@ class LauncherUiPerformanceGuardTests(unittest.TestCase):
         self.assertEqual(first_stream_row.updates, [("part 1", False), ("part 2", False)])
         self.assertEqual(dummy.scroll_calls, ["bottom", "bottom"])
 
+    def test_floating_orb_stream_updates_skip_auto_scroll_when_theme_toggle_disabled(self):
+        class DummyLayoutItem:
+            def __init__(self, widget):
+                self._widget = widget
+
+            def widget(self):
+                return self._widget
+
+        class DummyLayout:
+            def __init__(self):
+                self.widgets = []
+                self.alignment = None
+
+            def count(self):
+                return len(self.widgets) + 1
+
+            def insertWidget(self, index, widget):
+                idx = max(0, min(int(index), len(self.widgets)))
+                self.widgets.insert(idx, widget)
+
+            def takeAt(self, index):
+                if 0 <= int(index) < len(self.widgets):
+                    return DummyLayoutItem(self.widgets.pop(int(index)))
+                return DummyLayoutItem(None)
+
+            def indexOf(self, widget):
+                try:
+                    return self.widgets.index(widget)
+                except ValueError:
+                    return -1
+
+            def setAlignment(self, alignment):
+                self.alignment = alignment
+
+        class DummyRow:
+            def __init__(self, text, role, _parent, on_resend=None):
+                self._text = str(text)
+                self._role = str(role)
+                self._finished = True
+                self._on_resend = on_resend
+                self.updates = []
+
+            def set_finished(self, value):
+                self._finished = bool(value)
+
+            def update_content(self, text, *, finished):
+                self._text = str(text)
+                self._finished = bool(finished)
+                self.updates.append((self._text, self._finished))
+
+            def parent(self):
+                return object()
+
+            def deleteLater(self):
+                return None
+
+        class DummyHost:
+            def __init__(self):
+                self.cfg = {"theme_chat_auto_jump_latest": False}
+                self._busy = True
+                self._follow_latest_user_message = False
+
+        class DummyOrb:
+            _render_rows = launcher_window.FloatingOrbWindow._render_rows
+            _sync_stream_row = launcher_window.FloatingOrbWindow._sync_stream_row
+            _clear_stream_row = launcher_window.FloatingOrbWindow._clear_stream_row
+            _sync_message_layout_alignment = launcher_window.FloatingOrbWindow._sync_message_layout_alignment
+
+            def __init__(self):
+                self._host = DummyHost()
+                self._last_signature = None
+                self._last_bubble_signature = None
+                self._rendered_rows = []
+                self._stream_row = None
+                self._focus_latest_user_after_refresh = False
+                self.msg_layout = DummyLayout()
+                self.msg_root = object()
+                self.scroll_calls = []
+
+            def _clear_rows(self):
+                self._stream_row = None
+                self._last_bubble_signature = None
+                self._rendered_rows = []
+                self.msg_layout.widgets = []
+
+            def _scroll_to_latest_dialogue(self):
+                self.scroll_calls.append("latest")
+
+            def _scroll_to_bottom(self):
+                self.scroll_calls.append("bottom")
+
+        dummy = DummyOrb()
+        bubbles = [{"role": "user", "text": "hello"}]
+        with mock.patch.object(launcher_window, "MessageRow", DummyRow), mock.patch.object(
+            launcher_window.QTimer, "singleShot", side_effect=lambda _ms, fn: fn()
+        ):
+            dummy._render_rows(bubbles, "part 1")
+            dummy.scroll_calls.clear()
+            dummy._render_rows(bubbles, "part 2")
+
+        self.assertEqual(dummy.scroll_calls, [])
+
     def test_streaming_browser_height_skips_sub_line_growth_jitter(self):
         class DummyDoc:
             def __init__(self, height):

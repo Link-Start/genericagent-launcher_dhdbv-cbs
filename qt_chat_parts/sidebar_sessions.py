@@ -2380,6 +2380,7 @@ class SidebarSessionsMixin:
         kind = str(data.get("kind") or "").strip().lower()
         if mode == "remote_devices" and kind == "device":
             menu = QMenu(self)
+            chat_common.apply_menu_popup_theme(menu)
             rename_action = menu.addAction("重命名设备")
             auto_enabled = self._remote_device_auto_ssh_enabled(data)
             toggle_action = menu.addAction("关闭自动 SSH" if auto_enabled else "开启自动 SSH")
@@ -2418,6 +2419,7 @@ class SidebarSessionsMixin:
         count = len(rows)
         all_pinned = all(bool(row.get("pinned", False)) for row in rows)
         menu = QMenu(self)
+        chat_common.apply_menu_popup_theme(menu)
         rename_action = menu.addAction("重命名") if count == 1 else None
         pin_action = menu.addAction(f"{'取消收藏' if all_pinned else '收藏'}所选 ({count})")
         delete_action = menu.addAction(f"删除所选 ({count})")

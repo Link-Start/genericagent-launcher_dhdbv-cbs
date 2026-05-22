@@ -10,7 +10,7 @@ import os
 import sys
 from ctypes import byref, c_int
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QToolTip, QWidget
 
@@ -640,20 +640,180 @@ def chat_surface_background() -> str:
     return app_surface_background()
 
 
+_TOOLTIP_BG_ROLES = (
+    QPalette.ToolTipBase,
+    QPalette.Window,
+    QPalette.Base,
+    QPalette.Button,
+)
+
+
+_TOOLTIP_TEXT_ROLES = (
+    QPalette.ToolTipText,
+    QPalette.WindowText,
+    QPalette.Text,
+    QPalette.ButtonText,
+    QPalette.HighlightedText,
+)
+
+_TOOLTIP_THEME_FILTER: "_TooltipThemeEventFilter | None" = None
+_TOOLTIP_REFRESH_PENDING_PROP = "_ga_tooltip_refresh_pending"
+_TOOLTIP_THEME_APPLYING_PROP = "_ga_tooltip_theme_applying"
+
+
+def _tooltip_background_color() -> str:
+    return str(C.get("layer2") or C.get("field_bg") or "#ffffff")
+
+
+def _tooltip_text_color() -> str:
+    return str(C.get("text") or "#111111")
+
+
+def tooltip_widget_style() -> str:
+    return (
+        f"background: {_tooltip_background_color()}; color: {_tooltip_text_color()}; "
+        f"border: 1px solid {C['stroke_hover']}; border-radius: 8px; padding: 5px 9px;"
+    )
+
+
+def _is_live_tooltip_widget(widget) -> bool:
+    if widget is None or (not isinstance(widget, QWidget)):
+        return False
+    try:
+        class_name = str(widget.metaObject().className() or "").strip()
+    except Exception:
+        class_name = ""
+    try:
+        object_name = str(widget.objectName() or "").strip()
+    except Exception:
+        object_name = ""
+    return class_name == "QTipLabel" or object_name == "qtooltip_label"
+
+
+def _apply_live_tooltip_widget_theme(widget, *, force: bool = False) -> None:
+    if not _is_live_tooltip_widget(widget):
+        return
+    try:
+        if bool(widget.property(_TOOLTIP_THEME_APPLYING_PROP)):
+            return
+    except Exception:
+        pass
+    current_style = str(widget.styleSheet() or "")
+    theme_key = "|".join(
+        (
+            _tooltip_background_color(),
+            _tooltip_text_color(),
+            str(C.get("stroke_hover") or ""),
+        )
+    )
+    if (not force) and str(widget.property("_ga_tooltip_theme_key") or "") == theme_key and _tooltip_background_color() in current_style:
+        return
+    try:
+        widget.setProperty(_TOOLTIP_THEME_APPLYING_PROP, True)
+        widget.setProperty("_ga_tooltip_theme_key", theme_key)
+    except Exception:
+        pass
+    bg = QColor(_tooltip_background_color())
+    text = QColor(_tooltip_text_color())
+    try:
+        try:
+            pal = QPalette(widget.palette())
+            for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+                for role in _TOOLTIP_BG_ROLES:
+                    pal.setColor(group, role, bg)
+                for role in _TOOLTIP_TEXT_ROLES:
+                    pal.setColor(group, role, text)
+            widget.setPalette(pal)
+        except Exception:
+            pass
+        try:
+            widget.setStyleSheet(tooltip_widget_style())
+        except Exception:
+            pass
+        try:
+            widget.update()
+        except Exception:
+            pass
+    finally:
+        try:
+            widget.setProperty(_TOOLTIP_THEME_APPLYING_PROP, False)
+        except Exception:
+            pass
+
+
+def _schedule_live_tooltip_refresh(app: QApplication | None = None) -> None:
+    inst = app if app is not None else QApplication.instance()
+    if inst is None:
+        return
+    try:
+        if bool(inst.property(_TOOLTIP_REFRESH_PENDING_PROP)):
+            return
+        inst.setProperty(_TOOLTIP_REFRESH_PENDING_PROP, True)
+    except Exception:
+        pass
+
+    # Qt can repolish or recreate the tooltip label after the source widget
+    # handles QEvent.ToolTip or after the app stylesheet changes.
+    def _run():
+        try:
+            inst.setProperty(_TOOLTIP_REFRESH_PENDING_PROP, False)
+        except Exception:
+            pass
+        refresh_live_tooltip_widgets(inst)
+
+    try:
+        QTimer.singleShot(0, _run)
+    except Exception:
+        _run()
+
+
+def refresh_live_tooltip_widgets(app: QApplication | None = None) -> None:
+    inst = app if app is not None else QApplication.instance()
+    if inst is None:
+        return
+    try:
+        widgets = list(inst.topLevelWidgets())
+    except Exception:
+        widgets = []
+    for widget in widgets:
+        _apply_live_tooltip_widget_theme(widget, force=True)
+
+
+class _TooltipThemeEventFilter(QObject):
+    def eventFilter(self, watched, event):
+        et = event.type() if event is not None else None
+        if et == QEvent.ToolTip:
+            _schedule_live_tooltip_refresh(QApplication.instance())
+        if _is_live_tooltip_widget(watched):
+            if et in (QEvent.Show, QEvent.Polish):
+                _apply_live_tooltip_widget_theme(watched, force=True)
+                _schedule_live_tooltip_refresh(QApplication.instance())
+        return False
+
+
+def ensure_tooltip_theme_filter(app: QApplication | None = None) -> None:
+    global _TOOLTIP_THEME_FILTER
+    inst = app if app is not None else QApplication.instance()
+    if inst is None:
+        return
+    if _TOOLTIP_THEME_FILTER is None:
+        _TOOLTIP_THEME_FILTER = _TooltipThemeEventFilter(inst)
+        try:
+            inst.installEventFilter(_TOOLTIP_THEME_FILTER)
+        except Exception:
+            pass
+
+
 def build_tooltip_palette() -> QPalette:
-    bg = QColor(str(C.get("layer2") or C.get("field_bg") or "#ffffff"))
-    text = QColor(str(C.get("text") or "#111111"))
+    bg = QColor(_tooltip_background_color())
+    text = QColor(_tooltip_text_color())
     pal = QPalette(QToolTip.palette())
     for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
-        pal.setColor(group, QPalette.ToolTipBase, bg)
-        pal.setColor(group, QPalette.ToolTipText, text)
         # Some Windows/Qt paths still consult generic window/text roles for tooltips.
-        pal.setColor(group, QPalette.Window, bg)
-        pal.setColor(group, QPalette.WindowText, text)
-        pal.setColor(group, QPalette.Base, bg)
-        pal.setColor(group, QPalette.Text, text)
-        pal.setColor(group, QPalette.ButtonText, text)
-        pal.setColor(group, QPalette.HighlightedText, text)
+        for role in _TOOLTIP_BG_ROLES:
+            pal.setColor(group, role, bg)
+        for role in _TOOLTIP_TEXT_ROLES:
+            pal.setColor(group, role, text)
     return pal
 
 
@@ -665,14 +825,17 @@ def apply_tooltip_palette(app: QApplication | None = None) -> QPalette:
         pass
     inst = app if app is not None else QApplication.instance()
     if inst is not None:
+        ensure_tooltip_theme_filter(inst)
         try:
             app_pal = QPalette(inst.palette())
             for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
-                app_pal.setColor(group, QPalette.ToolTipBase, pal.color(group, QPalette.ToolTipBase))
-                app_pal.setColor(group, QPalette.ToolTipText, pal.color(group, QPalette.ToolTipText))
+                for role in _TOOLTIP_BG_ROLES + _TOOLTIP_TEXT_ROLES:
+                    app_pal.setColor(group, role, pal.color(group, role))
             inst.setPalette(app_pal)
         except Exception:
             pass
+        refresh_live_tooltip_widgets(inst)
+        _schedule_live_tooltip_refresh(inst)
     return pal
 
 
@@ -754,7 +917,6 @@ def build_qss() -> str:
     accent_pressed = C["accent_pressed"]
     accent_disabled = C["accent_disabled"]
     accent_soft = C["accent_soft_bg"]
-    accent_soft_hover = C["accent_soft_bg_hover"]
     stroke = C["stroke_default"]
     stroke_hover = C["stroke_hover"]
     stroke_divider = C["stroke_divider"]
@@ -776,8 +938,6 @@ def build_qss() -> str:
     layer3 = C["layer3"]
     mica_fb = C["mica_fallback"]
     sidebar_bg = C["sidebar_bg"]
-    danger = C["danger"]
-    danger_hover = C["danger_hover"]
     danger_soft_border = "rgba(234,112,112,0.35)" if C.get("is_dark") else "rgba(194,72,72,0.30)"
     danger_text = C["danger_text"]
     success = C["success"]

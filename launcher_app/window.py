@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import io
 import json
 import os
@@ -16,8 +17,9 @@ import ctypes
 from ctypes import byref, c_int
 from datetime import datetime
 
-from PySide6.QtCore import QByteArray, QEvent, QMetaObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, qInstallMessageHandler
+from PySide6.QtCore import QByteArray, QEvent, QLockFile, QMetaObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, qInstallMessageHandler
 from PySide6.QtGui import QColor, QCursor, QGuiApplication, QIcon, QKeyEvent, QPainter, QPainterPath, QPixmap, QRegion, QTextCursor
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -135,6 +137,299 @@ def _rotated_svg_icon(cache_key: str, svg: str, *, color: str, size: int, angle:
 
 
 qInstallMessageHandler(_qt_message_handler)
+
+
+_LAUNCHER_INSTANCE_ACTIVATE_PAYLOAD = b"activate\n"
+_LAUNCHER_INSTANCE_ACK_PAYLOAD = b"ok\n"
+_LAUNCHER_INSTANCE_SIGNAL_WAIT_MS = 220
+_LAUNCHER_INSTANCE_RETRY_TIMEOUT_MS = 2400
+_LAUNCHER_INSTANCE_RETRY_POLL_MS = 80
+
+
+def _launcher_single_instance_server_name() -> str:
+    seed = os.path.normcase(os.path.normpath(str(getattr(lz, "DATA_ROOT", "") or "")))
+    if not seed:
+        seed = str(getattr(lz, "APP_NAME", "GenericAgentLauncher") or "GenericAgentLauncher")
+    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"ga-launcher-{digest}"
+
+
+def _launcher_single_instance_lock_path() -> str:
+    state_dir = str(getattr(lz, "STATE_DIR", "") or "").strip()
+    if not state_dir:
+        state_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "GenericAgentLauncher", "state")
+    return os.path.join(state_dir, "launcher-single-instance.lock")
+
+
+class _LauncherSingleInstanceGuard:
+    def __init__(self, app: QApplication):
+        self._app = app
+        self.server_name = _launcher_single_instance_server_name()
+        self.lock_path = _launcher_single_instance_lock_path()
+        self._lock = QLockFile(self.lock_path)
+        try:
+            self._lock.setStaleLockTime(0)
+        except Exception:
+            pass
+        self._lock_acquired = False
+        self._server = None
+        self._connections = set()
+        self._activation_handler = None
+        self._activation_pending = False
+        self._activation_dispatch_scheduled = False
+
+    def request_existing_activation(self, wait_ms: int = _LAUNCHER_INSTANCE_SIGNAL_WAIT_MS) -> bool:
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            except Exception:
+                pass
+        socket = QLocalSocket(self._app)
+        try:
+            socket.connectToServer(self.server_name)
+            if not socket.waitForConnected(max(50, int(wait_ms or 0))):
+                return False
+            socket.write(_LAUNCHER_INSTANCE_ACTIVATE_PAYLOAD)
+            try:
+                socket.flush()
+            except Exception:
+                pass
+            try:
+                socket.waitForBytesWritten(max(50, int(wait_ms or 0)))
+            except Exception:
+                pass
+            try:
+                socket.waitForReadyRead(max(25, int(wait_ms or 0)))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                socket.disconnectFromServer()
+            except Exception:
+                pass
+            try:
+                socket.deleteLater()
+            except Exception:
+                pass
+
+    def wait_for_existing_activation(
+        self,
+        timeout_ms: int = _LAUNCHER_INSTANCE_RETRY_TIMEOUT_MS,
+        *,
+        poll_ms: int = _LAUNCHER_INSTANCE_RETRY_POLL_MS,
+    ) -> bool:
+        deadline = time.monotonic() + (max(0, int(timeout_ms or 0)) / 1000.0)
+        while time.monotonic() < deadline:
+            if self.request_existing_activation(wait_ms=max(50, int(poll_ms or 0))):
+                return True
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            try:
+                self._app.processEvents()
+            except Exception:
+                pass
+            time.sleep(min(max(20, int(poll_ms or 0)), remaining_ms) / 1000.0)
+        return False
+
+    def try_claim_primary(self) -> bool:
+        state_dir = os.path.dirname(self.lock_path)
+        try:
+            if callable(getattr(lz, "_ensure_launcher_data_dirs", None)):
+                lz._ensure_launcher_data_dirs()
+        except Exception:
+            pass
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+        except Exception:
+            pass
+        if not self._lock.tryLock(0):
+            return False
+        self._lock_acquired = True
+        try:
+            self._start_server()
+        except Exception:
+            self.close()
+            raise
+        return True
+
+    def set_activation_handler(self, handler) -> None:
+        self._activation_handler = handler if callable(handler) else None
+        if self._activation_pending and self._activation_handler is not None:
+            self._dispatch_activation_request()
+
+    def close(self) -> None:
+        server = self._server
+        self._server = None
+        owns_endpoint = server is not None or self._lock_acquired
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+            try:
+                server.deleteLater()
+            except Exception:
+                pass
+        if owns_endpoint:
+            try:
+                QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+        if self._lock_acquired:
+            try:
+                self._lock.unlock()
+            except Exception:
+                pass
+            self._lock_acquired = False
+        self._connections.clear()
+        self._activation_pending = False
+        self._activation_dispatch_scheduled = False
+
+    def _start_server(self) -> None:
+        server = QLocalServer(self._app)
+        try:
+            server.newConnection.connect(self._handle_new_connections)
+        except Exception:
+            pass
+        for _attempt in range(2):
+            try:
+                if _attempt == 0:
+                    QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+            if server.listen(self.server_name):
+                self._server = server
+                return
+            try:
+                server.close()
+            except Exception:
+                pass
+            try:
+                QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+        detail = ""
+        try:
+            detail = str(server.errorString() or "").strip()
+        except Exception:
+            detail = ""
+        raise RuntimeError(detail or "无法建立启动器单实例通信通道。")
+
+    def _handle_new_connections(self) -> None:
+        server = self._server
+        if server is None:
+            return
+        while True:
+            try:
+                conn = server.nextPendingConnection()
+            except Exception:
+                conn = None
+            if conn is None:
+                break
+            self._connections.add(conn)
+            try:
+                conn.readyRead.connect(lambda c=conn: self._consume_connection(c))
+            except Exception:
+                pass
+            try:
+                conn.disconnected.connect(lambda c=conn: self._forget_connection(c))
+            except Exception:
+                pass
+            self._consume_connection(conn)
+
+    def _consume_connection(self, conn) -> None:
+        if conn is None:
+            return
+        try:
+            consumed = bool(conn.property("_ga_launcher_instance_consumed"))
+        except Exception:
+            consumed = bool(getattr(conn, "_ga_launcher_instance_consumed", False))
+        if consumed:
+            return
+        payload = b""
+        try:
+            payload = bytes(conn.readAll() or b"")
+        except Exception:
+            payload = b""
+        message = payload.decode("utf-8", errors="ignore").strip().lower()
+        if not message:
+            return
+        try:
+            conn.setProperty("_ga_launcher_instance_consumed", True)
+        except Exception:
+            try:
+                setattr(conn, "_ga_launcher_instance_consumed", True)
+            except Exception:
+                pass
+        if message.startswith("activate"):
+            self._queue_activation_request()
+        try:
+            conn.write(_LAUNCHER_INSTANCE_ACK_PAYLOAD)
+            try:
+                conn.flush()
+            except Exception:
+                pass
+            try:
+                conn.waitForBytesWritten(50)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            conn.disconnectFromServer()
+        except Exception:
+            pass
+
+    def _forget_connection(self, conn) -> None:
+        if conn is None:
+            return
+        self._connections.discard(conn)
+        try:
+            conn.deleteLater()
+        except Exception:
+            pass
+
+    def _queue_activation_request(self) -> None:
+        self._activation_pending = True
+        handler = self._activation_handler
+        if handler is None or self._activation_dispatch_scheduled:
+            return
+        self._activation_dispatch_scheduled = True
+        try:
+            QTimer.singleShot(0, self._dispatch_activation_request)
+        except Exception:
+            self._dispatch_activation_request()
+
+    def _dispatch_activation_request(self) -> None:
+        self._activation_dispatch_scheduled = False
+        if not self._activation_pending:
+            return
+        handler = self._activation_handler
+        if handler is None:
+            return
+        self._activation_pending = False
+        try:
+            handler()
+        except Exception:
+            pass
+
+
+def _ensure_single_launcher_instance(app: QApplication):
+    guard = _LauncherSingleInstanceGuard(app)
+    if guard.request_existing_activation():
+        guard.close()
+        return None
+    if guard.try_claim_primary():
+        return guard
+    if guard.wait_for_existing_activation():
+        guard.close()
+        return None
+    guard.close()
+    return None
 
 
 class FloatingOrbWindow(QWidget):
@@ -639,10 +934,18 @@ class FloatingOrbWindow(QWidget):
         self.input_box.setStyleSheet(
             f"QTextEdit {{ background: transparent; border: none; color: {C['text']}; font-size: {body_fs}px; padding: 2px; }}"
         )
-        self.llm_combo.setStyleSheet(host._api_combo_style())
-        self.reasoning_effort_combo.setStyleSheet(host._api_combo_style())
-        self.session_combo.setStyleSheet(host._api_combo_style())
+        combo_style = ""
+        combo_styler = getattr(host, "_api_combo_style", None)
+        if callable(combo_styler):
+            try:
+                combo_style = str(combo_styler() or "")
+            except Exception:
+                combo_style = ""
+        chat_common.refresh_theme_aware_popup_surfaces(self, combo_style=combo_style)
         self.info_btn.setIcon(_svg_icon("floating_info", _SVG_INFO, color=C["muted"], size=14))
+        self.abort_btn.setIcon(_svg_icon("floating_stop", _SVG_STOP, color=C["danger_text"], size=14))
+        self.send_btn.setIcon(_svg_icon("floating_send", _SVG_SEND, color="#ffffff", size=14))
+        self.ball_btn.setIcon(_svg_icon("floating_ball", _SVG_BOT, color="#ffffff", size=24))
         self.restore_btn.setStyleSheet(host._action_button_style())
         self.tray_btn.setStyleSheet(host._action_button_style(kind="subtle"))
         self.new_session_btn.setStyleSheet(host._action_button_style())
@@ -834,7 +1137,12 @@ class FloatingOrbWindow(QWidget):
     def _render_rows(self, bubbles, stream_text: str):
         bubble_signature = tuple((str(item.get("role") or ""), str(item.get("text") or "")) for item in (bubbles or []))
         busy = bool(getattr(self._host, "_busy", False))
+        session = getattr(self._host, "current_session", None) or {}
+        session_id = str(session.get("id") or "").strip()
+        session_changed = session_id != str(getattr(self, "_last_session_id", "") or "").strip()
+        had_signature = self._last_signature is not None
         signature = (
+            session_id,
             bubble_signature,
             str(stream_text or ""),
             busy,
@@ -842,9 +1150,20 @@ class FloatingOrbWindow(QWidget):
         if signature == self._last_signature:
             return
         host_follow_latest = bool(getattr(self._host, "_follow_latest_user_message", False))
+        turn_auto_jump_getter = getattr(self._host, "_turn_auto_jump_latest_enabled", None)
+        if callable(turn_auto_jump_getter):
+            try:
+                host_turn_auto_jump = bool(turn_auto_jump_getter())
+            except Exception:
+                host_turn_auto_jump = False
+        else:
+            host_turn_auto_jump = bool(getattr(self._host, "_busy", False)) and chat_common.chat_auto_jump_latest_enabled(
+                getattr(self._host, "cfg", None)
+            )
         keep_latest_user = self._focus_latest_user_after_refresh or host_follow_latest
         if bubble_signature == self._last_bubble_signature:
             self._last_signature = signature
+            self._last_session_id = session_id
             self._sync_stream_row(str(stream_text or ""), busy)
             if keep_latest_user:
                 self._focus_latest_user_after_refresh = False
@@ -853,7 +1172,7 @@ class FloatingOrbWindow(QWidget):
                     if callable(follower):
                         follower(False)
                 QTimer.singleShot(0, self._scroll_to_latest_dialogue)
-            else:
+            elif host_turn_auto_jump:
                 QTimer.singleShot(0, self._scroll_to_bottom)
             return
         self._last_signature = signature
@@ -900,6 +1219,7 @@ class FloatingOrbWindow(QWidget):
             self._stream_row = row
             self._sync_message_layout_alignment()
         self._last_bubble_signature = bubble_signature
+        self._last_session_id = session_id
         if keep_latest_user:
             self._focus_latest_user_after_refresh = False
             if host_follow_latest:
@@ -907,7 +1227,7 @@ class FloatingOrbWindow(QWidget):
                 if callable(follower):
                     follower(False)
             QTimer.singleShot(0, self._scroll_to_latest_dialogue)
-        else:
+        elif host_turn_auto_jump or session_changed or not had_signature:
             QTimer.singleShot(0, self._scroll_to_bottom)
 
     def sync_view(self, *, title, subtitle, bubbles, stream_text, status, meta, can_send, can_abort, read_only):
@@ -2075,6 +2395,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 
     def _ensure_launcher_tray_icon(self):
         tray = self._launcher_tray_icon or getattr(self, "_reply_notify_tray", None)
+        created = False
         if tray is None:
             if not QSystemTrayIcon.isSystemTrayAvailable():
                 return None
@@ -2086,6 +2407,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             if icon is None or icon.isNull():
                 icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
             tray = QSystemTrayIcon(icon, self)
+            created = True
         tray.setToolTip("GenericAgent 启动器")
         signal_owner = getattr(self, "_launcher_tray_signal_owner", None)
         if signal_owner is not tray:
@@ -2096,6 +2418,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             self._launcher_tray_signal_owner = tray
         if self._launcher_tray_menu is None:
             menu = QMenu(self)
+            chat_common.apply_menu_popup_theme(menu)
             restore_action = menu.addAction("恢复完整界面")
             restore_action.triggered.connect(self._restore_from_tray_mode)
             show_floating_action = menu.addAction("显示悬浮窗")
@@ -2112,6 +2435,13 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             self._tray_hide_floating_action = hide_floating_action
             self._tray_exit_action = exit_action
         tray.show()
+        if created:
+            marker = getattr(self, "_set_tray_message_ready", None)
+            if callable(marker):
+                try:
+                    marker(tray, False)
+                except Exception:
+                    pass
         self._launcher_tray_icon = tray
         self._reply_notify_tray = tray
         self._refresh_launcher_tray_menu()
@@ -2443,6 +2773,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 
     def _open_floating_session_menu(self, anchor):
         menu = QMenu(self)
+        chat_common.apply_menu_popup_theme(menu)
         current = self.current_session or {}
         current_sid = str(current.get("id") or "").strip()
         pinned = bool(current.get("pinned", False))
@@ -2666,10 +2997,14 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             return
         self._show_floating_chat_window_only()
         if not self._tray_mode_hint_shown:
-            try:
-                tray.showMessage("GenericAgent 启动器", "主窗口已隐藏，可继续使用悬浮对话窗。", QSystemTrayIcon.Information, 1500)
-            except Exception:
-                pass
+            notifier = getattr(self, "_show_tray_message", None)
+            if callable(notifier):
+                notifier(tray, "GenericAgent 启动器", "主窗口已隐藏，可继续使用悬浮对话窗。", timeout_ms=1500)
+            else:
+                try:
+                    tray.showMessage("GenericAgent 启动器", "主窗口已隐藏，可继续使用悬浮对话窗。", QSystemTrayIcon.Information, 1500)
+                except Exception:
+                    pass
             self._tray_mode_hint_shown = True
 
     def _hide_floating_chat_window(self):
@@ -2702,6 +3037,49 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._show_chat_page()
         self._refresh_floating_chat_window()
         self._refresh_launcher_tray_menu()
+        editor = getattr(self, "input_box", None)
+        if editor is not None and (not self._is_channel_process_session()):
+            QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
+
+    def _activate_from_secondary_launch(self):
+        if bool(getattr(self, "_tray_mode_active", False)) or (not self.isVisible()):
+            restorer = getattr(self, "_restore_from_tray_mode", None)
+            if callable(restorer):
+                restorer()
+            return
+        try:
+            state = self.windowState()
+            if state & Qt.WindowMinimized:
+                self.setWindowState((state & ~Qt.WindowMinimized) | Qt.WindowActive)
+        except Exception:
+            try:
+                self.showNormal()
+            except Exception:
+                pass
+        try:
+            self.show()
+        except Exception:
+            pass
+        try:
+            self.raise_()
+        except Exception:
+            pass
+        try:
+            self.activateWindow()
+        except Exception:
+            pass
+        try:
+            self._show_chat_page()
+        except Exception:
+            pass
+        if os.name == "nt":
+            try:
+                hwnd = int(self.winId())
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
         editor = getattr(self, "input_box", None)
         if editor is not None and (not self._is_channel_process_session()):
             QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
@@ -2810,6 +3188,13 @@ def main(agent_dir: str | None = None) -> int:
         app.setWindowIcon(launcher_icon())
     except Exception:
         pass
+    try:
+        instance_guard = _ensure_single_launcher_instance(app)
+    except Exception as e:
+        QMessageBox.critical(None, "启动失败", str(e))
+        return 1
+    if instance_guard is None:
+        return 0
     loaded_cfg = lz.load_config()
     cfg = loaded_cfg if isinstance(loaded_cfg, dict) else {}
     mode = "light" if str(cfg.get("appearance_mode", "light") or "").strip().lower() == "light" else "dark"
@@ -2821,8 +3206,10 @@ def main(agent_dir: str | None = None) -> int:
     try:
         win = QtChatWindow(target)
     except Exception as e:
+        instance_guard.close()
         QMessageBox.critical(None, "启动失败", str(e))
         return 1
+    instance_guard.set_activation_handler(getattr(win, "_activate_from_secondary_launch", None))
     win.show()
     apply_mica(win, dark=(mode == "dark"))
     smoke_exit_ms = str(os.environ.get("GA_LAUNCHER_SMOKE_EXIT_MS") or "").strip()
@@ -2832,7 +3219,10 @@ def main(agent_dir: str | None = None) -> int:
         except Exception:
             delay_ms = 0
         QTimer.singleShot(delay_ms, app.quit)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        instance_guard.close()
 
 
 if __name__ == "__main__":

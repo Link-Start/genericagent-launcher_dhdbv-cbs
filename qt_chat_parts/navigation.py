@@ -478,6 +478,12 @@ class NavigationMixin:
             self.recent_path_label.setText(self.agent_dir if valid else "尚未配置有效的 GenericAgent 目录。")
         if hasattr(self, "recent_card"):
             self.recent_card.setVisible(valid)
+        relayout_recent = getattr(self, "_refresh_recent_directory_card_layout", None)
+        if callable(relayout_recent):
+            try:
+                relayout_recent(defer=True)
+            except Exception:
+                pass
         if hasattr(self, "enter_chat_btn"):
             self._apply_navigation_widget_state(
                 self.enter_chat_btn,

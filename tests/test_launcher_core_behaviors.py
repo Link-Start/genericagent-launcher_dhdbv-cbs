@@ -14,11 +14,12 @@ from unittest import mock
 
 import bridge
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPalette
-from PySide6.QtWidgets import QApplication, QLabel, QToolTip
+from PySide6.QtGui import QColor, QHelpEvent, QImage, QMouseEvent, QPalette
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QToolTip
 from launcher_app import app_icon as launcher_app_icon
 from launcher_app import core as lz
 from launcher_app import theme as launcher_theme
+from launcher_app import window as launcher_window
 from launcher_core_parts import channels as channels_mod
 from launcher_core_parts import conductor_runtime as conductor_runtime_mod
 from launcher_core_parts import model_api
@@ -478,28 +479,133 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
                 launcher_theme.configure_visual_preferences({"theme_visual_preset": preset, "theme_bg_preset": "default"})
                 launcher_theme.apply_tooltip_palette(app)
                 pal = QToolTip.palette()
+                tooltip_bg = QColor(str(launcher_theme.C["layer2"])).name()
+                tooltip_text = QColor(str(launcher_theme.C["text"])).name()
                 self.assertEqual(
                     pal.color(QPalette.Active, QPalette.ToolTipBase).name(),
-                    QColor(str(launcher_theme.C["layer2"])).name(),
+                    tooltip_bg,
                 )
                 self.assertEqual(
                     pal.color(QPalette.Active, QPalette.ToolTipText).name(),
-                    QColor(str(launcher_theme.C["text"])).name(),
+                    tooltip_text,
                 )
                 self.assertEqual(
                     app.palette().color(QPalette.Active, QPalette.ToolTipBase).name(),
-                    QColor(str(launcher_theme.C["layer2"])).name(),
+                    tooltip_bg,
                 )
                 self.assertEqual(
                     app.palette().color(QPalette.Active, QPalette.ToolTipText).name(),
-                    QColor(str(launcher_theme.C["text"])).name(),
+                    tooltip_text,
                 )
+                for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+                    for role in (QPalette.Window, QPalette.Base, QPalette.Button):
+                        self.assertEqual(
+                            app.palette().color(group, role).name(),
+                            tooltip_bg,
+                        )
+                    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText, QPalette.HighlightedText):
+                        self.assertEqual(
+                            app.palette().color(group, role).name(),
+                            tooltip_text,
+                        )
         finally:
             launcher_theme.C.clear()
             launcher_theme.C.update(original_palette)
             launcher_theme._VISUAL_PREFS.clear()
             launcher_theme._VISUAL_PREFS.update(original_prefs)
             launcher_theme.apply_tooltip_palette(app)
+
+    def test_live_tooltip_widget_tracks_theme_switch(self):
+        app = QApplication.instance() or QApplication([])
+        original_palette = dict(launcher_theme.C)
+        original_prefs = dict(launcher_theme._VISUAL_PREFS)
+        tip = QLabel("tooltip text")
+        try:
+            seen_styles = []
+            with mock.patch.object(launcher_theme, "_is_live_tooltip_widget", side_effect=lambda widget: widget is tip):
+                for mode, preset in (("dark", "graphite"), ("light", "paper")):
+                    launcher_theme.set_theme(mode)
+                    launcher_theme.configure_visual_preferences({"theme_visual_preset": preset, "theme_bg_preset": "default"})
+                    launcher_theme.apply_tooltip_palette(app)
+                    app.setStyleSheet(launcher_theme.build_qss())
+                    launcher_theme._apply_live_tooltip_widget_theme(tip, force=True)
+                    tooltip_bg = QColor(str(launcher_theme.C["layer2"])).name()
+                    tooltip_text = QColor(str(launcher_theme.C["text"])).name()
+                    self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Window).name(), tooltip_bg)
+                    self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Base).name(), tooltip_bg)
+                    self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Text).name(), tooltip_text)
+                    self.assertEqual(tip.palette().color(QPalette.Active, QPalette.WindowText).name(), tooltip_text)
+                    self.assertIn(tooltip_bg, tip.styleSheet())
+                    self.assertIn(tooltip_text, tip.styleSheet())
+                    seen_styles.append(tip.styleSheet())
+            self.assertEqual(len(seen_styles), 2)
+            self.assertNotEqual(seen_styles[0], seen_styles[1])
+        finally:
+            tip.deleteLater()
+            launcher_theme.C.clear()
+            launcher_theme.C.update(original_palette)
+            launcher_theme._VISUAL_PREFS.clear()
+            launcher_theme._VISUAL_PREFS.update(original_prefs)
+            launcher_theme.apply_tooltip_palette(app)
+            try:
+                app.setStyleSheet(launcher_theme.build_qss())
+            except Exception:
+                pass
+
+    def test_standard_qtooltip_label_tracks_theme_switch(self):
+        app = QApplication.instance() or QApplication([])
+        original_palette = dict(launcher_theme.C)
+        original_prefs = dict(launcher_theme._VISUAL_PREFS)
+        btn = QPushButton("hover me")
+        btn.setToolTip("tooltip text")
+        btn.resize(140, 40)
+        btn.show()
+        app.processEvents()
+
+        def show_standard_tooltip():
+            center = btn.rect().center()
+            event = QHelpEvent(QEvent.ToolTip, center, btn.mapToGlobal(center))
+            QApplication.sendEvent(btn, event)
+            app.processEvents()
+            for widget in app.topLevelWidgets():
+                if launcher_theme._is_live_tooltip_widget(widget):
+                    return widget
+            return None
+
+        try:
+            seen_styles = []
+            for mode, preset in (("light", "paper"), ("dark", "graphite")):
+                launcher_theme.set_theme(mode)
+                launcher_theme.configure_visual_preferences({"theme_visual_preset": preset, "theme_bg_preset": "default"})
+                launcher_theme.apply_tooltip_palette(app)
+                app.setStyleSheet(launcher_theme.build_qss())
+                tip = show_standard_tooltip()
+                self.assertIsNotNone(tip)
+                tooltip_bg = QColor(str(launcher_theme.C["layer2"])).name()
+                tooltip_text = QColor(str(launcher_theme.C["text"])).name()
+                self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Window).name(), tooltip_bg)
+                self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Base).name(), tooltip_bg)
+                self.assertEqual(tip.palette().color(QPalette.Active, QPalette.Text).name(), tooltip_text)
+                self.assertEqual(tip.palette().color(QPalette.Active, QPalette.WindowText).name(), tooltip_text)
+                self.assertIn(tooltip_bg, tip.styleSheet())
+                self.assertIn(tooltip_text, tip.styleSheet())
+                seen_styles.append(tip.styleSheet())
+            self.assertEqual(len(seen_styles), 2)
+            self.assertNotEqual(seen_styles[0], seen_styles[1])
+        finally:
+            QToolTip.hideText()
+            btn.close()
+            btn.deleteLater()
+            launcher_theme.C.clear()
+            launcher_theme.C.update(original_palette)
+            launcher_theme._VISUAL_PREFS.clear()
+            launcher_theme._VISUAL_PREFS.update(original_prefs)
+            launcher_theme.apply_tooltip_palette(app)
+            try:
+                app.setStyleSheet(launcher_theme.build_qss())
+            except Exception:
+                pass
+            app.processEvents()
 
     def test_apply_mica_syncs_native_caption_text_and_border_colors(self):
         original_palette = dict(launcher_theme.C)
@@ -549,10 +655,12 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
+        self.assertIn('self.settings_theme_auto_jump_latest = QCheckBox("发送或回复时自动跳到最新消息")', src)
         self.assertIn('visual_label = QLabel("主体预设")', src)
         self.assertIn('bg_label = QLabel("背景模式")', src)
         self.assertIn("self.settings_theme_visual_combo = _StablePopupComboBox()", src)
         self.assertIn('visual_preset = str(visual_combo.itemData(visual_combo.currentIndex()) or "graphite").strip()', src)
+        self.assertIn('self.cfg["theme_chat_auto_jump_latest"] = auto_jump_latest', src)
         self.assertIn('self.cfg["theme_visual_preset"] = visual_preset', src)
         self.assertIn("resolve_theme_visual_preset(self.cfg)", src)
         self.assertIn('normalize_theme_background_mode(self.cfg.get("theme_bg_preset"))', src)
@@ -587,6 +695,136 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             shell_src = f.read()
         self.assertIn('refresh_info_popup_style = getattr(self, "_refresh_info_popup_style", None)', shell_src)
         self.assertIn("refresh_info_popup_style()", shell_src)
+
+    def test_theme_application_routes_popup_restyling_through_shared_helper(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        common_path = os.path.join(root, "qt_chat_parts", "common.py")
+        shell_path = os.path.join(root, "qt_chat_parts", "window_shell.py")
+        window_path = os.path.join(root, "launcher_app", "window.py")
+        settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
+        with open(common_path, "r", encoding="utf-8") as f:
+            common_src = f.read()
+        with open(shell_path, "r", encoding="utf-8") as f:
+            shell_src = f.read()
+        with open(window_path, "r", encoding="utf-8") as f:
+            window_src = f.read()
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings_src = f.read()
+        self.assertIn("def combo_popup_view_style() -> str:", common_src)
+        self.assertIn("def combo_popup_container_style() -> str:", common_src)
+        self.assertIn("def menu_popup_style() -> str:", common_src)
+        self.assertIn("def apply_menu_popup_theme(menu: QMenu | None) -> None:", common_src)
+        self.assertIn("def apply_combo_popup_theme(combo: QComboBox | None, *, combo_style: str = \"\") -> None:", common_src)
+        self.assertIn("def refresh_theme_aware_popup_surfaces(root: QWidget | None, *, combo_style: str = \"\") -> None:", common_src)
+        self.assertIn("def _refresh_slash_popup_theme(self):", common_src)
+        self.assertIn("chat_common.refresh_theme_aware_popup_surfaces(self, combo_style=combo_style)", shell_src)
+        self.assertIn("chat_common.refresh_theme_aware_popup_surfaces(self, combo_style=combo_style)", window_src)
+        self.assertIn("chat_common.apply_menu_popup_theme(menu)", settings_src)
+
+    def test_runtime_theme_switch_refreshes_transient_popup_surfaces(self):
+        app = QApplication.instance() or QApplication([])
+        win = None
+        original_palette = dict(launcher_theme.C)
+        original_prefs = dict(launcher_theme._VISUAL_PREFS)
+
+        try:
+            with mock.patch.object(launcher_window.lz, "load_config", return_value={}), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_session_index_warmup", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_local_channel_autostart", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_start_autostart_scheduler", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_lan_interface_autostart", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_startup_update_check", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_startup_install_hint", autospec=True, side_effect=lambda self: None
+            ):
+                win = launcher_window.QtChatWindow(r"E:\\GenericAgent")
+                win._drain_timer.stop()
+                win._server_status_timer.stop()
+                win._subagent_status_timer.stop()
+                win._stream_flush_timer.stop()
+                win.show()
+                app.processEvents()
+
+                floating = win._ensure_floating_chat_window()
+                floating.show()
+                app.processEvents()
+                win._show_settings()
+                app.processEvents()
+                api_add_menu = getattr(win, "_settings_api_add_menu", None)
+                self.assertIsNotNone(api_add_menu)
+
+                win.input_box.set_slash_command_provider(
+                    lambda query, editor=None: [{"command": "/status", "description": "查看当前状态"}]
+                )
+                win._apply_theme("light")
+                light_panel = str(launcher_theme.C["panel"])
+                light_popup_bg = str(launcher_theme.C["layer1"])
+                win.input_box.setPlainText("/st")
+                win.input_box._refresh_slash_command_popup()
+                floating.session_combo.showPopup()
+                app.processEvents()
+
+                popup = getattr(win.input_box, "_slash_popup", None)
+                self.assertIsNotNone(popup)
+                self.assertTrue(popup.isVisible())
+                combo_popup = floating.session_combo.view().window()
+                light_api_menu_style = api_add_menu.styleSheet()
+                light_info_popup_style = win._info_popup.styleSheet()
+                light_slash_style = popup.styleSheet()
+                light_combo_style = floating.session_combo.view().styleSheet()
+                light_combo_popup_style = combo_popup.styleSheet()
+                self.assertIn(light_popup_bg, light_api_menu_style)
+                self.assertEqual(api_add_menu.palette().window().color().name().lower(), QColor(light_popup_bg).name().lower())
+                self.assertIn(light_panel, light_info_popup_style)
+                self.assertIn(light_panel, light_slash_style)
+                self.assertIn(light_popup_bg, light_combo_style)
+                self.assertIn(light_popup_bg, light_combo_popup_style)
+
+                win._apply_theme("dark")
+                app.processEvents()
+
+                dark_panel = str(launcher_theme.C["panel"])
+                dark_popup_bg = str(launcher_theme.C["layer1"])
+                self.assertNotEqual(light_panel, dark_panel)
+                self.assertIn(dark_popup_bg, api_add_menu.styleSheet())
+                self.assertEqual(api_add_menu.palette().window().color().name().lower(), QColor(dark_popup_bg).name().lower())
+                self.assertIn(dark_panel, win._info_popup.styleSheet())
+                self.assertIn(dark_panel, popup.styleSheet())
+                self.assertIn(dark_popup_bg, floating.session_combo.view().styleSheet())
+                self.assertIn(dark_popup_bg, combo_popup.styleSheet())
+                self.assertNotEqual(light_api_menu_style, api_add_menu.styleSheet())
+                self.assertNotEqual(light_info_popup_style, win._info_popup.styleSheet())
+                self.assertNotEqual(light_slash_style, popup.styleSheet())
+                self.assertNotEqual(light_combo_style, floating.session_combo.view().styleSheet())
+                self.assertNotEqual(light_combo_popup_style, combo_popup.styleSheet())
+        finally:
+            launcher_theme.C.clear()
+            launcher_theme.C.update(original_palette)
+            launcher_theme._VISUAL_PREFS.clear()
+            launcher_theme._VISUAL_PREFS.update(original_prefs)
+            common.set_md_css(common._build_md_css())
+            launcher_theme.apply_tooltip_palette(app)
+            if app is not None:
+                try:
+                    app.setStyleSheet(launcher_theme.build_qss())
+                except Exception:
+                    pass
+            if win is not None:
+                try:
+                    win.input_box._hide_slash_command_popup()
+                except Exception:
+                    pass
+                try:
+                    app.removeEventFilter(win)
+                except Exception:
+                    pass
+                win.close()
+                win.deleteLater()
+                app.processEvents()
 
     def test_message_row_uses_custom_theme_avatar_image_when_configured(self):
         app = QApplication.instance() or QApplication([])
@@ -1621,15 +1859,20 @@ tg_bot_token = '123'
     def test_bridge_runtime_anchors_send_to_user_row(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "qt_chat_parts", "bridge_runtime.py")
+        common_path = os.path.join(root, "qt_chat_parts", "common.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
+        with open(common_path, "r", encoding="utf-8") as f:
+            common_src = f.read()
+        self.assertIn("def chat_auto_jump_latest_enabled(cfg: dict | None) -> bool:", common_src)
+        self.assertIn("def _arm_current_turn_auto_jump(self, user_row):", src)
+        self.assertIn("auto_jump = self._chat_auto_jump_latest_enabled()", src)
         self.assertIn('display_text = text or f"[已发送 {len(attachments)} 张图片]"', src)
         self.assertIn('user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)', src)
         self.assertIn('self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)', src)
-        self.assertIn('anchor_setter = getattr(self, "_set_current_turn_user_row", None)', src)
-        self.assertIn("anchor_setter(user_row)", src)
         self.assertIn("self._user_scrolled_up = False", src)
         self.assertIn("self._scroll_row_to_top(user_row, preserve_scroll_state=True)", src)
+        self.assertIn("self._arm_current_turn_auto_jump(user_row)", src)
 
     def test_bridge_build_multimodal_user_content_includes_data_url_for_image_only_turn(self):
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -1936,6 +2179,70 @@ tg_bot_token = '123'
         self.assertIn("/releases/latest", nav_src)
         self.assertIn("GenericAgent.app", nav_src)
         self.assertIn("GenericAgent-windows-x64.exe", nav_src)
+
+    def test_startup_pages_use_scroll_bodies_and_recent_card_can_grow(self):
+        app = QApplication.instance() or QApplication([])
+        win = None
+
+        with mock.patch.object(launcher_window.lz, "load_config", return_value={}), mock.patch.object(
+            launcher_window.lz, "is_valid_agent_dir", return_value=True
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_session_index_warmup", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_local_channel_autostart", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_start_autostart_scheduler", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_lan_interface_autostart", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_startup_update_check", autospec=True, side_effect=lambda self: None
+        ), mock.patch.object(
+            launcher_window.QtChatWindow, "_schedule_startup_install_hint", autospec=True, side_effect=lambda self: None
+        ):
+            win = launcher_window.QtChatWindow(r"E:\\GenericAgent")
+            win._drain_timer.stop()
+            win._server_status_timer.stop()
+            win._subagent_status_timer.stop()
+            win._stream_flush_timer.stop()
+            win.resize(1100, 520)
+            win.show()
+            app.processEvents()
+            initial_recent_card_height = win.recent_card.height()
+
+            for attr_name in ("_welcome_page", "_locate_page", "_official_gui_page"):
+                page = getattr(win, attr_name)
+                scrolls = page.findChildren(launcher_window.QScrollArea)
+                self.assertTrue(scrolls, msg=attr_name)
+
+            for attr_name in ("_locate_page", "_official_gui_page"):
+                page = getattr(win, attr_name)
+                win.pages.setCurrentWidget(page)
+                app.processEvents()
+                scroll = page.findChildren(launcher_window.QScrollArea)[0]
+                self.assertGreater(scroll.verticalScrollBar().maximum(), 0, msg=attr_name)
+
+            long_path = "GenericAgent path with many spaced segments " * 8
+            win.agent_dir = long_path
+            win._refresh_welcome_state()
+            win._show_welcome()
+            app.processEvents()
+            app.processEvents()
+
+            self.assertEqual(win.recent_path_label.text(), long_path)
+            self.assertGreater(win.recent_card.height(), initial_recent_card_height)
+            self.assertGreaterEqual(win.recent_card.height(), win.recent_card.sizeHint().height())
+            self.assertGreaterEqual(win.recent_card.minimumHeight(), 78)
+            self.assertGreaterEqual(win.recent_card.minimumHeight(), win.recent_card.sizeHint().height())
+            self.assertGreater(win.recent_card.maximumHeight(), 78)
+
+        if win is not None:
+            try:
+                app.removeEventFilter(win)
+            except Exception:
+                pass
+            win.close()
+            win.deleteLater()
+            app.processEvents()
 
     def test_spec_uses_local_hooks_dir(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -2424,7 +2731,30 @@ tg_bot_token = '123'
         self.assertIn("_settings_target_write_mykey_text", channel_src)
         self.assertIn("if int(current_token or 0) != int(target_token or 0):", channel_src)
         self.assertIn("远端配置模式", channel_src)
-        self.assertIn('if category in ("api", "channels", "schedule", "usage"):', settings_src)
+        self.assertIn('if category in ("api", "channels", "schedule", "sop", "usage"):', settings_src)
+
+    def test_settings_panel_supports_sop_document_management(self):
+        root = os.path.dirname(os.path.dirname(__file__))
+        settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings_src = f.read()
+        self.assertIn('("sop", "SOP")', settings_src)
+        self.assertIn('"sop": chat_common._SVG_SPARKLE', settings_src)
+        self.assertIn('self._settings_intro(', settings_src)
+        self.assertIn("SOP 文档", settings_src)
+        self.assertIn("self.settings_sop_doc_combo = _StablePopupComboBox()", settings_src)
+        self.assertIn("self.settings_sop_doc_combo.currentIndexChanged.connect(self._load_selected_sop_document)", settings_src)
+        self.assertIn("self.settings_sop_editor = QPlainTextEdit()", settings_src)
+        self.assertIn("self.settings_sop_reload_btn.clicked.connect(self._reload_sop_panel)", settings_src)
+        self.assertIn("self.settings_sop_save_btn.clicked.connect(self._save_selected_sop_document)", settings_src)
+        self.assertIn("def _settings_sop_normalize_relpath", settings_src)
+        self.assertIn("def _settings_target_list_sop_documents", settings_src)
+        self.assertIn("def _settings_target_read_sop_text", settings_src)
+        self.assertIn("def _settings_target_write_sop_text", settings_src)
+        self.assertIn("def _reload_sop_panel", settings_src)
+        self.assertIn('if name == "SKILL.md" or name.endswith("_sop.md"):', settings_src)
+        self.assertIn("SOP 文档会读取并写回", settings_src)
+        self.assertIn('"sop": self._reload_sop_panel', settings_src)
 
     def test_settings_panel_vps_actions_expose_disabled_reason_helpers(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -2927,6 +3257,26 @@ tg_bot_token = '123'
         self.assertIn("3.11 / 3.12", detail)
         self.assertEqual(meta.get("requires_python"), ">=3.10,<3.14")
 
+    def test_probe_python_agent_compat_checks_bridge_boot_path_and_tolerates_missing_llm(self):
+        seen = {}
+
+        def fake_run(args, **kwargs):
+            seen["args"] = list(args)
+            seen["kwargs"] = dict(kwargs)
+            return types.SimpleNamespace(returncode=0, stdout="NO_LLM_OK\n", stderr="")
+
+        with mock.patch.object(python_env, "_run_external_subprocess", side_effect=fake_run):
+            ok, detail = python_env._probe_python_agent_compat("/usr/bin/python3", "/tmp/GenericAgent")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        self.assertEqual(seen["args"][0], "/usr/bin/python3")
+        self.assertEqual(seen["args"][1], "-c")
+        self.assertIn("import requests", seen["args"][2])
+        self.assertIn("agentmain.GeneraticAgent()", seen["args"][2])
+        self.assertIn("except IndexError:", seen["args"][2])
+        self.assertEqual(seen["args"][3], "/tmp/GenericAgent")
+
     def test_channel_registry_includes_terminal_tui_channel(self):
         spec = lz.COMM_CHANNEL_INDEX.get("tui") or {}
         self.assertEqual(spec.get("script"), "tuiapp_v2.py")
@@ -3055,31 +3405,35 @@ tg_bot_token = '123'
         self.assertIn("download_source_checkboxes", src)
         self.assertIn("_on_private_python_source_toggled", src)
 
-    def test_download_flow_has_macos_system_python_guard(self):
+    def test_download_flow_has_macos_project_venv_mode(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "qt_chat_parts", "downloads.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
         self.assertIn("PLATFORM_SUPPORTS_PRIVATE_PYTHON_INSTALLER", src)
-        self.assertIn("mac 版当前不提供私有 Python 安装器", src)
-        self.assertIn("mac 版请使用系统 Python", src)
+        self.assertIn("构建项目虚拟环境", src)
+        self.assertIn("_select_project_venv_seed_python", src)
+        self.assertIn("Homebrew Python 3.11 / 3.12", src)
+        self.assertIn("不会写入系统 Python", src)
 
-    def test_setup_page_mentions_macos_system_python_mode(self):
+    def test_setup_page_mentions_macos_project_venv_mode(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertIn("mac 版当前使用系统 Python", src)
-        self.assertIn("mac 版使用系统 Python", src)
+        self.assertIn("构建项目虚拟环境", src)
+        self.assertIn("不会污染系统 Python", src)
+        self.assertIn("seed Python", src)
+        self.assertNotIn("python / python3 / 常见 Homebrew 绝对路径", src)
 
-    def test_setup_page_uses_read_only_system_python_copy_on_macos(self):
+    def test_setup_page_uses_project_venv_copy_on_macos(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "qt_chat_parts", "setup_pages.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertIn("git clone 过程会在这里实时输出；进入聊天后的依赖检查会在单独窗口展示。", src)
-        self.assertIn("mac 版使用系统 Python，不会下载或管理私有解释器", src)
-        self.assertIn("首次载入时会自动探测 python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。", src)
+        self.assertIn("git clone 和项目虚拟环境构建都会在这里实时输出", src)
+        self.assertIn("只会借用现有 Python 执行 -m venv", src)
+        self.assertIn("python3 / python / 常见 Homebrew 绝对路径", src)
         self.assertIn("留空时会自动尝试 python / python3；mac 下也会补试常见 Homebrew 绝对路径。", src)
         self.assertIn("如果你已有项目虚拟环境，也可以手动填写 venv/bin/python。", src)
 

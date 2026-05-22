@@ -37,11 +37,90 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none;
 
 
 class SetupPagesMixin:
+    def _build_setup_scroll_body(self, *, margins=(36, 28, 36, 28), spacing: int = 16):
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setFrameShape(QFrame.NoFrame)
+        body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }" + _SCROLLBAR_STYLE)
+
+        body = QWidget()
+        body.setStyleSheet("background: transparent;")
+        body_scroll.setWidget(body)
+
+        viewport = body_scroll.viewport()
+        if viewport is not None:
+            viewport.setStyleSheet("background: transparent;")
+
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(*margins)
+        body_layout.setSpacing(spacing)
+        return body_scroll, body, body_layout
+
+    def _refresh_recent_directory_card_layout(self, *, defer: bool = False, attempt: int = 0):
+        if defer:
+            QTimer.singleShot(0, self, lambda: self._refresh_recent_directory_card_layout(attempt=attempt + 1))
+            return
+        label = getattr(self, "recent_path_label", None)
+        card = getattr(self, "recent_card", None)
+        if label is None or card is None:
+            return
+        try:
+            label.updateGeometry()
+        except Exception:
+            pass
+        layout = card.layout()
+        if layout is not None:
+            try:
+                layout.invalidate()
+                layout.activate()
+            except Exception:
+                pass
+        target_height = max(78, int(card.sizeHint().height() or 0))
+        if card.minimumHeight() != target_height:
+            card.setMinimumHeight(target_height)
+        current = card
+        seen = set()
+        welcome_page = getattr(self, "_welcome_page", None)
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            try:
+                if current.layout() is not None:
+                    current.layout().activate()
+            except Exception:
+                pass
+            try:
+                current.updateGeometry()
+                if current is not welcome_page:
+                    current.adjustSize()
+                current.update()
+            except Exception:
+                pass
+            if current is welcome_page:
+                break
+            current = current.parentWidget()
+        pages = getattr(self, "pages", None)
+        if pages is not None:
+            try:
+                pages.updateGeometry()
+                pages.update()
+            except Exception:
+                pass
+        actual_height = int(card.height() or 0)
+        desired_height = max(78, int(card.sizeHint().height() or 0))
+        if actual_height < desired_height and attempt < 2:
+            QTimer.singleShot(0, self, lambda: self._refresh_recent_directory_card_layout(attempt=attempt + 1))
+
     def _build_welcome_page(self) -> QWidget:
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(40, 32, 40, 28)
-        layout.setSpacing(14)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        body_scroll, body, layout = self._build_setup_scroll_body(margins=(40, 32, 40, 28), spacing=14)
+        self.welcome_body_scroll = body_scroll
+        self.welcome_body_widget = body
+        page_layout.addWidget(body_scroll, 1)
 
         brand = QWidget()
         brand_row = QHBoxLayout(brand)
@@ -67,7 +146,7 @@ class SetupPagesMixin:
 
         self.recent_card = QFrame()
         self.recent_card.setObjectName("recentCard")
-        self.recent_card.setFixedHeight(78)
+        self.recent_card.setMinimumHeight(78)
         recent_row = QHBoxLayout(self.recent_card)
         recent_row.setContentsMargins(18, 12, 16, 12)
         recent_info = QVBoxLayout()
@@ -96,7 +175,7 @@ class SetupPagesMixin:
             "我已经下载了 GenericAgent",
             "选择本地目录，立即载入内核",
             self._show_locate,
-            page,
+            body,
         )
         layout.addWidget(locate_card)
 
@@ -105,7 +184,7 @@ class SetupPagesMixin:
             "我还没有，帮我下载",
             "从 GitHub 自动克隆到你指定的位置",
             self._show_download,
-            page,
+            body,
         )
         layout.addWidget(download_card)
 
@@ -114,7 +193,7 @@ class SetupPagesMixin:
             "或许你想试试官方的？",
             "直接拉起上游默认 GUI / 官方发布版桌面端",
             self._show_official_gui_page,
-            page,
+            body,
         )
         layout.addWidget(official_card)
 
@@ -139,11 +218,8 @@ class SetupPagesMixin:
             )
         )
 
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(36, 28, 36, 28)
-        body_layout.setSpacing(16)
-        layout.addWidget(body, 1)
+        body_scroll, _body, body_layout = self._build_setup_scroll_body(margins=(36, 28, 36, 28), spacing=16)
+        layout.addWidget(body_scroll, 1)
 
         target_card = self._panel_card()
         target_box = QVBoxLayout(target_card)
@@ -309,11 +385,8 @@ class SetupPagesMixin:
             )
         )
 
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(36, 28, 36, 28)
-        body_layout.setSpacing(16)
-        layout.addWidget(body, 1)
+        body_scroll, _body, body_layout = self._build_setup_scroll_body(margins=(36, 28, 36, 28), spacing=16)
+        layout.addWidget(body_scroll, 1)
 
         card = self._panel_card()
         card_box = QVBoxLayout(card)
@@ -559,20 +632,10 @@ class SetupPagesMixin:
             )
         )
 
-        body_scroll = QScrollArea()
-        body_scroll.setWidgetResizable(True)
-        body_scroll.setFrameShape(QFrame.NoFrame)
-        body_scroll.setStyleSheet(f"QScrollArea {{ border: none; background: transparent; }}" + _SCROLLBAR_STYLE)
+        body_scroll, body, body_layout = self._build_setup_scroll_body(margins=(36, 28, 36, 16), spacing=16)
         self.download_body_scroll = body_scroll
-        layout.addWidget(body_scroll, 1)
-
-        body = QWidget()
-        body.setStyleSheet("background: transparent;")
         self.download_body_widget = body
-        body_scroll.setWidget(body)
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(36, 28, 36, 16)
-        body_layout.setSpacing(16)
+        layout.addWidget(body_scroll, 1)
 
         card = self._panel_card()
         card_box = QVBoxLayout(card)
@@ -612,6 +675,11 @@ class SetupPagesMixin:
         body_layout.addWidget(card)
 
         supports_private_python = bool(getattr(lz, "PLATFORM_SUPPORTS_PRIVATE_PYTHON_INSTALLER", os.name == "nt"))
+        managed_env_button_text = (
+            self._download_managed_env_button_text()
+            if callable(getattr(self, "_download_managed_env_button_text", None))
+            else ("下载并配置 3.12 虚拟环境" if supports_private_python else "构建项目虚拟环境")
+        )
         deps = self._download_dependency_placeholder()
         deps_card = self._panel_card()
         deps_box = QVBoxLayout(deps_card)
@@ -629,8 +697,9 @@ class SetupPagesMixin:
             deps_desc_text += "如果你不想动系统 Python，可以直接用下面的私有 3.12 虚拟环境安装，它会自己下载并管理一套私有解释器。"
         else:
             deps_desc_text += (
-                "mac 版当前使用系统 Python。下载完成后可直接进入聊天；首次载入时会自动探测 "
-                "python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。"
+                "mac 版不会下载私有解释器，但可以直接用现有 Python 为当前 GenericAgent 构建项目虚拟环境。"
+                "这个过程只会把依赖装进项目 venv，不会污染系统 Python。"
+                "seed Python 会优先复用你已配置的 python_exe，否则自动尝试 python3 / python / 常见 Homebrew 绝对路径。"
             )
         deps_desc = QLabel(deps_desc_text)
         deps_desc.setWordWrap(True)
@@ -685,7 +754,7 @@ class SetupPagesMixin:
         log_hint = QLabel(
             "git clone、私有 Python 安装和 venv 构建都会在这里实时输出"
             if supports_private_python
-            else "git clone 过程会在这里实时输出；进入聊天后的依赖检查会在单独窗口展示。"
+            else "git clone 和项目虚拟环境构建都会在这里实时输出；进入聊天后的依赖检查会在单独窗口展示。"
         )
         log_hint.setObjectName("mutedText")
         log_head.addWidget(log_hint, 0)
@@ -711,7 +780,7 @@ class SetupPagesMixin:
         private_hint = (
             "私有 3.12 环境会下载到当前 GenericAgent 目录内，只供启动器使用，不会改系统 PATH。"
             if supports_private_python
-            else "mac 版当前使用系统 Python，不提供私有 3.12 安装器。下载完成后可直接进入聊天；首次载入时会自动探测 python / python3 / 常见 Homebrew 绝对路径 / venv/bin/python，并补齐依赖。"
+            else "mac 版会直接在当前 GenericAgent 目录里构建项目虚拟环境；只会借用现有 Python 执行 -m venv，不会把依赖写进系统 Python，也不会改系统 PATH。"
         )
         self.download_private_hint = QLabel(private_hint)
         self.download_private_hint.setWordWrap(True)
@@ -721,7 +790,7 @@ class SetupPagesMixin:
         sources_hint = (
             "Python 安装包下载源（可多选；只会尝试你勾选的源）"
             if supports_private_python
-            else "mac 版使用系统 Python，不会下载或管理私有解释器；如果你已有项目虚拟环境，也可以在“载入内核”页手动指定它的 Python 可执行文件。"
+            else "mac 会优先使用已配置且存在的 python_exe；否则依次尝试 python3 / python / 常见 Homebrew 绝对路径。若已有项目虚拟环境，也可以在“载入内核”页手动指定它的 Python 可执行文件。"
         )
         self.download_sources_hint = QLabel(sources_hint)
         self.download_sources_hint.setWordWrap(True)
@@ -752,17 +821,16 @@ class SetupPagesMixin:
         self.download_btn.setFixedHeight(44)
         self.download_btn.clicked.connect(self._start_download_repo)
         actions.addWidget(self.download_btn, 1)
-        if supports_private_python:
-            self.download_private_btn = QPushButton("下载并配置 3.12 虚拟环境")
-            self.download_private_btn.setStyleSheet(self._action_button_style())
-            self.download_private_btn.setFixedHeight(44)
-            self.download_private_btn.clicked.connect(
-                lambda: self._start_download_repo(
-                    private_python=True,
-                    private_only=bool(getattr(self, "download_private_only_checkbox", None) and self.download_private_only_checkbox.isChecked()),
-                )
+        self.download_private_btn = QPushButton(managed_env_button_text)
+        self.download_private_btn.setStyleSheet(self._action_button_style())
+        self.download_private_btn.setFixedHeight(44)
+        self.download_private_btn.clicked.connect(
+            lambda: self._start_download_repo(
+                private_python=True,
+                private_only=bool(getattr(self, "download_private_only_checkbox", None) and self.download_private_only_checkbox.isChecked()),
             )
-            actions.addWidget(self.download_private_btn, 1)
+        )
+        actions.addWidget(self.download_private_btn, 1)
         footer_box.addLayout(actions)
         layout.addWidget(footer, 0)
         self._restyle_download_page_widgets()
@@ -792,3 +860,4 @@ class SetupPagesMixin:
         self.setWindowTitle("GenericAgent 启动器")
         self.pages.setCurrentWidget(self._welcome_page)
         self._refresh_welcome_state()
+        self._refresh_recent_directory_card_layout(defer=True)

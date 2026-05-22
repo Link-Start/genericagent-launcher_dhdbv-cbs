@@ -6,15 +6,17 @@ import os
 import re
 
 from PySide6.QtCore import QByteArray, QPoint, QSize, QTimer, Qt
-from PySide6.QtGui import QCursor, QIcon, QImage, QKeyEvent, QPainter, QPainterPath, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QKeyEvent, QPainter, QPainterPath, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QTextBrowser,
@@ -733,6 +735,127 @@ def refresh_svg_icons(root: QWidget | None) -> None:
             widget.setPixmap(_svg_icon(key, svg_template, color=_svg_resolve_color(color), size=size).pixmap(size, size))
 
 
+def combo_popup_view_style() -> str:
+    return (
+        f"QAbstractItemView {{ background: {C['layer1']}; color: {C['text']}; "
+        f"border: 1px solid {C['stroke_hover']}; border-radius: {F['radius_md']}px; padding: 4px; "
+        f"selection-background-color: {C['accent_soft_bg']}; selection-color: {C['text']}; outline: 0; }}"
+    )
+
+
+def combo_popup_container_style() -> str:
+    return f"QFrame {{ background: {C['layer1']}; color: {C['text']}; border: none; }}"
+
+
+def menu_popup_style() -> str:
+    return (
+        f"QMenu {{ background: {C['layer1']}; color: {C['text']}; border: 1px solid {C['stroke_hover']}; "
+        f"border-radius: {F['radius_md']}px; padding: 4px; }}"
+        f"QMenu::item {{ padding: 7px 16px; border-radius: {max(4, int(F['radius_sm']))}px; }}"
+        f"QMenu::item:selected {{ background: {C['accent_soft_bg']}; color: {C['text']}; }}"
+        f"QMenu::separator {{ height: 1px; background: {C['stroke_default']}; margin: 4px 6px; }}"
+    )
+
+
+def apply_menu_popup_theme(menu: QMenu | None) -> None:
+    if menu is None:
+        return
+    try:
+        menu.setStyleSheet(menu_popup_style())
+    except Exception:
+        pass
+    try:
+        pal = QPalette(menu.palette())
+        bg = QColor(str(C["layer1"]))
+        text = QColor(str(C["text"]))
+        highlight = QColor(str(C["accent_soft_bg"]))
+        for group in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+            pal.setColor(group, QPalette.Window, bg)
+            pal.setColor(group, QPalette.Base, bg)
+            pal.setColor(group, QPalette.Button, bg)
+            pal.setColor(group, QPalette.Text, text)
+            pal.setColor(group, QPalette.WindowText, text)
+            pal.setColor(group, QPalette.ButtonText, text)
+            pal.setColor(group, QPalette.Highlight, highlight)
+            pal.setColor(group, QPalette.HighlightedText, text)
+        menu.setPalette(pal)
+    except Exception:
+        pass
+
+
+def apply_combo_popup_theme(combo: QComboBox | None, *, combo_style: str = "") -> None:
+    if combo is None:
+        return
+    if combo_style:
+        try:
+            combo.setStyleSheet(combo_style)
+        except Exception:
+            pass
+    try:
+        view = combo.view()
+    except Exception:
+        view = None
+    if view is None:
+        return
+    popup_style = combo_popup_view_style()
+    try:
+        view.setStyleSheet(popup_style)
+    except Exception:
+        pass
+    try:
+        popup = view.window()
+    except Exception:
+        popup = None
+    if popup is not None and popup is not view:
+        try:
+            popup.setStyleSheet(combo_popup_container_style())
+        except Exception:
+            pass
+    try:
+        viewport = view.viewport()
+        if viewport is not None:
+            viewport.setStyleSheet(f"background: {C['layer1']}; color: {C['text']};")
+    except Exception:
+        pass
+
+
+def refresh_theme_aware_popup_surfaces(root: QWidget | None, *, combo_style: str = "") -> None:
+    if root is None:
+        return
+    widgets = [root]
+    widgets.extend(root.findChildren(QWidget))
+    for widget in widgets:
+        if isinstance(widget, QMenu):
+            apply_menu_popup_theme(widget)
+            continue
+        if isinstance(widget, QComboBox):
+            apply_combo_popup_theme(widget, combo_style=combo_style)
+            continue
+        for hook_name in ("_refresh_slash_popup_theme", "_refresh_info_popup_style"):
+            refresher = getattr(widget, hook_name, None)
+            if not callable(refresher):
+                continue
+            try:
+                refresher()
+            except Exception:
+                pass
+
+
+def chat_auto_jump_latest_enabled(cfg: dict | None) -> bool:
+    data = cfg if isinstance(cfg, dict) else {}
+    value = data.get("theme_chat_auto_jump_latest", True)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    if text in ("0", "false", "no", "off", "disable", "disabled", "关", "关闭", "否"):
+        return False
+    if text in ("1", "true", "yes", "on", "enable", "enabled", "开", "开启", "是"):
+        return True
+    return bool(value)
+
+
 def _avatar_role_key(role: str) -> str:
     return "user" if str(role or "").strip().lower() == "user" else "assistant"
 
@@ -959,7 +1082,6 @@ class InputTextEdit(QTextEdit):
         popup = getattr(self, "_slash_popup", None)
         if popup is not None:
             return popup
-        hover_bg = C.get("hover") or C.get("field_bg") or C.get("surface") or "#eef4ff"
         host = self.window() if isinstance(self.window(), QWidget) else self
         popup = QListWidget(host)
         popup.setWindowFlags(Qt.FramelessWindowHint)
@@ -970,16 +1092,35 @@ class InputTextEdit(QTextEdit):
         popup.setSelectionBehavior(QAbstractItemView.SelectRows)
         popup.setUniformItemSizes(True)
         popup.setMouseTracking(True)
-        popup.setStyleSheet(
+        popup.itemClicked.connect(self._accept_slash_popup_item)
+        self._slash_popup = popup
+        self._refresh_slash_popup_theme()
+        return popup
+
+    def _slash_popup_style_sheet(self) -> str:
+        hover_bg = C.get("hover") or C.get("field_bg") or C.get("surface") or "#eef4ff"
+        return (
             f"QListWidget {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['stroke_default']}; "
             f"border-radius: {F['radius_md']}px; padding: 6px; outline: none; }}"
             f"QListWidget::item {{ padding: 8px 10px; border-radius: {max(4, int(F['radius_sm']))}px; }}"
             f"QListWidget::item:selected {{ background: {hover_bg}; color: {C['text']}; }}"
             f"QListWidget::item:hover {{ background: {hover_bg}; }}"
         )
-        popup.itemClicked.connect(self._accept_slash_popup_item)
-        self._slash_popup = popup
-        return popup
+
+    def _refresh_slash_popup_theme(self):
+        popup = getattr(self, "_slash_popup", None)
+        if popup is None:
+            return
+        try:
+            popup.setStyleSheet(self._slash_popup_style_sheet())
+        except Exception:
+            pass
+        try:
+            viewport = popup.viewport()
+            if viewport is not None:
+                viewport.setStyleSheet(f"background: {C['panel']}; color: {C['text']};")
+        except Exception:
+            pass
 
     def _slash_query_text(self) -> str:
         if bool(getattr(self, "isReadOnly", lambda: False)()):

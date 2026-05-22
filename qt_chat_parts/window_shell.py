@@ -7,7 +7,6 @@ import time
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -514,25 +513,14 @@ class WindowShellMixin:
                         pass
                     break
         chat_common.refresh_svg_icons(self)
+        combo_style = ""
         combo_styler = getattr(self, "_api_combo_style", None)
         if callable(combo_styler):
-            combo_style = combo_styler()
-            popup_style = (
-                f"QAbstractItemView {{ background: {C['layer1']}; color: {C['text']}; "
-                f"border: 1px solid {C['stroke_hover']}; border-radius: {F['radius_md']}px; padding: 4px; "
-                f"selection-background-color: {C['accent_soft_bg']}; selection-color: {C['text']}; outline: 0; }}"
-            )
-            for combo in self.findChildren(QComboBox):
-                try:
-                    combo.setStyleSheet(combo_style)
-                    view = combo.view()
-                    if view is not None:
-                        view.setStyleSheet(popup_style)
-                        vp = view.viewport()
-                        if vp is not None:
-                            vp.setStyleSheet(f"background: {C['layer1']}; color: {C['text']};")
-                except Exception:
-                    pass
+            try:
+                combo_style = str(combo_styler() or "")
+            except Exception:
+                combo_style = ""
+        chat_common.refresh_theme_aware_popup_surfaces(self, combo_style=combo_style)
         self._restyle_download_page_widgets()
         ib = getattr(self, "input_box", None)
         if ib is not None:
@@ -604,7 +592,7 @@ class WindowShellMixin:
         body_scroll = getattr(self, "download_body_scroll", None)
         if body_scroll is not None:
             try:
-                body_scroll.setStyleSheet(f"QScrollArea {{ border: none; background: transparent; }}" + _SCROLLBAR_STYLE)
+                body_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }" + _SCROLLBAR_STYLE)
                 body_scroll.viewport().setStyleSheet(f"background: {C['bg']};")
             except Exception:
                 pass
@@ -637,6 +625,7 @@ class WindowShellMixin:
 
     def _open_functions_menu(self):
         menu = QMenu(self)
+        chat_common.apply_menu_popup_theme(menu)
         auto_on = bool(self.cfg.get("autonomous_enabled", False))
         settings_action = menu.addAction(chat_common._svg_icon("menu_settings", chat_common._SVG_SETTINGS, color=C["text_soft"], size=16), "设置")
         welcome_action = menu.addAction(chat_common._svg_icon("menu_home", chat_common._SVG_HOME, color=C["text_soft"], size=16), "欢迎页")

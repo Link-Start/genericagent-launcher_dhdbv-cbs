@@ -722,7 +722,12 @@ def _probe_python_agent_compat(py, agent_dir):
         "os.chdir(agent_dir)\n"
         "sys.path.insert(0, agent_dir)\n"
         "import agentmain\n"
-        "print('OK')\n"
+        "try:\n"
+        "    agentmain.GeneraticAgent()\n"
+        "except IndexError:\n"
+        "    print('NO_LLM_OK')\n"
+        "else:\n"
+        "    print('OK')\n"
     )
     try:
         r = _run_external_subprocess(
@@ -738,7 +743,8 @@ def _probe_python_agent_compat(py, agent_dir):
         )
     except Exception as e:
         return False, str(e)
-    if r.returncode == 0 and "OK" in (r.stdout or ""):
+    stdout_text = str(r.stdout or "")
+    if r.returncode == 0 and ("OK" in stdout_text or "NO_LLM_OK" in stdout_text):
         return True, ""
     detail = (r.stderr or r.stdout or "").strip()
     if detail:

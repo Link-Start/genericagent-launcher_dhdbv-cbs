@@ -361,6 +361,7 @@ class SettingsPanelMixin:
             "channels": chat_common._SVG_MESSAGE,
             "vps": chat_common._SVG_SERVER,
             "schedule": chat_common._SVG_CLOCK,
+            "sop": chat_common._SVG_SPARKLE,
             "personal": chat_common._SVG_PUZZLE,
             "theme": chat_common._SVG_SWATCH,
             "usage": chat_common._SVG_RECEIPT,
@@ -391,6 +392,7 @@ class SettingsPanelMixin:
         if button is None:
             return None
         menu = QMenu(button)
+        chat_common.apply_menu_popup_theme(menu)
         for format_key, label in self._api_add_menu_specs():
             action = menu.addAction(str(label))
             action.triggered.connect(lambda _checked=False, key=format_key: self._qt_api_add_channel(key))
@@ -681,6 +683,7 @@ class SettingsPanelMixin:
             ("channels", "通讯渠道"),
             ("vps", "VPS 管理"),
             ("schedule", "定时任务"),
+            ("sop", "SOP"),
             ("personal", "个性设置"),
             ("theme", "主题设置"),
             ("usage", "使用日志"),
@@ -1276,6 +1279,74 @@ class SettingsPanelMixin:
         sch_layout.addWidget(schedule_card)
         sch_layout.addStretch(1)
 
+        sop_layout = self._settings_pages["sop"]["layout"]
+        sop_layout.addWidget(
+            self._settings_intro(
+                "SOP 文档",
+                "这里直接查看和编辑当前 agant `memory/` 下的 SOP / Skill 文档，交互保持和现有设置页一致的轻量风格。",
+            )
+        )
+        sop_card = self._panel_card()
+        sop_box = QVBoxLayout(sop_card)
+        sop_box.setContentsMargins(20, 18, 20, 18)
+        sop_box.setSpacing(10)
+        sop_title = QLabel("文档编辑器")
+        sop_title.setObjectName("cardTitle")
+        sop_box.addWidget(sop_title)
+        sop_desc = QLabel("这里只显示上游约定的 `*_sop.md` 与 `SKILL.md`，避免把整块文件系统直接暴露进设置页。")
+        sop_desc.setWordWrap(True)
+        sop_desc.setObjectName("cardDesc")
+        sop_box.addWidget(sop_desc)
+        self.settings_sop_notice = QLabel("")
+        self.settings_sop_notice.setWordWrap(True)
+        self.settings_sop_notice.setObjectName("mutedText")
+        sop_box.addWidget(self.settings_sop_notice)
+
+        sop_doc_row = QHBoxLayout()
+        sop_doc_row.setSpacing(8)
+        sop_doc_label = QLabel("当前文档")
+        sop_doc_label.setMinimumWidth(92)
+        sop_doc_label.setObjectName("bodyText")
+        sop_doc_row.addWidget(sop_doc_label, 0)
+        self.settings_sop_doc_combo = _StablePopupComboBox()
+        self._apply_theme_combo_style(self.settings_sop_doc_combo)
+        self.settings_sop_doc_combo.currentIndexChanged.connect(self._load_selected_sop_document)
+        sop_doc_row.addWidget(self.settings_sop_doc_combo, 1)
+        self.settings_sop_reload_btn = QPushButton("重新读取")
+        self.settings_sop_reload_btn.setStyleSheet(self._action_button_style())
+        self.settings_sop_reload_btn.clicked.connect(self._reload_sop_panel)
+        sop_doc_row.addWidget(self.settings_sop_reload_btn, 0)
+        self.settings_sop_save_btn = QPushButton("保存文档")
+        self.settings_sop_save_btn.setStyleSheet(self._action_button_style(primary=True))
+        self.settings_sop_save_btn.clicked.connect(self._save_selected_sop_document)
+        sop_doc_row.addWidget(self.settings_sop_save_btn, 0)
+        sop_box.addLayout(sop_doc_row)
+
+        self.settings_sop_summary_label = QLabel("")
+        self.settings_sop_summary_label.setObjectName("softTextSmall")
+        self.settings_sop_summary_label.setWordWrap(True)
+        sop_box.addWidget(self.settings_sop_summary_label)
+
+        sop_path_row = QHBoxLayout()
+        sop_path_row.setSpacing(8)
+        sop_path_label = QLabel("文档路径")
+        sop_path_label.setMinimumWidth(92)
+        sop_path_label.setObjectName("bodyText")
+        sop_path_row.addWidget(sop_path_label, 0)
+        self.settings_sop_path_value = QLineEdit()
+        self.settings_sop_path_value.setReadOnly(True)
+        self.settings_sop_path_value.setPlaceholderText("当前还没有可用的 SOP 文档。")
+        self._fluent_input(self.settings_sop_path_value)
+        sop_path_row.addWidget(self.settings_sop_path_value, 1)
+        sop_box.addLayout(sop_path_row)
+
+        self.settings_sop_editor = QPlainTextEdit()
+        self.settings_sop_editor.setPlaceholderText("选择一个 SOP / Skill 文档后即可在这里查看和编辑。")
+        self.settings_sop_editor.setMinimumHeight(360)
+        sop_box.addWidget(self.settings_sop_editor)
+        sop_layout.addWidget(sop_card)
+        sop_layout.addStretch(1)
+
         personal_layout = self._settings_pages["personal"]["layout"]
         personal_layout.addWidget(
             self._settings_intro(
@@ -1465,6 +1536,13 @@ class SettingsPanelMixin:
         self.settings_theme_notice.setWordWrap(True)
         self.settings_theme_notice.setObjectName("mutedText")
         theme_box.addWidget(self.settings_theme_notice)
+
+        self.settings_theme_auto_jump_latest = QCheckBox("发送或回复时自动跳到最新消息")
+        theme_box.addWidget(self.settings_theme_auto_jump_latest)
+        auto_jump_desc = QLabel("默认开启。关闭后，会保留你当前查看的位置，不再因为发送消息或 AI 流式回复而强制跳转。")
+        auto_jump_desc.setWordWrap(True)
+        auto_jump_desc.setObjectName("softTextSmall")
+        theme_box.addWidget(auto_jump_desc)
 
         font_row = QHBoxLayout()
         font_row.setSpacing(8)
@@ -1901,9 +1979,346 @@ class SettingsPanelMixin:
 
     def _settings_category_scope_mode(self, key: str):
         category = str(key or "").strip().lower()
-        if category in ("api", "channels", "schedule", "usage"):
+        if category in ("api", "channels", "schedule", "sop", "usage"):
             return "target"
         return "local"
+
+    def _settings_sop_normalize_relpath(self, relpath: str) -> str:
+        text = str(relpath or "").strip().replace("\\", "/")
+        if not text or text.startswith("/"):
+            return ""
+        normalized = os.path.normpath(text).replace("\\", "/")
+        if normalized in (".", "..") or normalized.startswith("../"):
+            return ""
+        if not normalized.startswith("memory/"):
+            return ""
+        name = os.path.basename(normalized)
+        if name == "SKILL.md" or name.endswith("_sop.md"):
+            return normalized
+        return ""
+
+    def _settings_sop_label(self, relpath: str) -> str:
+        normalized = self._settings_sop_normalize_relpath(relpath)
+        if not normalized:
+            return ""
+        return normalized[len("memory/"):] if normalized.startswith("memory/") else normalized
+
+    def _settings_target_list_sop_documents(self):
+        ctx = self._settings_target_context()
+        docs: list[dict[str, str]] = []
+        if not bool(ctx.get("is_remote")):
+            if not lz.is_valid_agent_dir(self.agent_dir):
+                return docs, "请先选择有效的 GenericAgent 目录。"
+            memory_dir = os.path.join(self.agent_dir, "memory")
+            if not os.path.isdir(memory_dir):
+                return docs, "当前目录下未找到 `memory/`，暂时没有可用的 SOP 文档。"
+            seen = set()
+            for root_dir, dir_names, file_names in os.walk(memory_dir):
+                dir_names[:] = sorted(dir_names)
+                for name in sorted(file_names):
+                    if name != "SKILL.md" and (not name.endswith("_sop.md")):
+                        continue
+                    abs_path = os.path.join(root_dir, name)
+                    relpath = os.path.relpath(abs_path, self.agent_dir).replace("\\", "/")
+                    normalized = self._settings_sop_normalize_relpath(relpath)
+                    if (not normalized) or normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    docs.append({"relpath": normalized, "label": self._settings_sop_label(normalized)})
+            docs.sort(key=lambda item: str(item.get("label") or "").lower())
+            return docs, ""
+
+        dev = ctx.get("device") or {}
+        client, err = self._settings_target_open_remote_client(dev, timeout=10)
+        if client is None:
+            return docs, err
+        try:
+            remote_root = self._settings_target_remote_agent_dir(dev).rstrip("/")
+            remote_memory_dir = remote_root + "/memory"
+            cmd = (
+                f"if [ ! -d {shlex.quote(remote_memory_dir)} ]; then exit 7; fi; "
+                f"find {shlex.quote(remote_memory_dir)} -type f \\( -name '*_sop.md' -o -name 'SKILL.md' \\) -print | LC_ALL=C sort"
+            )
+            rc, out, err_text = self._vps_exec_remote(client, cmd, timeout=20)
+            if rc != 0:
+                if int(rc) == 7:
+                    return docs, f"{self._settings_target_display_path('memory')} 下未找到可用的 SOP 文档。"
+                detail = str(err_text or out or "").strip()
+                return docs, detail or "远端 SOP 文档列表读取失败。"
+            prefix = remote_root.rstrip("/") + "/"
+            seen = set()
+            for line in str(out or "").splitlines():
+                raw_path = str(line or "").strip()
+                if (not raw_path) or (not raw_path.startswith(prefix)):
+                    continue
+                relpath = raw_path[len(prefix):].replace("\\", "/")
+                normalized = self._settings_sop_normalize_relpath(relpath)
+                if (not normalized) or normalized in seen:
+                    continue
+                seen.add(normalized)
+                docs.append({"relpath": normalized, "label": self._settings_sop_label(normalized)})
+            docs.sort(key=lambda item: str(item.get("label") or "").lower())
+            return docs, ""
+        except Exception as e:
+            return docs, str(e)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _settings_target_read_sop_text(self, relpath: str):
+        normalized = self._settings_sop_normalize_relpath(relpath)
+        if not normalized:
+            return False, "", self._settings_target_display_path("memory"), "当前选择的 SOP 文档路径无效。"
+        ctx = self._settings_target_context()
+        if not bool(ctx.get("is_remote")):
+            if not lz.is_valid_agent_dir(self.agent_dir):
+                return False, "", self._settings_target_display_path(normalized), "请先选择有效的 GenericAgent 目录。"
+            local_path = os.path.join(self.agent_dir, normalized.replace("/", os.sep))
+            try:
+                with open(local_path, "r", encoding="utf-8", errors="replace") as f:
+                    return True, f.read(), local_path, ""
+            except Exception as e:
+                return False, "", local_path, str(e)
+
+        dev = ctx.get("device") or {}
+        client, err = self._settings_target_open_remote_client(dev, timeout=10)
+        if client is None:
+            return False, "", self._settings_target_display_path(normalized), err
+        try:
+            remote_root = self._settings_target_remote_agent_dir(dev).rstrip("/")
+            remote_fp = remote_root + "/" + normalized
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(remote_fp, "rb") as fp:
+                    raw = fp.read()
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            text = raw.decode("utf-8", errors="replace") if raw else ""
+            return True, text, self._settings_target_display_path(normalized), ""
+        except Exception as e:
+            return False, "", self._settings_target_display_path(normalized), str(e)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _settings_target_write_sop_text(self, relpath: str, text: str):
+        normalized = self._settings_sop_normalize_relpath(relpath)
+        if not normalized:
+            return False, self._settings_target_display_path("memory"), "当前选择的 SOP 文档路径无效。"
+        body = str(text or "")
+        ctx = self._settings_target_context()
+        if not bool(ctx.get("is_remote")):
+            if not lz.is_valid_agent_dir(self.agent_dir):
+                return False, self._settings_target_display_path(normalized), "请先选择有效的 GenericAgent 目录。"
+            local_path = os.path.join(self.agent_dir, normalized.replace("/", os.sep))
+            try:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, "w", encoding="utf-8") as f:
+                    f.write(body)
+                return True, local_path, ""
+            except Exception as e:
+                return False, local_path, str(e)
+
+        dev = ctx.get("device") or {}
+        client, err = self._settings_target_open_remote_client(dev, timeout=12)
+        if client is None:
+            return False, self._settings_target_display_path(normalized), err
+        try:
+            remote_root = self._settings_target_remote_agent_dir(dev).rstrip("/")
+            remote_fp = remote_root + "/" + normalized
+            parent_dir = remote_fp.rsplit("/", 1)[0]
+            rc, _out, mkdir_err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(parent_dir)}", timeout=20)
+            if rc != 0:
+                base_err = "远端 SOP 文档目录准备失败。"
+                return False, self._settings_target_display_path(normalized), str(mkdir_err or base_err).strip() or base_err
+            tmp_name = f".launcher_sop.tmp.{int(time.time() * 1000)}"
+            write_fp = parent_dir.rstrip("/") + "/" + tmp_name
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(write_fp, "wb") as fp:
+                    fp.write(body.encode("utf-8"))
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            mv_cmd = f"mv -f {shlex.quote(write_fp)} {shlex.quote(remote_fp)}"
+            rc, _out, mv_err = self._vps_exec_remote(client, mv_cmd, timeout=20)
+            if rc != 0:
+                base_err = "写入远端 SOP 文档失败。"
+                return False, self._settings_target_display_path(normalized), str(mv_err or base_err).strip() or base_err
+            return True, self._settings_target_display_path(normalized), ""
+        except Exception as e:
+            return False, self._settings_target_display_path(normalized), str(e)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _current_settings_sop_relpath(self) -> str:
+        combo = getattr(self, "settings_sop_doc_combo", None)
+        if combo is None:
+            return str(getattr(self, "_settings_sop_selected_relpath", "") or "").strip()
+        try:
+            value = combo.currentData()
+        except Exception:
+            value = None
+        if value in (None, ""):
+            try:
+                index = int(combo.currentIndex())
+            except Exception:
+                index = -1
+            if index >= 0:
+                try:
+                    value = combo.itemData(index)
+                except Exception:
+                    value = None
+        return self._settings_sop_normalize_relpath(str(value or getattr(self, "_settings_sop_selected_relpath", "") or "").strip())
+
+    def _sync_settings_sop_doc_combo(self, docs, preferred_relpath: str = "") -> str:
+        combo = getattr(self, "settings_sop_doc_combo", None)
+        if combo is None:
+            return ""
+        items = list(docs or [])
+        relpaths = [self._settings_sop_normalize_relpath(item.get("relpath")) for item in items if isinstance(item, dict)]
+        relpaths = [item for item in relpaths if item]
+        target_relpath = self._settings_sop_normalize_relpath(preferred_relpath)
+        if target_relpath not in relpaths:
+            target_relpath = relpaths[0] if relpaths else ""
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for item in items:
+                relpath = self._settings_sop_normalize_relpath(item.get("relpath"))
+                if not relpath:
+                    continue
+                combo.addItem(str(item.get("label") or self._settings_sop_label(relpath)), relpath)
+            if target_relpath:
+                index = combo.findData(target_relpath)
+                combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+        return target_relpath
+
+    def _load_selected_sop_document(self, *_args):
+        relpath = self._current_settings_sop_relpath()
+        editor = getattr(self, "settings_sop_editor", None)
+        notice = getattr(self, "settings_sop_notice", None)
+        path_edit = getattr(self, "settings_sop_path_value", None)
+        save_btn = getattr(self, "settings_sop_save_btn", None)
+        reload_btn = getattr(self, "settings_sop_reload_btn", None)
+        if not relpath:
+            if editor is not None:
+                editor.clear()
+                try:
+                    editor.document().setModified(False)
+                except Exception:
+                    pass
+                editor.setReadOnly(True)
+            if path_edit is not None:
+                path_edit.clear()
+            if notice is not None:
+                notice.setText("当前目标下还没有可用的 SOP / Skill 文档。")
+            if save_btn is not None:
+                save_btn.setEnabled(False)
+            if reload_btn is not None:
+                reload_btn.setEnabled(False)
+            self._settings_sop_selected_relpath = ""
+            return
+        ok, text, display_path, err = self._settings_target_read_sop_text(relpath)
+        if path_edit is not None:
+            path_edit.setText(str(display_path or ""))
+        if not ok:
+            if editor is not None:
+                editor.clear()
+                try:
+                    editor.document().setModified(False)
+                except Exception:
+                    pass
+                editor.setReadOnly(True)
+            if notice is not None:
+                notice.setText(str(err or "读取 SOP 文档失败。"))
+            if save_btn is not None:
+                save_btn.setEnabled(False)
+            if reload_btn is not None:
+                reload_btn.setEnabled(True)
+            return
+        if editor is not None:
+            editor.setReadOnly(False)
+            editor.setPlainText(str(text or ""))
+            try:
+                editor.document().setModified(False)
+            except Exception:
+                pass
+        if notice is not None:
+            notice.setText(f"已载入：{self._settings_sop_label(relpath) or relpath}")
+        if save_btn is not None:
+            save_btn.setEnabled(True)
+        if reload_btn is not None:
+            reload_btn.setEnabled(True)
+        self._settings_sop_selected_relpath = relpath
+
+    def _save_selected_sop_document(self):
+        relpath = self._current_settings_sop_relpath()
+        editor = getattr(self, "settings_sop_editor", None)
+        notice = getattr(self, "settings_sop_notice", None)
+        if (not relpath) or editor is None:
+            if notice is not None:
+                notice.setText("请先选择一个可编辑的 SOP 文档。")
+            return
+        ok, display_path, err = self._settings_target_write_sop_text(relpath, editor.toPlainText())
+        if not ok:
+            message = str(err or "保存 SOP 文档失败。")
+            if notice is not None:
+                notice.setText(message)
+            setter = getattr(self, "_set_status", None)
+            if callable(setter):
+                try:
+                    setter(message)
+                except Exception:
+                    pass
+            return
+        try:
+            editor.document().setModified(False)
+        except Exception:
+            pass
+        if notice is not None:
+            notice.setText(f"已保存：{display_path}")
+        setter = getattr(self, "_set_status", None)
+        if callable(setter):
+            try:
+                setter("SOP 文档已保存。")
+            except Exception:
+                pass
+
+    def _reload_sop_panel(self):
+        summary = getattr(self, "settings_sop_summary_label", None)
+        notice = getattr(self, "settings_sop_notice", None)
+        current_relpath = self._current_settings_sop_relpath()
+        docs, err = self._settings_target_list_sop_documents()
+        selected_relpath = self._sync_settings_sop_doc_combo(docs, current_relpath)
+        if summary is not None:
+            if docs:
+                summary.setText(f"当前共发现 {len(docs)} 份 SOP / Skill 文档。")
+            else:
+                summary.setText("当前未发现可编辑的 SOP / Skill 文档。")
+        if not docs:
+            self._load_selected_sop_document()
+            if notice is not None and err:
+                notice.setText(str(err or ""))
+            return
+        if notice is not None and err:
+            notice.setText(str(err or ""))
+        self._settings_sop_selected_relpath = selected_relpath
+        self._load_selected_sop_document()
 
     def _settings_category_uses_target_switch(self, key: str):
         return self._settings_category_scope_mode(key) == "target"
@@ -2062,12 +2477,20 @@ class SettingsPanelMixin:
         notice = getattr(self, "settings_target_notice", None)
         if notice is None:
             return
+        category = str(getattr(self, "_current_settings_category", "api") or "api").strip().lower()
         current = self._normalize_settings_target(
             {
                 "scope": getattr(self, "_settings_target_scope", "local"),
                 "device_id": getattr(self, "_settings_target_device_id", "local"),
             }
         )
+        if category == "sop":
+            if current["scope"] == "remote":
+                path_text = self._settings_target_display_path("memory")
+                notice.setText(f"当前目标：远程设备（SSH 宿主机）。SOP 文档会读取并写回 `{path_text}`。")
+            else:
+                notice.setText("当前目标：本机目录。SOP 文档会读取并写回当前目录下的 `memory/`。")
+            return
         if current["scope"] == "remote":
             path_text = self._settings_target_display_path("mykey.py")
             notice.setText(f"当前目标：远程设备（SSH 宿主机）。API/渠道配置会写入 `{path_text}`。")
@@ -2494,6 +2917,7 @@ class SettingsPanelMixin:
             "channels": self._reload_channels_editor_state,
             "vps": self._reload_vps_panel,
             "schedule": self._reload_schedule_panel,
+            "sop": self._reload_sop_panel,
             "personal": self._reload_personal_panel,
             "theme": self._reload_theme_panel,
             "usage": self._reload_usage_panel,
@@ -5923,12 +6347,15 @@ class SettingsPanelMixin:
         floating_bg_combo = getattr(self, "settings_theme_floating_bg_combo", None)
         floating_mode_combo = getattr(self, "settings_theme_floating_bg_mode_combo", None)
         floating_fade_slider = getattr(self, "settings_theme_floating_fade_slider", None)
+        auto_jump_checkbox = getattr(self, "settings_theme_auto_jump_latest", None)
         for combo in (font_combo, weight_combo, size_combo, visual_combo, bg_combo, mode_combo, floating_bg_combo, floating_mode_combo):
             self._apply_theme_combo_style(combo)
         path_edit = getattr(self, "settings_theme_bg_image_path", None)
         floating_path_edit = getattr(self, "settings_theme_floating_bg_image_path", None)
         user_avatar_edit = getattr(self, "settings_theme_user_avatar_path", None)
         ai_avatar_edit = getattr(self, "settings_theme_ai_avatar_path", None)
+        if auto_jump_checkbox is not None:
+            auto_jump_checkbox.setChecked(bool(self.cfg.get("theme_chat_auto_jump_latest", True)))
         current_font = str(self.cfg.get("theme_font_family") or "").strip()
         self._select_combo_data(font_combo, current_font, default_index=0)
         self._select_combo_data(weight_combo, str(self.cfg.get("theme_font_weight") or "400"), default_index=0)
@@ -6178,6 +6605,7 @@ class SettingsPanelMixin:
         floating_bg_combo = getattr(self, "settings_theme_floating_bg_combo", None)
         floating_mode_combo = getattr(self, "settings_theme_floating_bg_mode_combo", None)
         floating_fade_slider = getattr(self, "settings_theme_floating_fade_slider", None)
+        auto_jump_checkbox = getattr(self, "settings_theme_auto_jump_latest", None)
         font_family = str(font_combo.itemData(font_combo.currentIndex()) or "").strip() if font_combo is not None else ""
         font_weight = str(weight_combo.itemData(weight_combo.currentIndex()) or "400").strip() if weight_combo is not None else "400"
         font_size = str(size_combo.itemData(size_combo.currentIndex()) or "14").strip() if size_combo is not None else "14"
@@ -6186,6 +6614,7 @@ class SettingsPanelMixin:
         bg_mode = str(mode_combo.itemData(mode_combo.currentIndex()) or "center").strip() if mode_combo is not None else "center"
         floating_bg_preset = str(floating_bg_combo.itemData(floating_bg_combo.currentIndex()) or "follow").strip() if floating_bg_combo is not None else "follow"
         floating_bg_mode = str(floating_mode_combo.itemData(floating_mode_combo.currentIndex()) or "center").strip() if floating_mode_combo is not None else "center"
+        auto_jump_latest = bool(auto_jump_checkbox.isChecked()) if auto_jump_checkbox is not None else bool(self.cfg.get("theme_chat_auto_jump_latest", True))
         fade_value = max(0, min(100, int(fade_slider.value() if fade_slider is not None else self.cfg.get("theme_bg_fade", self.cfg.get("theme_bg_blur", 18)) or 18)))
         floating_fade_value = max(
             0,
@@ -6343,6 +6772,7 @@ class SettingsPanelMixin:
         self.cfg["theme_font_weight"] = font_weight
         self.cfg["theme_font_size"] = font_size
         self.cfg["theme_visual_preset"] = visual_preset
+        self.cfg["theme_chat_auto_jump_latest"] = auto_jump_latest
         self.cfg["theme_bg_preset"] = bg_preset
         self.cfg["theme_bg_image"] = generated_rel
         self.cfg["theme_bg_source"] = source_rel

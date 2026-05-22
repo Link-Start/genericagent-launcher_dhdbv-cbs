@@ -343,10 +343,10 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         class DummyBridge(BridgeRuntimeMixin):
             _resolve_bridge_python = BridgeRuntimeMixin._resolve_bridge_python
 
-            def __init__(self, agent_dir):
+            def __init__(self, agent_dir, python_exe):
                 self.agent_dir = agent_dir
                 self.cfg = {"python_exe": os.path.join("venv", "bin", "python")}
-                self._last_dependency_check = {}
+                self._last_dependency_check = {"ok": True, "python": python_exe}
 
         with tempfile.TemporaryDirectory() as td:
             python_exe = os.path.join(td, "venv", "bin", "python")
@@ -354,10 +354,37 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             with open(python_exe, "w", encoding="utf-8") as f:
                 f.write("#!/usr/bin/env python3\n")
 
-            dummy = DummyBridge(td)
+            dummy = DummyBridge(td, python_exe)
             py, detail = dummy._resolve_bridge_python()
 
         self.assertEqual(os.path.normpath(py), os.path.normpath(python_exe))
+        self.assertIsNone(detail)
+
+    def test_resolve_bridge_python_revalidates_stale_configured_python_before_reuse(self):
+        class DummyBridge(BridgeRuntimeMixin):
+            _resolve_bridge_python = BridgeRuntimeMixin._resolve_bridge_python
+
+            def __init__(self, agent_dir):
+                self.agent_dir = agent_dir
+                self.cfg = {"python_exe": os.path.join("venv", "bin", "python")}
+                self._last_dependency_check = {}
+
+        with tempfile.TemporaryDirectory() as td:
+            configured_python = os.path.join(td, "venv", "bin", "python")
+            fallback_python = os.path.join(td, "fallback", "bin", "python3")
+            os.makedirs(os.path.dirname(configured_python), exist_ok=True)
+            os.makedirs(os.path.dirname(fallback_python), exist_ok=True)
+            for path in (configured_python, fallback_python):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("#!/usr/bin/env python3\n")
+
+            dummy = DummyBridge(td)
+            with mock.patch.object(bridge_runtime.lz, "_probe_python_agent_compat", return_value=(False, "bad python")), mock.patch.object(
+                bridge_runtime.lz, "_find_compatible_system_python", return_value=(fallback_python, None)
+            ):
+                py, detail = dummy._resolve_bridge_python()
+
+        self.assertEqual(os.path.normpath(py), os.path.normpath(fallback_python))
         self.assertIsNone(detail)
 
     def test_launcher_version_info_falls_back_to_legacy_macos_version_json(self):
@@ -868,6 +895,67 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy.sound_calls, 1)
         tray.showMessage.assert_called_once()
 
+    def test_notify_reply_done_delays_fresh_tray_message_on_windows(self):
+        class DummyTray:
+            def __init__(self):
+                self._props = {}
+                self.calls = []
+
+            def setProperty(self, key, value):
+                self._props[str(key)] = value
+
+            def property(self, key):
+                return self._props.get(str(key))
+
+            def show(self):
+                self.calls.append("show")
+
+            def showMessage(self, *args):
+                self.calls.append(("showMessage", args))
+
+            def isVisible(self):
+                return True
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _notify_reply_done = BridgeRuntimeMixin._notify_reply_done
+            _set_tray_message_ready = BridgeRuntimeMixin._set_tray_message_ready
+            _tray_message_ready = BridgeRuntimeMixin._tray_message_ready
+            _show_tray_message = BridgeRuntimeMixin._show_tray_message
+
+            def __init__(self):
+                self.cfg = {}
+                self.sound_calls = 0
+                self.reply_tray_calls = 0
+
+            def _play_reply_done_sound(self):
+                self.sound_calls += 1
+
+            def _ensure_launcher_tray_icon(self):
+                return None
+
+            def _ensure_reply_notify_tray(self):
+                self.reply_tray_calls += 1
+                return tray
+
+        tray = DummyTray()
+        dummy = DummyBridge()
+        dummy._set_tray_message_ready(tray, False)
+        delays = []
+
+        with mock.patch.object(bridge_runtime.os, "name", "nt"), mock.patch.object(
+            bridge_runtime.QTimer, "singleShot", side_effect=lambda ms, cb: delays.append(int(ms)) or cb()
+        ):
+            dummy._notify_reply_done("fresh tray")
+
+        self.assertEqual(dummy.sound_calls, 1)
+        self.assertEqual(dummy.reply_tray_calls, 1)
+        self.assertEqual(delays, [180])
+        self.assertEqual(tray.calls[0], "show")
+        self.assertEqual(tray.calls[1][0], "showMessage")
+        self.assertEqual(tray.calls[1][1][0], "GenericAgent 启动器")
+        self.assertEqual(tray.calls[1][1][1], "AI 回复已完成：fresh tray")
+        self.assertTrue(dummy._tray_message_ready(tray))
+
     def test_real_qt_chat_window_notify_reply_done_uses_system_notification_path_when_hidden(self):
         app = launcher_window.QApplication.instance() or launcher_window.QApplication([])
         win = None
@@ -928,6 +1016,73 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 pass
             win.deleteLater()
             app.processEvents()
+
+    def test_launcher_single_instance_guard_queues_activation_until_handler_attached(self):
+        app = launcher_window.QApplication.instance() or launcher_window.QApplication([])
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            launcher_window.lz, "STATE_DIR", td
+        ), mock.patch.object(
+            launcher_window.lz, "_ensure_launcher_data_dirs", side_effect=lambda: os.makedirs(td, exist_ok=True)
+        ), mock.patch.object(
+            launcher_window, "_launcher_single_instance_server_name", return_value=f"ga-launcher-test-{abs(hash(td))}"
+        ):
+            primary = launcher_window._LauncherSingleInstanceGuard(app)
+            secondary = launcher_window._LauncherSingleInstanceGuard(app)
+            try:
+                self.assertTrue(primary.try_claim_primary())
+                self.assertTrue(secondary.request_existing_activation(wait_ms=600))
+
+                app.processEvents()
+                QTest.qWait(80)
+                app.processEvents()
+
+                calls = []
+                primary.set_activation_handler(lambda: calls.append("activate"))
+
+                app.processEvents()
+                QTest.qWait(80)
+                app.processEvents()
+
+                self.assertEqual(calls, ["activate"])
+            finally:
+                secondary.close()
+                primary.close()
+
+    def test_activate_from_secondary_launch_restores_hidden_window(self):
+        class DummyHost:
+            _activate_from_secondary_launch = launcher_window.QtChatWindow._activate_from_secondary_launch
+
+            def __init__(self):
+                self._tray_mode_active = True
+                self.calls = []
+
+            def isVisible(self):
+                return False
+
+            def _restore_from_tray_mode(self):
+                self.calls.append("restore")
+
+        dummy = DummyHost()
+        dummy._activate_from_secondary_launch()
+
+        self.assertEqual(dummy.calls, ["restore"])
+
+    def test_launcher_main_returns_early_when_existing_instance_was_signaled(self):
+        app = mock.Mock()
+        app.exec.side_effect = AssertionError("secondary launch must not enter app.exec")
+
+        with mock.patch.object(launcher_window.QApplication, "instance", return_value=app), mock.patch.object(
+            launcher_window, "launcher_icon", return_value=mock.Mock()
+        ), mock.patch.object(
+            launcher_window, "_ensure_single_launcher_instance", return_value=None
+        ), mock.patch.object(
+            launcher_window, "QtChatWindow"
+        ) as window_ctor:
+            result = launcher_window.main(r"E:\\GenericAgent")
+
+        self.assertEqual(result, 0)
+        window_ctor.assert_not_called()
+        app.exec.assert_not_called()
 
     def test_stream_done_triggers_reply_notification_once(self):
         class Button:
@@ -1080,6 +1235,124 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy._active_turn_attachments_data, [])
         self.assertEqual(dummy.released, [{"path": "done.png", "name": "done", "owned": True}])
         self.assertEqual(dummy.anchor_clear_calls, 1)
+
+    def test_flush_stream_render_skips_auto_jump_when_theme_toggle_disabled(self):
+        class Row:
+            def __init__(self):
+                self._text = ""
+                self._finished = False
+                self.updates = []
+
+            def update_content(self, text, *, finished):
+                self._text = str(text)
+                self._finished = bool(finished)
+                self.updates.append((self._text, self._finished))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _flush_stream_render = BridgeRuntimeMixin._flush_stream_render
+
+            def __init__(self):
+                self.cfg = {"theme_chat_auto_jump_latest": False}
+                self._turn_auto_jump_latest = True
+                self._stream_row = Row()
+                self._pending_stream_text = "part 1"
+                self.sync_calls = []
+                self.scroll_calls = 0
+                self.refresh_calls = 0
+                self.token_updates = []
+
+            def _update_stream_row_tokens(self, *, live):
+                self.token_updates.append(bool(live))
+
+            def _sync_current_turn_view(self, *, force=False):
+                self.sync_calls.append(bool(force))
+
+            def _scroll_to_bottom(self):
+                self.scroll_calls += 1
+
+            def _refresh_floating_chat_window(self):
+                self.refresh_calls += 1
+
+        dummy = DummyBridge()
+        dummy._flush_stream_render()
+
+        self.assertEqual(dummy._stream_row.updates, [("part 1", False)])
+        self.assertEqual(dummy.token_updates, [True])
+        self.assertEqual(dummy.sync_calls, [])
+        self.assertEqual(dummy.scroll_calls, 0)
+        self.assertEqual(dummy.refresh_calls, 1)
+
+    def test_stream_done_skips_auto_jump_when_theme_toggle_disabled(self):
+        class Button:
+            def __init__(self):
+                self.values = []
+
+            def setEnabled(self, value):
+                self.values.append(bool(value))
+
+        class Row:
+            def __init__(self):
+                self.updates = []
+
+            def update_content(self, text, *, finished):
+                self.updates.append((str(text), bool(finished)))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+
+            def __init__(self):
+                self.cfg = {"theme_chat_auto_jump_latest": False}
+                self._turn_auto_jump_latest = True
+                self._abort_requested = False
+                self._stream_row = Row()
+                self._busy = True
+                self._current_stream_text = ""
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.current_session = None
+                self.follow_calls = []
+                self.sync_calls = []
+                self.scroll_calls = 0
+                self.refresh_calls = 0
+
+            def _set_status(self, _text):
+                return None
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _clear_active_turn_attachments(self):
+                return None
+
+            def _refresh_token_label(self):
+                return None
+
+            def _notify_reply_done(self, _final_text):
+                return None
+
+            def _set_follow_latest_user(self, value):
+                self.follow_calls.append(bool(value))
+
+            def _sync_current_turn_view(self, *, force=False):
+                self.sync_calls.append(bool(force))
+
+            def _scroll_to_bottom(self):
+                self.scroll_calls += 1
+
+            def _refresh_floating_chat_window(self):
+                self.refresh_calls += 1
+
+        dummy = DummyBridge()
+        row = dummy._stream_row
+        dummy._stream_done("done")
+
+        self.assertEqual(row.updates, [("done", True)])
+        self.assertEqual(dummy.follow_calls, [False])
+        self.assertEqual(dummy.sync_calls, [])
+        self.assertEqual(dummy.scroll_calls, 0)
+        self.assertEqual(dummy.refresh_calls, 1)
+        self.assertFalse(getattr(dummy, "_turn_auto_jump_latest", True))
 
     def test_bridge_runtime_state_helpers_explain_attachment_and_llm_disable_reasons(self):
         class DummyBridge(BridgeRuntimeMixin):
@@ -1797,6 +2070,117 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy._attachment_bar_display_items(), [])
         self.assertEqual(dummy.attachment_refreshes, 1)
         self.assertEqual(dummy.scroll_calls, [("user", True)])
+        self.assertIs(dummy._current_turn_user_row, dummy.rows[0])
+
+    def test_submit_user_message_skips_auto_jump_when_theme_toggle_disabled(self):
+        class DummyEditor:
+            def __init__(self, text=""):
+                self.text = str(text)
+                self.cleared = 0
+
+            def clear(self):
+                self.text = ""
+                self.cleared += 1
+
+        class DummyButton:
+            def __init__(self):
+                self.values = []
+
+            def setEnabled(self, value):
+                self.values.append(bool(value))
+
+        class DummyRow:
+            def __init__(self, role, text, finished, auto_scroll):
+                self.role = str(role)
+                self.text = str(text)
+                self.finished = bool(finished)
+                self.auto_scroll = bool(auto_scroll)
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _submit_user_message = BridgeRuntimeMixin._submit_user_message
+
+            def __init__(self):
+                self.cfg = {"theme_chat_auto_jump_latest": False}
+                self.current_session = {"id": "sess-1", "bubbles": [], "channel_id": "launcher"}
+                self._pending_input_attachments_data = []
+                self._active_turn_attachments_data = []
+                self._current_turn_user_row = None
+                self._busy = False
+                self._abort_requested = False
+                self._bridge_ready = True
+                self._user_scrolled_up = True
+                self.send_btn = DummyButton()
+                self.stop_btn = DummyButton()
+                self.sent = []
+                self.rows = []
+                self.scroll_calls = []
+                self.follow_calls = []
+
+            def _handle_local_slash_command(self, *_args, **_kwargs):
+                return False
+
+            def _is_channel_process_session(self):
+                return False
+
+            def _is_remote_session(self, _session=None):
+                return False
+
+            def _ensure_session(self, _text):
+                return None
+
+            def _add_message_row(self, role, text, *, finished, auto_scroll):
+                row = DummyRow(role, text, finished, auto_scroll)
+                self.rows.append(row)
+                return row
+
+            def _set_status(self, _text):
+                return None
+
+            def _refresh_composer_enabled(self):
+                return None
+
+            def _persist_session(self, _session):
+                return None
+
+            def _refresh_token_label(self):
+                return None
+
+            def _update_stream_row_tokens(self, *, live):
+                return None
+
+            def _current_llm_name(self):
+                return "test-llm"
+
+            def _send_cmd(self, obj):
+                self.sent.append(dict(obj))
+
+            def _scroll_row_to_top(self, row, preserve_scroll_state=False):
+                self.scroll_calls.append((row.role, bool(preserve_scroll_state)))
+
+            def _set_follow_latest_user(self, value):
+                self.follow_calls.append(bool(value))
+
+            def _refresh_input_attachment_bar(self):
+                return None
+
+            def _refresh_floating_chat_window(self):
+                return None
+
+            def _set_current_turn_user_row(self, row):
+                self._current_turn_user_row = row
+
+        dummy = DummyBridge()
+        editor = DummyEditor("hello")
+
+        result = dummy._submit_user_message("hello", attachments=[], source_editor=editor)
+
+        self.assertTrue(result)
+        self.assertEqual(editor.cleared, 1)
+        self.assertEqual(dummy.sent, [{"cmd": "send", "text": "hello", "images": [], "session_id": "sess-1"}])
+        self.assertEqual(dummy.scroll_calls, [])
+        self.assertEqual(dummy.follow_calls, [False])
+        self.assertTrue(dummy._user_scrolled_up)
+        self.assertFalse(getattr(dummy, "_turn_auto_jump_latest", False))
         self.assertIs(dummy._current_turn_user_row, dummy.rows[0])
 
     def test_remote_exec_chat_turn_sends_uploaded_remote_image_paths(self):
@@ -2863,6 +3247,81 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(parsed.get("error"), None)
         self.assertEqual(len(parsed.get("configs") or []), 1)
         self.assertEqual(parsed["configs"][0]["data"]["name"], "primary")
+
+    def test_settings_target_list_sop_documents_filters_supported_local_files(self):
+        class DummySettings(SettingsPanelMixin):
+            _settings_sop_normalize_relpath = SettingsPanelMixin._settings_sop_normalize_relpath
+            _settings_sop_label = SettingsPanelMixin._settings_sop_label
+            _settings_target_list_sop_documents = SettingsPanelMixin._settings_target_list_sop_documents
+
+            def __init__(self, agent_dir):
+                self.agent_dir = agent_dir
+
+            def _settings_target_context(self):
+                return {"is_remote": False, "label": "本机"}
+
+        with tempfile.TemporaryDirectory() as td:
+            memory_dir = os.path.join(td, "memory")
+            os.makedirs(os.path.join(memory_dir, "skill_search"), exist_ok=True)
+            os.makedirs(os.path.join(memory_dir, "autonomous_operation_sop"), exist_ok=True)
+            with open(os.path.join(memory_dir, "scheduled_task_sop.md"), "w", encoding="utf-8") as f:
+                f.write("# scheduled task sop\n")
+            with open(os.path.join(memory_dir, "skill_search", "SKILL.md"), "w", encoding="utf-8") as f:
+                f.write("# skill search\n")
+            with open(os.path.join(memory_dir, "subagent.md"), "w", encoding="utf-8") as f:
+                f.write("# ignored\n")
+            with open(os.path.join(memory_dir, "autonomous_operation_sop", "task_planning.md"), "w", encoding="utf-8") as f:
+                f.write("# ignored nested planning\n")
+
+            dummy = DummySettings(td)
+            with mock.patch.object(lz, "is_valid_agent_dir", return_value=True):
+                docs, err = dummy._settings_target_list_sop_documents()
+
+        self.assertEqual(err, "")
+        self.assertEqual(
+            [item["relpath"] for item in docs],
+            ["memory/scheduled_task_sop.md", "memory/skill_search/SKILL.md"],
+        )
+        self.assertEqual(
+            [item["label"] for item in docs],
+            ["scheduled_task_sop.md", "skill_search/SKILL.md"],
+        )
+
+    def test_settings_target_read_and_write_sop_text_round_trip_locally(self):
+        class DummySettings(SettingsPanelMixin):
+            _settings_sop_normalize_relpath = SettingsPanelMixin._settings_sop_normalize_relpath
+            _settings_target_read_sop_text = SettingsPanelMixin._settings_target_read_sop_text
+            _settings_target_write_sop_text = SettingsPanelMixin._settings_target_write_sop_text
+            _settings_target_display_path = SettingsPanelMixin._settings_target_display_path
+
+            def __init__(self, agent_dir):
+                self.agent_dir = agent_dir
+
+            def _settings_target_context(self):
+                return {"is_remote": False, "label": "本机"}
+
+        with tempfile.TemporaryDirectory() as td:
+            memory_dir = os.path.join(td, "memory")
+            os.makedirs(memory_dir, exist_ok=True)
+            sop_path = os.path.join(memory_dir, "plan_sop.md")
+            with open(sop_path, "w", encoding="utf-8") as f:
+                f.write("before = 1\n")
+
+            dummy = DummySettings(td)
+            with mock.patch.object(lz, "is_valid_agent_dir", return_value=True):
+                ok, text, display_path, err = dummy._settings_target_read_sop_text("memory/plan_sop.md")
+                self.assertTrue(ok)
+                self.assertEqual(text, "before = 1\n")
+                self.assertEqual(display_path, sop_path)
+                self.assertEqual(err, "")
+
+                ok, display_path, err = dummy._settings_target_write_sop_text("memory/plan_sop.md", "after = 2\n")
+                self.assertTrue(ok)
+                self.assertEqual(display_path, sop_path)
+                self.assertEqual(err, "")
+
+            with open(sop_path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "after = 2\n")
 
     def test_settings_target_read_mykey_text_reads_legacy_docker_target_via_direct_ssh_path(self):
         class DummyRemoteFile:
@@ -4499,6 +4958,8 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
         dummy = DummyDownload()
         self.assertTrue(dummy._uses_system_python_download_mode())
+        self.assertEqual(dummy._download_managed_env_button_text(), "构建项目虚拟环境")
+        self.assertEqual(dummy._download_managed_env_ready_text(), "下载完成，已构建项目虚拟环境并设置为当前 GenericAgent 目录。现在可以直接进入聊天。")
         self.assertEqual(
             dummy._download_existing_target_ready_text(),
             "已使用现有目录。请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。",
@@ -4508,6 +4969,171 @@ class LauncherCoreFacadeTests(unittest.TestCase):
             "下载完成，已设置为当前 GenericAgent 目录。请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。",
         )
         self.assertEqual(dummy._download_git_missing_message(), "未检测到 Git。请先安装 Git：\nhttps://git-scm.com/downloads")
+
+    def test_select_project_venv_seed_python_prefers_configured_python_when_compatible(self):
+        class DummyDownload(DownloadMixin):
+            _select_project_venv_seed_python = DownloadMixin._select_project_venv_seed_python
+            _project_venv_seed_candidates = DownloadMixin._project_venv_seed_candidates
+            _private_runtime_paths = DownloadMixin._private_runtime_paths
+            _normalized_download_path = DownloadMixin._normalized_download_path
+            _download_path_is_within = DownloadMixin._download_path_is_within
+
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def _supports_private_python_installer(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            configured_python = os.path.join(td, "configured", "bin", "python3")
+            system_python = os.path.join(td, "system", "bin", "python3")
+            os.makedirs(os.path.dirname(configured_python), exist_ok=True)
+            os.makedirs(os.path.dirname(system_python), exist_ok=True)
+            for path in (configured_python, system_python):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("#!/usr/bin/env python3\n")
+
+            dummy = DummyDownload({"python_exe": configured_python})
+            with mock.patch.object(lz, "_resolve_configured_python_exe", return_value=configured_python), mock.patch.object(
+                lz, "_probe_python_command", return_value={"path": configured_python, "version": "3.12.4"}
+            ), mock.patch.object(
+                lz, "_system_python_candidates", return_value=[{"path": system_python, "version": "3.11.9"}]
+            ), mock.patch.object(
+                lz, "resolve_upstream_dependency_manifest", return_value={"requires_python": ">=3.11,<3.13"}
+            ):
+                info, err = dummy._select_project_venv_seed_python(td)
+
+        self.assertEqual(err, "")
+        self.assertEqual(info["path"], configured_python)
+        self.assertEqual(info["version"], "3.12.4")
+        self.assertEqual(info["source"], "已配置 python_exe")
+
+    def test_select_project_venv_seed_python_reports_macos_guidance_for_unsupported_versions(self):
+        class DummyDownload(DownloadMixin):
+            _select_project_venv_seed_python = DownloadMixin._select_project_venv_seed_python
+            _project_venv_seed_candidates = DownloadMixin._project_venv_seed_candidates
+            _private_runtime_paths = DownloadMixin._private_runtime_paths
+            _normalized_download_path = DownloadMixin._normalized_download_path
+            _download_path_is_within = DownloadMixin._download_path_is_within
+
+            def __init__(self):
+                self.cfg = {}
+
+            def _supports_private_python_installer(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            system_python = os.path.join(td, "system", "bin", "python3")
+            os.makedirs(os.path.dirname(system_python), exist_ok=True)
+            with open(system_python, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env python3\n")
+
+            dummy = DummyDownload()
+            with mock.patch.object(lz, "_system_python_candidates", return_value=[{"path": system_python, "version": "3.10.14"}]), mock.patch.object(
+                lz, "resolve_upstream_dependency_manifest", return_value={"requires_python": ">=3.11,<3.13"}
+            ):
+                info, err = dummy._select_project_venv_seed_python(td)
+
+        self.assertEqual(info, {})
+        self.assertIn("Homebrew Python 3.11 / 3.12", err)
+        self.assertIn("launcher_config.json", err)
+        self.assertIn(">=3.11,<3.13", err)
+        self.assertIn("Python 3.10", err)
+
+    def test_select_project_venv_seed_python_skips_launcher_runtime_interpreters(self):
+        class DummyDownload(DownloadMixin):
+            _select_project_venv_seed_python = DownloadMixin._select_project_venv_seed_python
+            _project_venv_seed_candidates = DownloadMixin._project_venv_seed_candidates
+            _private_runtime_paths = DownloadMixin._private_runtime_paths
+            _normalized_download_path = DownloadMixin._normalized_download_path
+            _download_path_is_within = DownloadMixin._download_path_is_within
+
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def _supports_private_python_installer(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime_python = os.path.join(td, ".launcher_runtime", "venv312", "bin", "python3")
+            system_python = os.path.join(td, "system", "bin", "python3")
+            os.makedirs(os.path.dirname(runtime_python), exist_ok=True)
+            os.makedirs(os.path.dirname(system_python), exist_ok=True)
+            for path in (runtime_python, system_python):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("#!/usr/bin/env python3\n")
+
+            dummy = DummyDownload({"python_exe": runtime_python})
+            with mock.patch.object(lz, "_resolve_configured_python_exe", return_value=runtime_python), mock.patch.object(
+                lz, "_probe_python_command", return_value={"path": runtime_python, "version": "3.12.4"}
+            ), mock.patch.object(
+                lz, "_system_python_candidates", return_value=[{"path": system_python, "version": "3.11.9"}]
+            ), mock.patch.object(
+                lz, "resolve_upstream_dependency_manifest", return_value={"requires_python": ">=3.11,<3.13"}
+            ):
+                info, err = dummy._select_project_venv_seed_python(td)
+
+        self.assertEqual(err, "")
+        self.assertEqual(info["path"], system_python)
+        self.assertEqual(info["source"], "系统候选")
+
+    def test_ensure_private_python_env_builds_project_venv_without_touching_seed_python_packages(self):
+        class DummyQueue:
+            def __init__(self):
+                self.events = []
+
+            def put(self, ev):
+                self.events.append(dict(ev))
+
+        class DummyDownload(DownloadMixin):
+            _ensure_private_python_env = DownloadMixin._ensure_private_python_env
+            _build_runtime_venv = DownloadMixin._build_runtime_venv
+            _private_runtime_paths = DownloadMixin._private_runtime_paths
+
+            def __init__(self, target, seed_python):
+                self.cfg = {}
+                self.target = target
+                self.seed_python = seed_python
+                self._event_queue = DummyQueue()
+                self.calls = []
+
+            def _supports_private_python_installer(self):
+                return False
+
+            def _select_project_venv_seed_python(self, _target):
+                return {"path": self.seed_python, "version": "3.12.4", "source": "系统候选"}, ""
+
+            def _run_checked_command(self, args, **_kwargs):
+                self.calls.append(list(args))
+                runtime_paths = self._private_runtime_paths(self.target)
+                if args[:3] == [self.seed_python, "-m", "venv"]:
+                    os.makedirs(os.path.dirname(runtime_paths["venv_python"]), exist_ok=True)
+                    with open(runtime_paths["venv_python"], "w", encoding="utf-8") as f:
+                        f.write("#!/usr/bin/env python3\n")
+                return True, ""
+
+        with tempfile.TemporaryDirectory() as td:
+            seed_python = os.path.join(td, "seed", "bin", "python3")
+            os.makedirs(os.path.dirname(seed_python), exist_ok=True)
+            with open(seed_python, "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env python3\n")
+
+            dummy = DummyDownload(td, seed_python)
+            with mock.patch.object(lz, "_probe_python_agent_compat", return_value=(True, "")):
+                python_exe, err = dummy._ensure_private_python_env(td)
+
+            runtime_paths = dummy._private_runtime_paths(td)
+
+        self.assertEqual(err, None)
+        self.assertEqual(python_exe, runtime_paths["venv_python"])
+        self.assertEqual(dummy.calls[0], [seed_python, "-m", "venv", "--clear", runtime_paths["venv_root"]])
+        self.assertEqual(dummy.calls[1], [runtime_paths["venv_python"], "-m", "ensurepip", "--upgrade"])
+        self.assertEqual(
+            dummy.calls[2],
+            [runtime_paths["venv_python"], "-m", "pip", "install", "--upgrade", "requests", "simplejson"],
+        )
+        self.assertTrue(all(call[0] == runtime_paths["venv_python"] for call in dummy.calls[1:]))
+        self.assertTrue(any("不会写入系统 Python" in str(ev.get("msg") or "") for ev in dummy._event_queue.events))
 
     def test_refresh_download_state_tolerates_missing_private_controls(self):
         class DummyLabel:
@@ -4559,6 +5185,41 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy.download_btn.text, "开始下载")
         self.assertEqual(dummy.download_progress.range, (0, 1))
         self.assertEqual(dummy.download_progress.value, 0)
+
+    def test_refresh_download_state_keeps_project_venv_button_enabled_without_private_installer(self):
+        class DummyButton:
+            def __init__(self):
+                self.enabled = None
+                self.text = ""
+
+            def setEnabled(self, enabled):
+                self.enabled = bool(enabled)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyDownload(DownloadMixin):
+            _refresh_download_state = DownloadMixin._refresh_download_state
+
+            def __init__(self):
+                self.install_parent = "/tmp"
+                self._download_running = False
+                self._download_mode = ""
+                self.download_private_btn = DummyButton()
+
+            def _supports_private_python_installer(self):
+                return False
+
+        dummy = DummyDownload()
+        dummy._refresh_download_state()
+        self.assertTrue(dummy.download_private_btn.enabled)
+        self.assertEqual(dummy.download_private_btn.text, "构建项目虚拟环境")
+
+        dummy._download_running = True
+        dummy._download_mode = "private_python"
+        dummy._refresh_download_state()
+        self.assertFalse(dummy.download_private_btn.enabled)
+        self.assertEqual(dummy.download_private_btn.text, "构建中…")
 
     def test_channel_runtime_detects_local_wechat_processes_on_posix(self):
         class DummyChannel(ChannelRuntimeMixin):
@@ -9554,6 +10215,7 @@ native_oai_config2 = {
                 self.settings_stack = DummyStack()
                 self._settings_pages = {
                     "channels": {"widget": object()},
+                    "sop": {"widget": object()},
                     "vps": {"widget": object()},
                     "api": {"widget": object()},
                     "theme": {"widget": object()},
@@ -9561,6 +10223,7 @@ native_oai_config2 = {
                 }
                 self._settings_nav_buttons = {
                     "channels": DummyButton(),
+                    "sop": DummyButton(),
                     "vps": DummyButton(),
                     "api": DummyButton(),
                     "theme": DummyButton(),
@@ -9594,6 +10257,11 @@ native_oai_config2 = {
         with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
             dummy._show_settings_category("api", reload=True)
         self.assertIn(("reload", ["api"], False), dummy.calls)
+
+        dummy.calls.clear()
+        with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
+            dummy._show_settings_category("sop", reload=True)
+        self.assertIn(("reload", ["sop"], False), dummy.calls)
 
         dummy.calls.clear()
         with mock.patch("qt_chat_parts.settings_panel.QTimer.singleShot", side_effect=lambda *_args: _args[-1]()):
@@ -10614,6 +11282,13 @@ native_oai_config2 = {
             def setText(self, value):
                 self.text_value = str(value)
 
+        class DummyCheckBox:
+            def __init__(self, checked):
+                self._checked = bool(checked)
+
+            def isChecked(self):
+                return self._checked
+
         class DummyCombo:
             def __init__(self, value, label=""):
                 self._value = value
@@ -10663,6 +11338,7 @@ native_oai_config2 = {
                 self.settings_theme_floating_bg_combo = DummyCombo("image", "图片背景")
                 self.settings_theme_floating_bg_mode_combo = DummyCombo("center", "居中裁切")
                 self.settings_theme_floating_fade_slider = DummySlider(18)
+                self.settings_theme_auto_jump_latest = DummyCheckBox(False)
                 self.settings_theme_bg_image_path = DummyLineEdit("D:/demo/main.png")
                 self.settings_theme_floating_bg_image_path = DummyLineEdit("D:/demo/floating.png")
                 self.settings_theme_notice = DummyLabel()
@@ -10710,12 +11386,122 @@ native_oai_config2 = {
         self.assertEqual(dummy.cfg["theme_floating_bg_image"], "")
         self.assertEqual(dummy.cfg["theme_floating_bg_source"], "")
         self.assertEqual(dummy.cfg["theme_floating_bg_crop"], {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0})
+        self.assertFalse(dummy.cfg["theme_chat_auto_jump_latest"])
         self.assertEqual(dummy.saved_modes, ["dark"])
         self.assertEqual(dummy.reload_calls, 1)
         self.assertEqual(dummy.statuses, ["主题设置已保存。"])
         self.assertTrue(saved)
         self.assertIn("主题已保存", dummy.settings_theme_notice.text_value)
         warning_box.assert_not_called()
+
+    def test_reload_theme_panel_defaults_auto_jump_checkbox_on(self):
+        class DummyCheckBox:
+            def __init__(self):
+                self.checked = None
+
+            def setChecked(self, value):
+                self.checked = bool(value)
+
+        class DummyCombo:
+            def __init__(self):
+                self.index = 0
+                self.style = ""
+
+            def objectName(self):
+                return ""
+
+            def setStyleSheet(self, value):
+                self.style = str(value)
+
+            def hidePopup(self):
+                return None
+
+            def count(self):
+                return 0
+
+            def itemData(self, _index):
+                return ""
+
+            def setCurrentIndex(self, index):
+                self.index = int(index)
+
+            def blockSignals(self, _blocked):
+                return None
+
+            def findData(self, _value):
+                return -1
+
+            def itemText(self, _index):
+                return ""
+
+        class DummySlider:
+            def __init__(self):
+                self.value = None
+
+            def blockSignals(self, _blocked):
+                return None
+
+            def setValue(self, value):
+                self.value = int(value)
+
+        class DummyLineEdit:
+            def __init__(self):
+                self.text_value = ""
+
+            def setText(self, value):
+                self.text_value = str(value)
+
+        class DummyLabel:
+            def __init__(self):
+                self.text_value = ""
+
+            def setText(self, value):
+                self.text_value = str(value)
+
+        class DummySettings(SettingsPanelMixin):
+            _reload_theme_panel = SettingsPanelMixin._reload_theme_panel
+            _normalize_theme_crop_data = SettingsPanelMixin._normalize_theme_crop_data
+            _select_combo_data = SettingsPanelMixin._select_combo_data
+            _apply_theme_combo_style = SettingsPanelMixin._apply_theme_combo_style
+
+            def __init__(self):
+                self.cfg = {}
+                self.settings_theme_notice = DummyLabel()
+                self.settings_theme_auto_jump_latest = DummyCheckBox()
+                self.settings_theme_font_combo = DummyCombo()
+                self.settings_theme_weight_combo = DummyCombo()
+                self.settings_theme_size_combo = DummyCombo()
+                self.settings_theme_visual_combo = DummyCombo()
+                self.settings_theme_bg_combo = DummyCombo()
+                self.settings_theme_bg_mode_combo = DummyCombo()
+                self.settings_theme_fade_slider = DummySlider()
+                self.settings_theme_floating_bg_combo = DummyCombo()
+                self.settings_theme_floating_bg_mode_combo = DummyCombo()
+                self.settings_theme_floating_fade_slider = DummySlider()
+                self.settings_theme_bg_image_path = DummyLineEdit()
+                self.settings_theme_floating_bg_image_path = DummyLineEdit()
+                self.settings_theme_user_avatar_path = DummyLineEdit()
+                self.settings_theme_ai_avatar_path = DummyLineEdit()
+
+            def _ensure_theme_font_options(self):
+                return None
+
+            def _theme_combo_style(self):
+                return ""
+
+            def _dismiss_combo_popup(self, _combo):
+                return None
+
+            def _on_theme_fade_changed(self, _value):
+                return None
+
+            def _on_theme_floating_fade_changed(self, _value):
+                return None
+
+        dummy = DummySettings()
+        dummy._reload_theme_panel()
+
+        self.assertTrue(dummy.settings_theme_auto_jump_latest.checked)
 
     def test_on_vps_deploy_source_changed_refreshes_buttons_and_honors_item_data_fallback(self):
         class DummyWidget:

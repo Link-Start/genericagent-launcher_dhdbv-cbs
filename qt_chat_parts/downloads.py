@@ -24,6 +24,26 @@ class DownloadMixin:
     def _uses_system_python_download_mode(self):
         return not self._supports_private_python_installer()
 
+    def _download_managed_env_button_text(self):
+        if self._uses_system_python_download_mode():
+            return "构建项目虚拟环境"
+        return "下载并配置 3.12 虚拟环境"
+
+    def _download_managed_env_action_text(self):
+        if self._uses_system_python_download_mode():
+            return "构建项目虚拟环境"
+        return "配置私有 3.12 环境"
+
+    def _download_managed_env_display_name(self):
+        if self._uses_system_python_download_mode():
+            return "项目虚拟环境"
+        return "私有 3.12 虚拟环境"
+
+    def _download_managed_env_ready_text(self):
+        if self._uses_system_python_download_mode():
+            return "下载完成，已构建项目虚拟环境并设置为当前 GenericAgent 目录。现在可以直接进入聊天。"
+        return "下载完成，已配置私有 3.12 虚拟环境并设置为当前 GenericAgent 目录。现在可以直接进入聊天。"
+
     def _download_existing_target_ready_text(self):
         if self._uses_system_python_download_mode():
             return "已使用现有目录。请使用系统 Python 进入聊天；首次载入时会自动执行依赖检查。"
@@ -58,6 +78,22 @@ class DownloadMixin:
         box.append(text)
         box.moveCursor(QTextCursor.End)
 
+    def _normalized_download_path(self, path):
+        raw = str(path or "").strip()
+        if not raw:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(raw)))
+
+    def _download_path_is_within(self, path, root):
+        norm_path = self._normalized_download_path(path)
+        norm_root = self._normalized_download_path(root)
+        if not norm_path or not norm_root:
+            return False
+        try:
+            return os.path.commonpath([norm_path, norm_root]) == norm_root
+        except Exception:
+            return False
+
     def _refresh_download_state(self):
         if hasattr(self, "download_parent_label"):
             target = os.path.join(self.install_parent, "GenericAgent") if self.install_parent else "未选择安装位置"
@@ -69,14 +105,10 @@ class DownloadMixin:
             self.download_btn.setText("下载中…" if self._download_running and self._download_mode == "clone" else "开始下载")
         private_btn = getattr(self, "download_private_btn", None)
         if private_btn is not None:
-            if self._supports_private_python_installer():
-                private_btn.setEnabled(not self._download_running)
-                private_btn.setText(
-                    "构建中…" if self._download_running and self._download_mode == "private_python" else "下载并配置 3.12 虚拟环境"
-                )
-            else:
-                private_btn.setEnabled(False)
-                private_btn.setText("mac 版使用系统 Python")
+            private_btn.setEnabled(not self._download_running)
+            private_btn.setText(
+                "构建中…" if self._download_running and self._download_mode == "private_python" else self._download_managed_env_button_text()
+            )
         private_only_checkbox = getattr(self, "download_private_only_checkbox", None)
         if private_only_checkbox is not None:
             private_only_checkbox.setEnabled(self._supports_private_python_installer() and (not self._download_running))
@@ -197,13 +229,6 @@ class DownloadMixin:
         return picked if picked else list(sources)
 
     def _start_download_repo(self, private_python=False, private_only=False):
-        if private_python and (not self._supports_private_python_installer()):
-            QMessageBox.information(
-                self,
-                "系统 Python 模式",
-                "mac 版当前不提供私有 Python 安装器。\n\n请先下载或定位 GenericAgent，再使用系统 Python 和依赖检查完成环境准备。",
-            )
-            return
         parent = str(self.install_parent or "").strip()
         if not parent or not os.path.isdir(parent):
             QMessageBox.warning(self, "位置无效", "请选择有效的安装位置。")
@@ -218,14 +243,21 @@ class DownloadMixin:
             return
         if os.path.exists(target):
             if lz.is_valid_agent_dir(target):
-                if QMessageBox.question(self, "目录已存在", f"{target}\n\n已存在。是否直接使用它作为 GenericAgent 目录？") != QMessageBox.Yes:
+                confirm_text = (
+                    f"{target}\n\n已存在。是否直接使用它作为 GenericAgent 目录，并继续{self._download_managed_env_action_text()}？"
+                    if private_python
+                    else f"{target}\n\n已存在。是否直接使用它作为 GenericAgent 目录？"
+                )
+                if QMessageBox.question(self, "目录已存在", confirm_text) != QMessageBox.Yes:
                     return
                 if not private_python:
                     self._set_agent_dir(target)
                     self.download_status_label.setText(self._download_existing_target_ready_text())
                     self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目录已存在，已直接接管：{target}")
                     return
-                self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目录已存在，将继续为它配置私有 3.12 虚拟环境：{target}")
+                self._append_download_log(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] 目录已存在，将继续为它{self._download_managed_env_action_text()}：{target}"
+                )
             else:
                 if private_python and private_only:
                     QMessageBox.warning(self, "目录无效", "你勾选了“仅配置虚拟环境”，但目标目录不是有效的 GenericAgent 根目录。")
@@ -257,9 +289,13 @@ class DownloadMixin:
         self._download_mode = "private_python" if private_python else "clone"
         self._refresh_download_state()
         if private_python and private_only:
-            self.download_status_label.setText("正在为现有 GenericAgent 配置私有 3.12 环境…")
+            self.download_status_label.setText(f"正在为现有 GenericAgent {self._download_managed_env_action_text()}…")
         else:
-            self.download_status_label.setText("正在准备私有 3.12 环境…" if private_python else "正在检查 Git 并开始下载…")
+            self.download_status_label.setText(
+                "正在准备构建项目虚拟环境…"
+                if private_python and self._uses_system_python_download_mode()
+                else ("正在准备私有 3.12 环境…" if private_python else "正在检查 Git 并开始下载…")
+            )
         self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 目标目录：{target}")
         self.cfg["install_parent"] = parent
         lz.save_config(self.cfg)
@@ -267,7 +303,7 @@ class DownloadMixin:
 
     def _private_python_spec(self):
         if not self._supports_private_python_installer():
-            return None, "当前平台暂未接入私有 Python 3.12 自动安装。mac 版请使用系统 Python。"
+            return None, "当前平台暂未接入私有 Python 3.12 自动安装。mac 版请改用现有 Python 构建项目虚拟环境。"
         machine = (platform.machine() or "").lower()
         if machine in ("amd64", "x86_64", "x64", ""):
             arch = "amd64"
@@ -348,7 +384,7 @@ class DownloadMixin:
     def _private_runtime_paths(self, target):
         root = os.path.join(target, ".launcher_runtime")
         python_root = os.path.join(root, "python312")
-        venv_root = os.path.join(root, "venv312")
+        venv_root = os.path.join(root, "venv" if self._uses_system_python_download_mode() else "venv312")
         downloads_root = os.path.join(root, "downloads")
         python_exe = os.path.join(python_root, "python.exe" if os.name == "nt" else "bin/python")
         venv_python = os.path.join(venv_root, "Scripts", "python.exe") if os.name == "nt" else os.path.join(venv_root, "bin", "python")
@@ -421,6 +457,76 @@ class DownloadMixin:
                 add(os.path.join(local_appdata, "Programs", "Python", "Python312-32", "python.exe"))
 
         return candidates
+
+    def _project_venv_seed_candidates(self, target):
+        paths = self._private_runtime_paths(target)
+        runtime_root = str((paths or {}).get("root") or "").strip()
+        venv_root = str((paths or {}).get("venv_root") or "").strip()
+        seen = set()
+        failures = []
+        candidates = []
+
+        def add_candidate(info, source):
+            path = str((info or {}).get("path") or "").strip()
+            if not path:
+                return
+            norm = self._normalized_download_path(path)
+            if not norm or norm in seen:
+                return
+            if self._download_path_is_within(path, venv_root):
+                failures.append(f"跳过待重建目录中的旧虚拟环境解释器：{path}")
+                return
+            if self._download_path_is_within(path, runtime_root):
+                failures.append(f"跳过当前 GenericAgent 目录下 launcher 运行时中的旧解释器：{path}")
+                return
+            seen.add(norm)
+            candidates.append(
+                {
+                    "path": path,
+                    "version": str((info or {}).get("version") or "").strip(),
+                    "source": str(source or "").strip(),
+                }
+            )
+
+        cfg = getattr(self, "cfg", None)
+        cfg_py = str((cfg or {}).get("python_exe") or "").strip() if isinstance(cfg, dict) else ""
+        if cfg_py:
+            resolved = str(lz._resolve_configured_python_exe(cfg_py, agent_dir=target) or "").strip()
+            if resolved and os.path.isfile(resolved):
+                info = lz._probe_python_command([resolved]) or {"path": resolved, "version": self._probe_python_version_prefix(resolved)}
+                add_candidate(info, "已配置 python_exe")
+            else:
+                failures.append(f"已配置 python_exe 不存在或不可访问：{cfg_py}")
+
+        for info in lz._system_python_candidates(agent_dir=target):
+            add_candidate(info, "系统候选")
+        return candidates, failures
+
+    def _project_venv_seed_failure_text(self, *, requires_python="", failures=None):
+        lines = ["未找到可用于构建项目虚拟环境的 Python 解释器。"]
+        required = str(requires_python or "").strip()
+        if required:
+            lines.append(f"当前 GenericAgent 上游要求 {required}。")
+        for item in list(failures or [])[:5]:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"- {text}")
+        lines.append("mac 请优先安装 Homebrew Python 3.11 / 3.12，例如 /opt/homebrew/bin/python3 或 /usr/local/bin/python3。")
+        lines.append("如果你已经有可用解释器，也可以在 launcher_config.json 中手动指定 python_exe。")
+        lines.append("如果项目已下载，也可以先去“我已经下载了 GenericAgent”页面填写 Python 可执行文件，再回来构建项目虚拟环境。")
+        return "\n".join(lines)
+
+    def _select_project_venv_seed_python(self, target):
+        manifest = lz.resolve_upstream_dependency_manifest(target)
+        requires_python = str((manifest or {}).get("requires_python") or "").strip()
+        candidates, failures = self._project_venv_seed_candidates(target)
+        for info in candidates:
+            version = str((info or {}).get("version") or "").strip()
+            if requires_python and version and (not lz._python_version_matches_requires(version, requires_python)):
+                failures.append(f"{info['path']} (Python {version})：{lz._upstream_python_range_error(version, requires_python)}")
+                continue
+            return info, ""
+        return {}, self._project_venv_seed_failure_text(requires_python=requires_python, failures=failures)
 
     def _resolve_private_python_exe(self, paths, *, wait_seconds=0):
         try:
@@ -756,12 +862,74 @@ class DownloadMixin:
             )
         return False, detail
 
+    def _build_runtime_venv(self, target, *, seed_python, env_display_name, create_label):
+        paths = self._private_runtime_paths(target)
+        os.makedirs(paths["root"], exist_ok=True)
+        self._event_queue.put({"event": "clone_status", "msg": f"正在创建{env_display_name}…"})
+        ok, detail = self._run_checked_command(
+            [seed_python, "-m", "venv", "--clear", paths["venv_root"]],
+            timeout=1200,
+            label=create_label,
+        )
+        if not ok:
+            return None, detail
+        if not os.path.isfile(paths["venv_python"]):
+            return None, f"{env_display_name}创建完成后未找到 venv 的 Python 可执行文件。"
+
+        self._event_queue.put({"event": "clone_status", "msg": "正在初始化 pip…"})
+        ok, detail = self._run_checked_command(
+            [paths["venv_python"], "-m", "ensurepip", "--upgrade"],
+            timeout=1200,
+            label="初始化 pip",
+        )
+        if not ok:
+            return None, detail
+
+        self._event_queue.put({"event": "clone_status", "msg": f"正在为{env_display_name}升级 requests / simplejson 到最新版…"})
+        ok, detail = self._run_checked_command(
+            [paths["venv_python"], "-m", "pip", "install", "--upgrade", "requests", "simplejson"],
+            timeout=1800,
+            label="安装 requests / simplejson",
+        )
+        if not ok:
+            return None, detail
+
+        ok, detail = lz._probe_python_agent_compat(paths["venv_python"], target)
+        if not ok:
+            return None, f"{env_display_name}已创建，但载入 GenericAgent 失败：{detail}"
+        return paths["venv_python"], None
+
     def _ensure_private_python_env(self, target):
+        paths = self._private_runtime_paths(target)
+        os.makedirs(paths["root"], exist_ok=True)
+        if self._uses_system_python_download_mode():
+            seed_info, seed_err = self._select_project_venv_seed_python(target)
+            if seed_err:
+                return None, seed_err
+            seed_python = str((seed_info or {}).get("path") or "").strip()
+            seed_version = str((seed_info or {}).get("version") or "").strip()
+            seed_source = str((seed_info or {}).get("source") or "").strip()
+            seed_label = f"{seed_python}（Python {seed_version}）" if seed_version else seed_python
+            if seed_source:
+                self._event_queue.put({"event": "clone_status", "msg": f"将使用{seed_source} 作为 seed Python：{seed_label}"})
+            else:
+                self._event_queue.put({"event": "clone_status", "msg": f"将使用 seed Python：{seed_label}"})
+            self._event_queue.put(
+                {
+                    "event": "clone_status",
+                    "msg": "只会用这个 seed Python 执行 -m venv；后续依赖只会安装到项目虚拟环境，不会写入系统 Python。",
+                }
+            )
+            return self._build_runtime_venv(
+                target,
+                seed_python=seed_python,
+                env_display_name=self._download_managed_env_display_name(),
+                create_label="创建项目虚拟环境",
+            )
+
         spec, spec_err = self._private_python_spec()
         if spec_err:
             return None, spec_err
-        paths = self._private_runtime_paths(target)
-        os.makedirs(paths["root"], exist_ok=True)
         os.makedirs(paths["downloads_root"], exist_ok=True)
 
         python_exe, python_version, _ = self._resolve_private_python_exe(paths, wait_seconds=0)
@@ -844,39 +1012,12 @@ class DownloadMixin:
         else:
             self._event_queue.put({"event": "clone_status", "msg": f"复用已存在的私有 Python {python_version}：{paths['python_exe']}"})
 
-        self._event_queue.put({"event": "clone_status", "msg": "正在创建私有 3.12 虚拟环境…"})
-        ok, detail = self._run_checked_command(
-            [paths["python_exe"], "-m", "venv", "--clear", paths["venv_root"]],
-            timeout=1200,
-            label="创建私有虚拟环境",
+        return self._build_runtime_venv(
+            target,
+            seed_python=paths["python_exe"],
+            env_display_name=self._download_managed_env_display_name(),
+            create_label="创建私有虚拟环境",
         )
-        if not ok:
-            return None, detail
-        if not os.path.isfile(paths["venv_python"]):
-            return None, "虚拟环境创建完成后未找到 venv 的 python.exe。"
-
-        self._event_queue.put({"event": "clone_status", "msg": "正在初始化 pip…"})
-        ok, detail = self._run_checked_command(
-            [paths["venv_python"], "-m", "ensurepip", "--upgrade"],
-            timeout=1200,
-            label="初始化 pip",
-        )
-        if not ok:
-            return None, detail
-
-        self._event_queue.put({"event": "clone_status", "msg": "正在为私有虚拟环境升级 requests / simplejson 到最新版…"})
-        ok, detail = self._run_checked_command(
-            [paths["venv_python"], "-m", "pip", "install", "--upgrade", "requests", "simplejson"],
-            timeout=1800,
-            label="安装 requests / simplejson",
-        )
-        if not ok:
-            return None, detail
-
-        ok, detail = lz._probe_python_agent_compat(paths["venv_python"], target)
-        if not ok:
-            return None, f"私有 3.12 虚拟环境已创建，但载入 GenericAgent 失败：{detail}"
-        return paths["venv_python"], None
 
     def _run_clone_repo(self, target, private_python=False, private_only=False):
         try:
@@ -884,7 +1025,7 @@ class DownloadMixin:
                 if not lz.is_valid_agent_dir(target):
                     self._event_queue.put({"event": "clone_error", "msg": "仅配置虚拟环境时，目标目录必须已经是有效的 GenericAgent 根目录。"})
                     return
-                self._event_queue.put({"event": "clone_status", "msg": "已跳过源码下载，继续为现有目录配置私有 3.12 环境。"})
+                self._event_queue.put({"event": "clone_status", "msg": f"已跳过源码下载，继续为现有目录{self._download_managed_env_action_text()}。"})
             elif not lz.is_valid_agent_dir(target):
                 try:
                     lz._run_external_subprocess(
@@ -921,13 +1062,13 @@ class DownloadMixin:
                     self._event_queue.put({"event": "clone_error", "msg": detail or "git clone 失败，请检查网络后重试。"})
                     return
             elif private_python:
-                self._event_queue.put({"event": "clone_status", "msg": "检测到现有 GenericAgent 目录，跳过 git clone，继续配置私有 3.12 环境。"})
+                self._event_queue.put({"event": "clone_status", "msg": f"检测到现有 GenericAgent 目录，跳过 git clone，继续{self._download_managed_env_action_text()}。"})
 
             python_exe = ""
             if private_python:
                 python_exe, py_err = self._ensure_private_python_env(target)
                 if not python_exe:
-                    self._event_queue.put({"event": "clone_error", "msg": py_err or "私有 3.12 虚拟环境配置失败。"})
+                    self._event_queue.put({"event": "clone_error", "msg": py_err or f"{self._download_managed_env_display_name()}准备失败。"})
                     return
             self._event_queue.put({"event": "clone_done", "target": target, "python_exe": python_exe, "private_python": bool(private_python)})
         except Exception as e:
@@ -953,8 +1094,10 @@ class DownloadMixin:
                 self._set_agent_dir(target)
             self._refresh_download_state()
             if private_python and python_exe:
-                self.download_status_label.setText("下载完成，已配置私有 3.12 虚拟环境并设置为当前 GenericAgent 目录。现在可以直接进入聊天。")
-                self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 私有 3.12 虚拟环境已就绪：{python_exe}")
+                self.download_status_label.setText(self._download_managed_env_ready_text())
+                self._append_download_log(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] {self._download_managed_env_display_name()}已就绪：{python_exe}"
+                )
             else:
                 self.download_status_label.setText(self._download_clone_ready_text())
             self._append_download_log(f"[{datetime.now().strftime('%H:%M:%S')}] 下载完成")
