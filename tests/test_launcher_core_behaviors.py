@@ -851,6 +851,15 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
             self.assertLess(center.green(), 120)
             self.assertLess(center.blue(), 120)
 
+    def test_message_row_skips_selectable_user_label_on_macos_github_actions(self):
+        app = QApplication.instance() or QApplication([])
+        self.addCleanup(lambda: app.processEvents())
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), mock.patch.object(common.lz, "IS_MACOS", True):
+            row = common.MessageRow("hello", "user")
+        label = getattr(row, "_label", None)
+        self.assertIsNotNone(label)
+        self.assertEqual(label.property("_ga_selection_mode"), "disabled")
+
     def test_theme_settings_source_includes_chat_avatar_configuration(self):
         root = os.path.dirname(os.path.dirname(__file__))
         settings_path = os.path.join(root, "qt_chat_parts", "settings_panel.py")

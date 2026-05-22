@@ -956,6 +956,24 @@ def _apply_message_avatar(label: QLabel | None, role: str, cfg: dict | None = No
     label.setText("你" if role_key == "user" else "助")
 
 
+def _configure_message_label_selection(label: QLabel | None) -> None:
+    if label is None:
+        return
+    # GitHub macOS runners can segfault when a headless QLabel enables mouse text
+    # selection. Keep normal desktop behavior, but skip the risky path in CI.
+    if bool(getattr(lz, "IS_MACOS", False)) and str(os.environ.get("GITHUB_ACTIONS") or "").strip().lower() == "true":
+        try:
+            label.setProperty("_ga_selection_mode", "disabled")
+        except Exception:
+            pass
+        return
+    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    try:
+        label.setProperty("_ga_selection_mode", "mouse")
+    except Exception:
+        pass
+
+
 _STREAMING_HEIGHT_GROWTH_STEP_PX = 8
 _BROWSER_MIN_HEIGHT_PX = 18
 _BROWSER_HEIGHT_SLACK_PX = 2
@@ -1530,7 +1548,7 @@ class MessageRow(QWidget):
             label = QLabel(self._text)
             label.setObjectName("userMsgText")
             label.setWordWrap(True)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            _configure_message_label_selection(label)
             label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
             right.addWidget(label)
             self._label = label
