@@ -111,6 +111,135 @@ class UpdateManagerLockTests(unittest.TestCase):
         self.assertIn("denied", cm.exception.detail)
         self.assertTrue(os.path.exists(self.lock_path))
 
+    def test_windows_owner_probe_treats_invalid_pid_as_not_running(self):
+        class FakeKernel32:
+            def OpenProcess(self, _access, _inherit, _pid):
+                return 0
+
+            def GetLastError(self):
+                return 87
+
+            def GetExitCodeProcess(self, _handle, _code):
+                return 0
+
+            def CloseHandle(self, _handle):
+                return 1
+
+        import ctypes
+
+        with mock.patch.object(update_manager.os, "name", "nt"), mock.patch.object(
+            ctypes, "WinDLL", return_value=FakeKernel32(), create=True
+        ), mock.patch.object(ctypes, "get_last_error", return_value=0, create=True), mock.patch.object(
+            ctypes, "set_last_error", return_value=None, create=True
+        ):
+            self.assertFalse(update_manager._update_lock_owner_running(424242))
+
+    def test_launch_update_job_records_preflight_lock_failure(self):
+        job = {
+            "job_id": "job-preflight",
+            "target_version": "1.2.4",
+            "package_url": "https://example.com/update.zip",
+            "package_sha256": "a" * 64,
+            "status": "queued",
+            "phase": "queued",
+            "error_code": "",
+            "error_detail": "",
+        }
+        job_path = os.path.join(self.updates_dir, "job-preflight.json")
+        update_manager._atomic_write_json(job_path, job)
+        err = update_manager.UpdateError(
+            update_manager.ERR_LOCK_TIMEOUT,
+            "更新锁等待超时",
+            phase="prepare",
+            detail="uncertain: pid=424242 status unknown",
+        )
+
+        with mock.patch.object(update_manager, "_update_lock", side_effect=err), mock.patch.object(
+            update_manager, "launch_installed_updater"
+        ) as launch_installed:
+            with self.assertRaises(update_manager.UpdateError):
+                update_manager.launch_update_job(job_path)
+
+        launch_installed.assert_not_called()
+        payload = update_manager._read_json_file(job_path, {})
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["phase"], "prepare")
+        self.assertEqual(payload["error_code"], update_manager.ERR_LOCK_TIMEOUT)
+        self.assertIn("uncertain: pid=424242", payload["error_detail"])
+
+    def test_launch_update_job_records_missing_updater_failure(self):
+        job = {
+            "job_id": "job-launch",
+            "target_version": "1.2.4",
+            "package_url": "https://example.com/update.zip",
+            "package_sha256": "a" * 64,
+            "status": "queued",
+            "phase": "queued",
+            "error_code": "",
+            "error_detail": "",
+        }
+        job_path = os.path.join(self.updates_dir, "job-launch.json")
+        update_manager._atomic_write_json(job_path, job)
+
+        with mock.patch.object(update_manager, "_update_lock") as update_lock, mock.patch.object(
+            update_manager, "launch_installed_updater", side_effect=FileNotFoundError("Updater.exe 不存在")
+        ):
+            update_lock.return_value.__enter__.return_value = self.lock_path
+            update_lock.return_value.__exit__.return_value = False
+            with self.assertRaises(FileNotFoundError):
+                update_manager.launch_update_job(job_path)
+
+        payload = update_manager._read_json_file(job_path, {})
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["phase"], "launch")
+        self.assertEqual(payload["error_code"], update_manager.ERR_UPDATER_LAUNCH)
+        self.assertIn("Updater.exe 不存在", payload["error_detail"])
+
+    def test_signed_release_metadata_uses_internal_install_mode(self):
+        release = {
+            "tag_name": "v1.2.4",
+            "html_url": "https://github.com/example/launcher/releases/tag/v1.2.4",
+            "body": "notes",
+            "assets": [
+                {
+                    "name": "manifest.json",
+                    "browser_download_url": "https://example.com/manifest.json",
+                },
+                {
+                    "name": "launcher-update-1.2.4.zip",
+                    "browser_download_url": "https://example.com/launcher-update-1.2.4.zip",
+                },
+            ],
+        }
+        manifest = (
+            b'{"version":"1.2.4","channel":"stable",'
+            b'"signature":"signed",'
+            b'"package":{"name":"launcher-update-1.2.4.zip","sha256":"'
+            + (b"a" * 64)
+            + b'"},'
+            b'"security":{"health_min_alive_seconds":7,"health_startup_timeout_seconds":30}}'
+        )
+
+        with mock.patch.object(update_manager, "_fetch_text", return_value=manifest), mock.patch.object(
+            update_manager, "verify_manifest_signature"
+        ) as verify_signature:
+            info = update_manager._release_to_launcher_update_info(
+                release,
+                public_key_pem="-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----",
+            )
+
+        verify_signature.assert_called_once_with(
+            manifest,
+            "signed",
+            "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----",
+        )
+        self.assertEqual(info["install_mode"], "internal")
+        self.assertEqual(info["target_version"], "1.2.4")
+        self.assertEqual(info["package_url"], "https://example.com/launcher-update-1.2.4.zip")
+        self.assertEqual(info["package_sha256"], "a" * 64)
+        self.assertEqual(info["health_min_alive_seconds"], 7)
+        self.assertEqual(info["health_startup_timeout_seconds"], 30)
+
 
 if __name__ == "__main__":
     unittest.main()

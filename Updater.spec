@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 
+from PyInstaller.utils.hooks import collect_all
+
 
 def _resolve_root_dir():
     spec_path = globals().get("__file__") or globals().get("SPEC")
@@ -16,12 +18,21 @@ UPDATER_SCRIPT = os.path.join(ROOT_DIR, "updater.py")
 HOOKS_DIR = os.path.join(ROOT_DIR, "hooks")
 WINDOWS_ICON_PATH = os.path.join(ROOT_DIR, "assets", "launcher_app_icon.ico")
 
+binaries = []
+datas = []
+hiddenimports = []
+for _package in ("requests", "simplejson", "charset_normalizer", "cryptography"):
+    _package_datas, _package_binaries, _package_hiddenimports = collect_all(_package)
+    datas += _package_datas
+    binaries += _package_binaries
+    hiddenimports += _package_hiddenimports
+
 a = Analysis(
     [UPDATER_SCRIPT],
     pathex=[ROOT_DIR],
-    binaries=[],
-    datas=[],
-    hiddenimports=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[HOOKS_DIR],
     hooksconfig={},
     runtime_hooks=[],

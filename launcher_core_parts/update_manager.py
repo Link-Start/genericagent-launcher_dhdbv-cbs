@@ -62,6 +62,7 @@ ERR_PACKAGE_EXTRACT = "UPD-E-PACKAGE-EXTRACT"
 ERR_PACKAGE_CONTENT = "UPD-E-PACKAGE-CONTENT"
 ERR_INSTALL = "UPD-E-INSTALL"
 ERR_AUTHENTICODE = "UPD-E-AUTHENTICODE-INVALID"
+ERR_UPDATER_LAUNCH = "UPD-E-UPDATER-LAUNCH"
 ERR_BOOTSTRAP = "UPD-E-BOOTSTRAP"
 ERR_HEALTH_STARTUP_TIMEOUT = "UPD-E-HEALTH-STARTUP-TIMEOUT"
 ERR_HEALTH_ALIVE_TIMEOUT = "UPD-E-HEALTH-ALIVE-TIMEOUT"
@@ -329,6 +330,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str, prox
     return {
         "target_version": target_version,
         "channel": channel,
+        "install_mode": "internal",
         "package_url": package_url,
         "package_sha256": package_sha256,
         "release_url": str(release.get("html_url") or "").strip(),
@@ -413,7 +415,40 @@ def create_update_job(update_info: dict):
 
 
 def launch_update_job(job_path: str):
-    return launch_installed_updater(str(job_path or "").strip())
+    job_file = str(job_path or "").strip()
+    job = _read_json_file(job_file, {}) if job_file else {}
+    if not isinstance(job, dict):
+        job = {}
+    try:
+        # Fail before closing the UI if a previous updater left an active or
+        # uncertain lock behind. Confirmed-stale locks are cleaned here.
+        with _update_lock(timeout_seconds=3):
+            pass
+        return launch_installed_updater(job_file)
+    except UpdateError as e:
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="failed",
+                phase=e.phase,
+                error_code=e.code,
+                error_detail=_trim_detail(e.detail or str(e)),
+                completed_at=float(time.time()),
+            )
+        raise
+    except Exception as e:
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="failed",
+                phase="launch",
+                error_code=ERR_UPDATER_LAUNCH,
+                error_detail=_trim_detail(str(e)),
+                completed_at=float(time.time()),
+            )
+        raise
 
 
 def _save_job_state(job_file: str, job: dict, **patch):
@@ -467,14 +502,42 @@ def _update_lock_owner_running(pid: int):
         from ctypes import wintypes
     except Exception:
         return None
-    kernel32 = getattr(ctypes, "windll", None)
-    kernel32 = getattr(kernel32, "kernel32", None)
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        kernel32 = getattr(ctypes, "windll", None)
+        kernel32 = getattr(kernel32, "kernel32", None)
     if kernel32 is None:
         return None
     process_access = 0x1000 | 0x00100000
     still_active = 259
     error_access_denied = 5
     error_invalid_parameter = 87
+    try:
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+    except Exception:
+        pass
+
+    def _last_error() -> int:
+        try:
+            err = int(ctypes.get_last_error() or 0)
+            if err:
+                return err
+        except Exception:
+            pass
+        try:
+            getter = getattr(kernel32, "GetLastError", None)
+            if getter is not None:
+                return int(getter() or 0)
+        except Exception:
+            pass
+        return 0
+
     try:
         ctypes.set_last_error(0)
     except Exception:
@@ -484,10 +547,7 @@ def _update_lock_owner_running(pid: int):
     except Exception:
         return None
     if not handle:
-        try:
-            err = int(ctypes.get_last_error() or 0)
-        except Exception:
-            err = 0
+        err = _last_error()
         if err == error_access_denied:
             return True
         if err == error_invalid_parameter:

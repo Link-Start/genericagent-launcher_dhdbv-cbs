@@ -4080,14 +4080,20 @@ tg_bot_token = '123'
         root = os.path.dirname(os.path.dirname(__file__))
         updater_path = os.path.join(root, "updater.py")
         spec_path = os.path.join(root, "GenericAgentLauncher.spec")
+        updater_spec_path = os.path.join(root, "Updater.spec")
         with open(updater_path, "r", encoding="utf-8") as f:
             updater_src = f.read()
         with open(spec_path, "r", encoding="utf-8") as f:
             spec_src = f.read()
+        with open(updater_spec_path, "r", encoding="utf-8") as f:
+            updater_spec_src = f.read()
         self.assertIn("from launcher_core_parts.runtime import updater_log", updater_src)
         self.assertIn("from launcher_core_parts.update_manager import apply_update_job", updater_src)
         self.assertNotIn("from launcher_app import core as lz", updater_src)
         self.assertIn('"cryptography"', spec_src)
+        self.assertIn("collect_all", updater_spec_src)
+        for dependency in ("requests", "simplejson", "charset_normalizer", "cryptography"):
+            self.assertIn(f'"{dependency}"', updater_spec_src)
 
     def test_markup_helpers(self):
         raw = """
