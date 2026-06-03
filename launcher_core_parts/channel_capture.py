@@ -11,13 +11,17 @@ def channel_capture_sitecustomize_source() -> str:
         import inspect
         import json
         import os
-        import queue
         import re
+        import sys
         import threading
         import time
 
         _GA_CHANNEL_CAPTURE_INSTALLED = False
         _GA_CHANNEL_CAPTURE_LOCK = threading.RLock()
+        _GA_QUEUE_CAPTURE_STATES = {}
+        _GA_QUEUE_CAPTURE_CLASS_ORIGINAL_PUT = {}
+        _GA_QUEUE_CAPTURE_STATE_MAX = 4096
+        _GA_QUEUE_CAPTURE_STATE_TTL_SECONDS = 3600
         _GA_CHANNEL_CAPTURE_SOURCES = {
             "wechat": "wechat",
             "telegram": "telegram",
@@ -92,73 +96,287 @@ def channel_capture_sitecustomize_source() -> str:
             return default
 
 
+        def _ga_text(value):
+            if value in (None, ""):
+                return ""
+            return str(value).strip()
+
+
+        def _ga_first_value(*values):
+            for value in values:
+                text = _ga_text(value)
+                if text:
+                    return text
+            return ""
+
+
+        def _ga_pick(obj, *names):
+            for name in names:
+                if isinstance(obj, dict):
+                    value = obj.get(name)
+                else:
+                    value = _ga_attr(obj, name, "")
+                text = _ga_text(value)
+                if text:
+                    return text
+            return ""
+
+
+        def _ga_nested_pick(obj, *paths):
+            for path in paths:
+                cur = obj
+                ok = True
+                for name in path:
+                    if isinstance(cur, dict):
+                        cur = cur.get(name)
+                    else:
+                        cur = _ga_attr(cur, name, None)
+                    if cur in (None, ""):
+                        ok = False
+                        break
+                if ok:
+                    text = _ga_text(cur)
+                    if text:
+                        return text
+            return ""
+
+
+        def _ga_cleanup_queue_capture_states_locked(now=None):
+            now = time.time() if now is None else float(now or 0)
+            expired = []
+            for key, state in list(_GA_QUEUE_CAPTURE_STATES.items()):
+                if not isinstance(state, dict):
+                    expired.append(key)
+                    continue
+                created_at = float(state.get("created_at", now) or now)
+                if state.get("recorded_done") or (now - created_at) > _GA_QUEUE_CAPTURE_STATE_TTL_SECONDS:
+                    expired.append(key)
+            if len(_GA_QUEUE_CAPTURE_STATES) - len(expired) > _GA_QUEUE_CAPTURE_STATE_MAX:
+                survivors = [
+                    (float(state.get("created_at", now) or now), key)
+                    for key, state in _GA_QUEUE_CAPTURE_STATES.items()
+                    if key not in expired and isinstance(state, dict)
+                ]
+                survivors.sort()
+                overflow = len(_GA_QUEUE_CAPTURE_STATES) - len(expired) - _GA_QUEUE_CAPTURE_STATE_MAX
+                expired.extend(key for _, key in survivors[:max(0, overflow)])
+            for key in expired:
+                _GA_QUEUE_CAPTURE_STATES.pop(key, None)
+
+
         def _ga_context_from_stack(source):
             channel = _ga_normalize_source(source)
-            parts = [channel]
+            chat_id = ""
+            thread_token = ""
+            context_token = ""
             event_id = ""
             user_label = ""
             frame = inspect.currentframe()
             try:
                 frame = frame.f_back
                 depth = 0
-                while frame is not None and depth < 24:
+                while frame is not None and depth < 36:
                     local = frame.f_locals
                     if not user_label:
-                        for key in ("uid", "open_id", "sender_id", "user_id"):
+                        for key in (
+                            "uid",
+                            "open_id",
+                            "openid",
+                            "sender_id",
+                            "senderId",
+                            "sender_staff_id",
+                            "senderStaffId",
+                            "user_id",
+                            "userId",
+                            "author_id",
+                            "authorId",
+                            "from_user_id",
+                            "fromUserId",
+                            "from_wxid",
+                        ):
                             value = local.get(key)
                             if value not in (None, ""):
-                                user_label = str(value)
+                                user_label = _ga_text(value)
                                 break
                     if not event_id:
-                        for key in ("msg_id", "message_id"):
+                        for key in ("msg_id", "msgId", "message_id", "messageId", "event_id", "eventId"):
                             value = local.get(key)
                             if value not in (None, ""):
-                                event_id = str(value)
+                                event_id = _ga_text(value)
                                 break
-                    if local.get("chat_id") not in (None, ""):
-                        parts.append(local.get("chat_id"))
-                        break
-                    if local.get("conversation_id") not in (None, ""):
-                        parts.append(local.get("conversation_id"))
-                        break
-                    if local.get("uid") not in (None, ""):
-                        parts.append(local.get("uid"))
-                        if local.get("ctx") not in (None, ""):
-                            parts.append(local.get("ctx"))
-                        break
+                    if not chat_id:
+                        chat_id = _ga_first_value(
+                            local.get("chat_id"),
+                            local.get("chatId"),
+                            local.get("conversation_id"),
+                            local.get("conversationId"),
+                            local.get("open_conversation_id"),
+                            local.get("openConversationId"),
+                            local.get("group_id"),
+                            local.get("groupId"),
+                            local.get("group_openid"),
+                            local.get("room_id"),
+                            local.get("roomid"),
+                            local.get("roomId"),
+                            local.get("guild_id"),
+                            local.get("guildId"),
+                            local.get("channel_id"),
+                            local.get("channelId"),
+                            local.get("uid"),
+                        )
+                    if not thread_token:
+                        thread_token = _ga_first_value(
+                            local.get("thread_id"),
+                            local.get("threadId"),
+                            local.get("message_thread_id"),
+                            local.get("messageThreadId"),
+                            local.get("topic_id"),
+                            local.get("topicId"),
+                        )
+                    if not context_token:
+                        context_token = _ga_text(local.get("context_token"))
+                    ctx = local.get("ctx")
+                    if not context_token and ctx not in (None, "") and not isinstance(ctx, (dict, list, tuple, set)):
+                        context_token = _ga_text(ctx)
+                    if isinstance(ctx, dict):
+                        if not event_id:
+                            event_id = _ga_pick(ctx, "msg_id", "msgId", "message_id", "messageId", "id")
+                        if not user_label:
+                            user_label = _ga_pick(ctx, "uid", "open_id", "openid", "sender_id", "senderId", "user_id", "userId")
+                        if not chat_id:
+                            chat_id = _ga_pick(
+                                ctx,
+                                "chat_id",
+                                "chatId",
+                                "conversation_id",
+                                "conversationId",
+                                "group_id",
+                                "groupId",
+                                "room_id",
+                                "roomid",
+                                "guild_id",
+                                "channel_id",
+                            )
+                        if not context_token:
+                            context_token = _ga_pick(ctx, "context_token")
+                    query_obj = local.get("query")
+                    if query_obj is not None:
+                        msg_obj = _ga_attr(query_obj, "message", None)
+                        if not event_id:
+                            event_id = _ga_first_value(
+                                _ga_attr(query_obj, "id", ""),
+                                _ga_attr(msg_obj, "message_id", ""),
+                                _ga_attr(msg_obj, "id", ""),
+                            )
+                        if not chat_id:
+                            chat = _ga_attr(msg_obj, "chat", None)
+                            chat_id = _ga_first_value(_ga_attr(chat, "id", ""), _ga_attr(msg_obj, "chat_id", ""))
+                        if not user_label:
+                            user = _ga_attr(query_obj, "from_user", None)
+                            user_label = _ga_attr(user, "id", "")
                     msg = local.get("msg")
                     if isinstance(msg, dict):
                         if not event_id:
-                            event_id = str(msg.get("message_id") or msg.get("msgid") or "")
-                        from_user = str(msg.get("from_user_id") or msg.get("from") or "")
-                        context_token = str(msg.get("context_token") or "")
-                        if from_user or context_token:
-                            parts.extend([from_user, context_token])
-                            break
+                            event_id = _ga_pick(msg, "message_id", "messageId", "msgid", "msgId", "id")
+                        if not user_label:
+                            user_label = _ga_pick(
+                                msg,
+                                "from_user_id",
+                                "fromUserId",
+                                "from",
+                                "openid",
+                                "user_openid",
+                                "sender_id",
+                                "senderStaffId",
+                            )
+                        if not chat_id:
+                            chat_id = _ga_pick(
+                                msg,
+                                "chat_id",
+                                "chatId",
+                                "conversation_id",
+                                "conversationId",
+                                "group_openid",
+                                "group_id",
+                                "room_id",
+                                "roomid",
+                                "guild_id",
+                                "channel_id",
+                            )
+                        if not context_token:
+                            context_token = _ga_pick(msg, "context_token")
                     message = local.get("message")
                     if message is not None:
                         if not event_id:
-                            event_id = str(_ga_attr(message, "message_id", "") or _ga_attr(message, "id", ""))
-                        chat_id = _ga_attr(message, "chat_id", "")
+                            event_id = _ga_first_value(_ga_attr(message, "message_id", ""), _ga_attr(message, "id", ""))
+                        if not chat_id:
+                            msg_chat_id = _ga_attr(message, "chat_id", "")
+                            chat_id = _ga_text(msg_chat_id)
                         if not chat_id:
                             chat = _ga_attr(message, "chat", None)
-                            chat_id = _ga_attr(chat, "id", "")
-                        if chat_id:
-                            parts.append(chat_id)
-                            break
+                            chat_id = _ga_text(_ga_attr(chat, "id", ""))
+                        if not chat_id:
+                            channel_obj = _ga_attr(message, "channel", None)
+                            guild_obj = _ga_attr(message, "guild", None)
+                            chat_id = _ga_first_value(
+                                _ga_attr(guild_obj, "id", ""),
+                                _ga_attr(channel_obj, "id", ""),
+                            )
+                        if not thread_token:
+                            thread_token = _ga_first_value(
+                                _ga_attr(message, "message_thread_id", ""),
+                                _ga_attr(message, "thread_id", ""),
+                            )
+                        if not user_label:
+                            author = _ga_attr(message, "author", None) or _ga_attr(message, "from_user", None)
+                            user_label = _ga_first_value(_ga_attr(author, "id", ""), _ga_attr(author, "name", ""))
                     update = local.get("update")
                     if update is not None:
                         msg_obj = _ga_attr(update, "message", None) or _ga_attr(update, "effective_message", None)
                         if not event_id:
-                            event_id = str(_ga_attr(msg_obj, "message_id", ""))
-                        chat = _ga_attr(update, "effective_chat", None) or _ga_attr(msg_obj, "chat", None)
-                        chat_id = _ga_attr(chat, "id", "")
-                        if chat_id:
-                            parts.append(chat_id)
-                            break
+                            event_id = _ga_first_value(_ga_attr(msg_obj, "message_id", ""), _ga_attr(msg_obj, "id", ""))
+                        if not chat_id:
+                            chat = _ga_attr(update, "effective_chat", None) or _ga_attr(msg_obj, "chat", None)
+                            chat_id = _ga_text(_ga_attr(chat, "id", ""))
+                        if not thread_token:
+                            thread_token = _ga_first_value(
+                                _ga_attr(msg_obj, "message_thread_id", ""),
+                                _ga_attr(msg_obj, "thread_id", ""),
+                            )
+                        if not user_label:
+                            user = _ga_attr(update, "effective_user", None)
+                            user_label = _ga_text(_ga_attr(user, "id", ""))
                     data = local.get("data")
                     if data is not None:
-                        chat_id = _ga_attr(data, "group_openid", "") or _ga_dict_get(data, "group_openid", "")
+                        if not event_id:
+                            event_id = _ga_pick(data, "id", "msg_id", "msgId", "message_id", "messageId")
+                        if not chat_id:
+                            chat_id = _ga_first_value(
+                                _ga_pick(
+                                    data,
+                                    "group_openid",
+                                    "group_id",
+                                    "groupId",
+                                    "chat_id",
+                                    "chatId",
+                                    "conversation_id",
+                                    "conversationId",
+                                    "openConversationId",
+                                    "room_id",
+                                    "roomid",
+                                    "guild_id",
+                                    "channel_id",
+                                ),
+                                _ga_nested_pick(
+                                    data,
+                                    ("message", "chat_id"),
+                                    ("message", "chatId"),
+                                    ("message", "conversationId"),
+                                    ("event", "message", "chat_id"),
+                                    ("event", "message", "chatId"),
+                                    ("event", "message", "conversationId"),
+                                ),
+                            )
                         if not chat_id:
                             author = _ga_attr(data, "author", None) or _ga_dict_get(data, "author", {})
                             chat_id = (
@@ -169,14 +387,36 @@ def channel_capture_sitecustomize_source() -> str:
                                 or _ga_dict_get(author, "user_openid", "")
                                 or _ga_dict_get(author, "id", "")
                             )
-                        if chat_id:
-                            parts.append(chat_id)
-                            break
+                        if not user_label:
+                            sender = _ga_nested_pick(
+                                data,
+                                ("event", "sender", "sender_id", "open_id"),
+                                ("event", "sender", "senderId", "openId"),
+                                ("sender", "sender_id", "open_id"),
+                                ("sender", "senderId", "openId"),
+                            )
+                            user_label = _ga_first_value(
+                                sender,
+                                _ga_pick(data, "sender_id", "senderId", "sender_staff_id", "senderStaffId", "user_id", "userId"),
+                            )
                     frame = frame.f_back
                     depth += 1
             finally:
                 del frame
-            if len(parts) <= 1:
+            parts = [channel]
+            if chat_id:
+                parts.append(chat_id)
+                if thread_token:
+                    parts.append(thread_token)
+                elif context_token:
+                    parts.append(context_token)
+            elif user_label:
+                parts.append(user_label)
+                if context_token:
+                    parts.append(context_token)
+            elif context_token:
+                parts.append(context_token)
+            else:
                 parts.append("default")
             conversation_id = "|".join(str(part or "").strip() for part in parts if str(part or "").strip())
             return conversation_id or (channel + "|default"), event_id, user_label
@@ -434,13 +674,15 @@ def channel_capture_sitecustomize_source() -> str:
 
 
         def _ga_patch_display_queue(dq, agent, channel, conversation_id, event_id):
-            if not isinstance(dq, queue.Queue):
+            if dq is None:
                 return dq
             if getattr(dq, "_ga_launcher_channel_capture_put_patched", False):
                 return dq
             original_put = getattr(dq, "put", None)
             if not callable(original_put):
-                return _GAQueueProxy(dq, agent, channel, conversation_id, event_id)
+                if callable(getattr(dq, "get", None)) or callable(getattr(dq, "get_nowait", None)):
+                    return _GAQueueProxy(dq, agent, channel, conversation_id, event_id)
+                return dq
             recorded_done = {"value": False}
 
             def patched_put(item, *args, **kwargs):
@@ -457,6 +699,63 @@ def channel_capture_sitecustomize_source() -> str:
                 dq._ga_launcher_channel_capture_put_patched = True
                 return dq
             except Exception:
+                return _ga_patch_display_queue_class(dq, agent, channel, conversation_id, event_id)
+
+
+        def _ga_patch_display_queue_class(dq, agent, channel, conversation_id, event_id):
+            cls = getattr(dq, "__class__", None)
+            if cls is None:
+                return _GAQueueProxy(dq, agent, channel, conversation_id, event_id)
+            original_put = getattr(cls, "put", None)
+            if not callable(original_put):
+                return _GAQueueProxy(dq, agent, channel, conversation_id, event_id)
+            key = id(dq)
+            with _GA_CHANNEL_CAPTURE_LOCK:
+                _ga_cleanup_queue_capture_states_locked()
+                _GA_QUEUE_CAPTURE_STATES[key] = {
+                    "agent": agent,
+                    "channel": channel,
+                    "conversation_id": conversation_id,
+                    "event_id": event_id,
+                    "recorded_done": False,
+                    "created_at": time.time(),
+                }
+                if cls in _GA_QUEUE_CAPTURE_CLASS_ORIGINAL_PUT:
+                    return dq
+                _GA_QUEUE_CAPTURE_CLASS_ORIGINAL_PUT[cls] = original_put
+
+            def class_patched_put(self, item, *args, **kwargs):
+                result = original_put(self, item, *args, **kwargs)
+                with _GA_CHANNEL_CAPTURE_LOCK:
+                    state = _GA_QUEUE_CAPTURE_STATES.get(id(self))
+                if (
+                    isinstance(state, dict)
+                    and (not state.get("recorded_done"))
+                    and isinstance(item, dict)
+                    and "done" in item
+                ):
+                    text = str(item.get("done") or "").strip()
+                    if text:
+                        with _GA_CHANNEL_CAPTURE_LOCK:
+                            state["recorded_done"] = True
+                            _GA_QUEUE_CAPTURE_STATES.pop(id(self), None)
+                        _ga_record_assistant_async(
+                            state.get("agent"),
+                            state.get("channel"),
+                            state.get("conversation_id"),
+                            state.get("event_id"),
+                            text,
+                        )
+                return result
+
+            try:
+                setattr(cls, "put", class_patched_put)
+                return dq
+            except Exception:
+                with _GA_CHANNEL_CAPTURE_LOCK:
+                    if _GA_QUEUE_CAPTURE_CLASS_ORIGINAL_PUT.get(cls) is original_put:
+                        _GA_QUEUE_CAPTURE_CLASS_ORIGINAL_PUT.pop(cls, None)
+                    _GA_QUEUE_CAPTURE_STATES.pop(key, None)
                 return _GAQueueProxy(dq, agent, channel, conversation_id, event_id)
 
 
@@ -502,13 +801,18 @@ def channel_capture_sitecustomize_source() -> str:
             _GA_CHANNEL_CAPTURE_INSTALLED = True
             import builtins
             original_import = builtins.__import__
+            existing_agentmain = sys.modules.get("agentmain")
+            if existing_agentmain is not None:
+                try:
+                    _ga_patch_agentmain(existing_agentmain)
+                except Exception:
+                    pass
 
             def patched_import(name, globals=None, locals=None, fromlist=(), level=0):
                 mod = original_import(name, globals, locals, fromlist, level)
                 try:
                     root_name = str(name or "").split(".", 1)[0]
                     if root_name == "agentmain":
-                        import sys
                         target = sys.modules.get("agentmain") or mod
                         _ga_patch_agentmain(target)
                 except Exception:

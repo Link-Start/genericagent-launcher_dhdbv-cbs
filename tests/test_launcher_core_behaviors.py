@@ -1834,6 +1834,319 @@ tg_bot_token = '123'
             self.assertEqual(repaired_index[sid].get("channel_id"), "telegram")
             self.assertEqual(repaired_index[sid].get("session_kind"), "channel_conversation")
 
+    def test_channel_capture_runtime_records_custom_queue_producer_put(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            frontends_dir = os.path.join(td, "frontends")
+            os.makedirs(frontends_dir, exist_ok=True)
+            with open(os.path.join(td, "agentmain.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import threading, time\n"
+                    "\n"
+                    "class SlotQueue:\n"
+                    "    __slots__ = ('items',)\n"
+                    "    def __init__(self):\n"
+                    "        self.items = []\n"
+                    "    def put(self, item, *args, **kwargs):\n"
+                    "        self.items.append(item)\n"
+                    "    def get(self):\n"
+                    "        return self.items.pop(0)\n"
+                    "\n"
+                    "class Backend:\n"
+                    "    def __init__(self):\n"
+                    "        self.history = []\n"
+                    "        self.context_win = 1024\n"
+                    "\n"
+                    "class LLMClient:\n"
+                    "    def __init__(self):\n"
+                    "        self.backend = Backend()\n"
+                    "\n"
+                    "class GeneraticAgent:\n"
+                    "    def __init__(self):\n"
+                    "        self.llmclient = LLMClient()\n"
+                    "        self.history = []\n"
+                    "        self.llm_no = 3\n"
+                    "        self.is_running = False\n"
+                    "\n"
+                    "    def put_task(self, query, source='user', images=None):\n"
+                    "        display_queue = SlotQueue()\n"
+                    "        self.is_running = True\n"
+                    "        def worker():\n"
+                    "            time.sleep(0.2)\n"
+                    "            self.llmclient.backend.history = [{'role': 'assistant', 'content': 'slot reply'}]\n"
+                    "            self.history = [{'role': 'assistant', 'content': 'slot reply'}]\n"
+                    "            self.is_running = False\n"
+                    "            display_queue.put({'done': 'slot reply'})\n"
+                    "        threading.Thread(target=worker, daemon=True).start()\n"
+                    "        return display_queue\n"
+                )
+            with open(os.path.join(frontends_dir, "fake_custom_queue.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import os, sys, time\n"
+                    "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+                    "from agentmain import GeneraticAgent\n"
+                    "import sitecustomize\n"
+                    "agent = GeneraticAgent()\n"
+                    "def receive_one(chat_id):\n"
+                    "    agent.put_task('hello custom queue', source='telegram')\n"
+                    "receive_one('slot-chat-raw')\n"
+                    "time.sleep(1.0)\n"
+                    "print('STATE_LEN=%s' % len(getattr(sitecustomize, '_GA_QUEUE_CAPTURE_STATES', {})))\n"
+                )
+
+            env = lz.channel_capture_env(os.environ.copy(), td)
+            proc = subprocess.run(
+                [sys.executable, "-u", os.path.join(frontends_dir, "fake_custom_queue.py")],
+                cwd=td,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            self.assertIn("STATE_LEN=0", proc.stdout)
+
+            session_dir = os.path.join(td, "temp", "launcher_sessions")
+            files = [name for name in os.listdir(session_dir) if name.endswith(".json")]
+            self.assertEqual(len(files), 1)
+            with open(os.path.join(session_dir, files[0]), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(
+                [(item.get("role"), item.get("text")) for item in payload.get("bubbles", [])],
+                [("user", "hello custom queue"), ("assistant", "slot reply")],
+            )
+            self.assertEqual(payload.get("llm_idx"), 3)
+            self.assertNotIn("slot-chat-raw", json.dumps(payload, ensure_ascii=False))
+
+    def test_channel_capture_sitecustomize_patches_already_imported_agentmain(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            runtime_dir = lz.install_channel_capture_runtime(td)
+            with open(os.path.join(td, "agentmain.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import queue, threading, time\n"
+                    "class Backend:\n"
+                    "    def __init__(self):\n"
+                    "        self.history = []\n"
+                    "        self.context_win = 2048\n"
+                    "class LLMClient:\n"
+                    "    def __init__(self):\n"
+                    "        self.backend = Backend()\n"
+                    "class GeneraticAgent:\n"
+                    "    def __init__(self):\n"
+                    "        self.llmclient = LLMClient()\n"
+                    "        self.history = []\n"
+                    "        self.llm_no = 4\n"
+                    "        self.is_running = False\n"
+                    "    def put_task(self, query, source='user', images=None):\n"
+                    "        q = queue.Queue()\n"
+                    "        self.is_running = True\n"
+                    "        def worker():\n"
+                    "            time.sleep(0.2)\n"
+                    "            self.llmclient.backend.history = [{'role': 'assistant', 'content': 'late patch reply'}]\n"
+                    "            self.history = [{'role': 'assistant', 'content': 'late patch reply'}]\n"
+                    "            self.is_running = False\n"
+                    "            q.put({'done': 'late patch reply'})\n"
+                    "        threading.Thread(target=worker, daemon=True).start()\n"
+                    "        return q\n"
+                )
+            script_path = os.path.join(td, "late_sitecustomize.py")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "import os, sys, time\n"
+                    "sys.path.insert(0, os.getcwd())\n"
+                    "import agentmain\n"
+                    "sitecustomize_path = os.path.join(os.getcwd(), 'temp', 'launcher_channel_capture', 'sitecustomize.py')\n"
+                    "with open(sitecustomize_path, 'r', encoding='utf-8') as handle:\n"
+                    "    source = handle.read()\n"
+                    "exec(compile(source, sitecustomize_path, 'exec'), {'__name__': 'sitecustomize'})\n"
+                    "agent = agentmain.GeneraticAgent()\n"
+                    "def receive_one(chat_id, message_id):\n"
+                    "    agent.put_task('hello after import', source='telegram')\n"
+                    "receive_one('late-chat-raw', 'late-message-raw')\n"
+                    "time.sleep(1.0)\n"
+                )
+            env = dict(os.environ)
+            env["GA_LAUNCHER_CHANNEL_CAPTURE"] = "1"
+            env["GA_LAUNCHER_AGENT_DIR"] = td
+            env.pop("PYTHONPATH", None)
+            self.assertTrue(os.path.isdir(runtime_dir))
+
+            proc = subprocess.run(
+                [sys.executable, "-u", script_path],
+                cwd=td,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+            session_dir = os.path.join(td, "temp", "launcher_sessions")
+            files = [name for name in os.listdir(session_dir) if name.endswith(".json")]
+            self.assertEqual(len(files), 1)
+            with open(os.path.join(session_dir, files[0]), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.assertEqual(
+                [(item.get("role"), item.get("text")) for item in payload.get("bubbles", [])],
+                [("user", "hello after import"), ("assistant", "late patch reply")],
+            )
+            serialized = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("late-chat-raw", serialized)
+            self.assertNotIn("late-message-raw", serialized)
+
+    def test_channel_capture_runtime_separates_common_channel_contexts_without_raw_platform_ids(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            frontends_dir = os.path.join(td, "frontends")
+            os.makedirs(frontends_dir, exist_ok=True)
+            with open(os.path.join(td, "agentmain.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import queue, threading, time\n"
+                    "class Backend:\n"
+                    "    def __init__(self):\n"
+                    "        self.history = []\n"
+                    "        self.context_win = 4096\n"
+                    "class LLMClient:\n"
+                    "    def __init__(self):\n"
+                    "        self.backend = Backend()\n"
+                    "class GeneraticAgent:\n"
+                    "    def __init__(self):\n"
+                    "        self.llmclient = LLMClient()\n"
+                    "        self.history = []\n"
+                    "        self.llm_no = 5\n"
+                    "        self.is_running = False\n"
+                    "    def put_task(self, query, source='user', images=None):\n"
+                    "        q = queue.Queue()\n"
+                    "        self.is_running = True\n"
+                    "        def worker():\n"
+                    "            time.sleep(0.2)\n"
+                    "            reply = 'reply to ' + query\n"
+                    "            self.llmclient.backend.history = [{'role': 'assistant', 'content': reply}]\n"
+                    "            self.history = [{'role': 'assistant', 'content': reply}]\n"
+                    "            self.is_running = False\n"
+                    "            q.put({'done': reply})\n"
+                    "        threading.Thread(target=worker, daemon=True).start()\n"
+                    "        return q\n"
+                )
+            with open(os.path.join(frontends_dir, "fake_two_contexts.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import os, sys, time\n"
+                    "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+                    "from agentmain import GeneraticAgent\n"
+                    "class Obj:\n"
+                    "    def __init__(self, **kwargs):\n"
+                    "        self.__dict__.update(kwargs)\n"
+                    "agent = GeneraticAgent()\n"
+                    "def receive_wechat(room_id, msg_id, from_wxid, text):\n"
+                    "    token = 'raw-token-wechat'\n"
+                    "    payload = {'token': token, 'raw': 'raw-payload-wechat'}\n"
+                    "    agent.put_task(text, source='wechat')\n"
+                    "def receive_tg(update, text):\n"
+                    "    bot_token = 'raw-token-telegram'\n"
+                    "    agent.put_task(text, source='tg')\n"
+                    "def receive_feishu(data, text):\n"
+                    "    tenant_access_token = 'raw-token-feishu'\n"
+                    "    agent.put_task(text, source='feishu')\n"
+                    "def receive_wecom(msg, text):\n"
+                    "    access_token = 'raw-token-wecom'\n"
+                    "    agent.put_task(text, source='wecom')\n"
+                    "def receive_qq(message, text):\n"
+                    "    payload = {'token': 'raw-token-qq', 'message': 'raw-payload-qq'}\n"
+                    "    agent.put_task(text, source='qq')\n"
+                    "def receive_discord(message, text):\n"
+                    "    token = 'raw-token-discord'\n"
+                    "    agent.put_task(text, source='discord')\n"
+                    "def receive_dingtalk(conversation_id, message_id, sender_staff_id, text):\n"
+                    "    token = 'raw-token-dingtalk'\n"
+                    "    agent.put_task(text, source='dingtalk')\n"
+                    "receive_wechat('raw-wechat-room', 'raw-wechat-msg', 'raw-wechat-user', 'hello wechat')\n"
+                    "tg_message = Obj(message_id='raw-tg-msg', chat=Obj(id='raw-tg-chat'))\n"
+                    "tg_update = Obj(effective_message=tg_message, effective_chat=Obj(id='raw-tg-chat'), effective_user=Obj(id='raw-tg-user'))\n"
+                    "receive_tg(tg_update, 'hello telegram')\n"
+                    "receive_feishu({'event': {'message': {'chat_id': 'raw-feishu-chat', 'message_id': 'raw-feishu-msg'}, 'sender': {'sender_id': {'open_id': 'raw-feishu-user'}}}}, 'hello feishu')\n"
+                    "receive_wecom({'group_openid': 'raw-wecom-group', 'msgid': 'raw-wecom-msg', 'from_user_id': 'raw-wecom-user'}, 'hello wecom')\n"
+                    "receive_qq(Obj(chat_id='raw-qq-chat', id='raw-qq-msg', author=Obj(id='raw-qq-user')), 'hello qq')\n"
+                    "receive_discord(Obj(id='raw-discord-msg', channel=Obj(id='raw-discord-channel'), guild=Obj(id='raw-discord-guild'), author=Obj(id='raw-discord-user')), 'hello discord')\n"
+                    "receive_dingtalk('raw-dingtalk-conversation', 'raw-dingtalk-msg', 'raw-dingtalk-user', 'hello dingtalk')\n"
+                    "time.sleep(2.0)\n"
+                )
+
+            env = lz.channel_capture_env(os.environ.copy(), td)
+            proc = subprocess.run(
+                [sys.executable, "-u", os.path.join(frontends_dir, "fake_two_contexts.py")],
+                cwd=td,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+            session_dir = os.path.join(td, "temp", "launcher_sessions")
+            files = sorted(name for name in os.listdir(session_dir) if name.endswith(".json"))
+            self.assertEqual(len(files), 7)
+            payloads = []
+            for name in files:
+                with open(os.path.join(session_dir, name), "r", encoding="utf-8") as f:
+                    payloads.append(json.load(f))
+            texts_by_session = [
+                [item.get("text") for item in payload.get("bubbles", []) if isinstance(item, dict)]
+                for payload in payloads
+            ]
+            for text in (
+                "hello wechat",
+                "hello telegram",
+                "hello feishu",
+                "hello wecom",
+                "hello qq",
+                "hello discord",
+                "hello dingtalk",
+            ):
+                self.assertIn([text, "reply to " + text], texts_by_session)
+            self.assertEqual(
+                sorted(payload.get("channel_id") for payload in payloads),
+                ["dingtalk", "discord", "feishu", "qq", "telegram", "wechat", "wecom"],
+            )
+            serialized = json.dumps(payloads, ensure_ascii=False)
+            for raw in (
+                "raw-wechat-room",
+                "raw-wechat-msg",
+                "raw-wechat-user",
+                "raw-tg-chat",
+                "raw-tg-msg",
+                "raw-tg-user",
+                "raw-feishu-chat",
+                "raw-feishu-msg",
+                "raw-feishu-user",
+                "raw-wecom-group",
+                "raw-wecom-msg",
+                "raw-wecom-user",
+                "raw-qq-chat",
+                "raw-qq-msg",
+                "raw-qq-user",
+                "raw-discord-channel",
+                "raw-discord-guild",
+                "raw-discord-msg",
+                "raw-discord-user",
+                "raw-dingtalk-conversation",
+                "raw-dingtalk-msg",
+                "raw-dingtalk-user",
+                "raw-token-wechat",
+                "raw-token-telegram",
+                "raw-token-feishu",
+                "raw-token-wecom",
+                "raw-token-qq",
+                "raw-token-discord",
+                "raw-token-dingtalk",
+                "raw-payload-wechat",
+                "raw-payload-qq",
+            ):
+                self.assertNotIn(raw, serialized)
+            self.assertIn("external_thread_hash", serialized)
+            self.assertIn("external_event_id", serialized)
+            self.assertIn("external_user_hash", serialized)
+
     def test_purge_archived_sessions(self):
         with tempfile.TemporaryDirectory() as td:
             arc_dir = lz.archived_sessions_dir(td, "wechat")
