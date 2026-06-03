@@ -112,6 +112,18 @@ class BuildReleaseBundleTests(unittest.TestCase):
             with open(public_key_path, "r", encoding="utf-8") as f:
                 expected_public = f.read().strip()
             self.assertEqual(embedded_public, expected_public)
+            with open(os.path.join(release_dir, "install", "update_public_key.pem"), "rb") as f:
+                embedded_public_bytes = f.read()
+            with open(public_key_path, "rb") as f:
+                expected_public_bytes = f.read()
+            self.assertEqual(embedded_public_bytes, expected_public_bytes)
+            for rel_path in (
+                os.path.join("install", "update_public_key.pem"),
+                os.path.join("update", "manifest.sig"),
+                os.path.join("update", "sha256sums.txt"),
+            ):
+                with open(os.path.join(release_dir, rel_path), "rb") as f:
+                    self.assertNotIn(b"\r\n", f.read())
 
     def test_release_build_without_private_key_fails(self):
         root = os.path.dirname(os.path.dirname(__file__))
