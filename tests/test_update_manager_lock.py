@@ -195,6 +195,35 @@ class UpdateManagerLockTests(unittest.TestCase):
         self.assertEqual(payload["error_code"], update_manager.ERR_UPDATER_LAUNCH)
         self.assertIn("Updater.exe 不存在", payload["error_detail"])
 
+    def test_launch_update_job_records_successful_updater_handoff(self):
+        job = {
+            "job_id": "job-handoff",
+            "target_version": "1.2.4",
+            "package_url": "https://example.com/update.zip",
+            "package_sha256": "a" * 64,
+            "status": "queued",
+            "phase": "queued",
+            "error_code": "",
+            "error_detail": "",
+        }
+        job_path = os.path.join(self.updates_dir, "job-handoff.json")
+        update_manager._atomic_write_json(job_path, job)
+
+        with mock.patch.object(update_manager, "_update_lock") as update_lock, mock.patch.object(
+            update_manager, "launch_installed_updater", return_value=object()
+        ) as launch_installed, mock.patch.object(update_manager, "updater_log") as updater_log:
+            update_lock.return_value.__enter__.return_value = self.lock_path
+            update_lock.return_value.__exit__.return_value = False
+            update_manager.launch_update_job(job_path)
+
+        launch_installed.assert_called_once_with(job_path)
+        payload = update_manager._read_json_file(job_path, {})
+        self.assertEqual(payload["status"], "handoff")
+        self.assertEqual(payload["phase"], "updater-launched")
+        self.assertEqual(payload["error_code"], "")
+        self.assertGreater(float(payload.get("handoff_at") or 0.0), 0.0)
+        self.assertTrue(any("updater handoff launched" in str(call.args[0]) for call in updater_log.call_args_list))
+
     def test_signed_release_metadata_uses_internal_install_mode(self):
         release = {
             "tag_name": "v1.2.4",

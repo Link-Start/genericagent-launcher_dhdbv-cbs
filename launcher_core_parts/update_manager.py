@@ -419,12 +419,25 @@ def launch_update_job(job_path: str):
     job = _read_json_file(job_file, {}) if job_file else {}
     if not isinstance(job, dict):
         job = {}
+    job_id = str(job.get("job_id") or os.path.splitext(os.path.basename(job_file))[0] if job_file else "").strip()
     try:
         # Fail before closing the UI if a previous updater left an active or
         # uncertain lock behind. Confirmed-stale locks are cleaned here.
         with _update_lock(timeout_seconds=3):
             pass
-        return launch_installed_updater(job_file)
+        launched = launch_installed_updater(job_file)
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="handoff",
+                phase="updater-launched",
+                error_code="",
+                error_detail="",
+                handoff_at=float(time.time()),
+            )
+        updater_log(f"[{job_id or 'unknown'}] updater handoff launched: {job_file}")
+        return launched
     except UpdateError as e:
         if job_file and job:
             _save_job_state(

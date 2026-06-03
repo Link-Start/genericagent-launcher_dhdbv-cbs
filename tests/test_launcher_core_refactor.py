@@ -15852,7 +15852,359 @@ native_oai_config2 = {
 
         self.assertTrue(dummy.settings_about_install_update_btn.enabled)
         self.assertEqual(dummy.settings_about_install_update_btn.text, "查看手动升级说明")
-        self.assertEqual(dummy.settings_about_install_update_btn.tooltip, "查看当前版本对应的手动升级说明。")
+        self.assertEqual(dummy.settings_about_install_update_btn.tooltip, "查看启动器手动升级说明；这不会同步 GenericAgent 内核仓库。")
+        self.assertIn("版本状态：发现启动器新版本", dummy.settings_about_update_status.text)
+        self.assertIn("更新方式：当前平台不走应用内自更新", dummy.settings_about_update_status.text)
+        self.assertIn("下一步：点击“查看手动升级说明”", dummy.settings_about_update_status.text)
+
+    def test_about_launcher_update_state_text_distinguishes_update_modes(self):
+        class DummyUsage(PersonalUsageMixin):
+            _about_manual_update_action_target = PersonalUsageMixin._about_manual_update_action_target
+            _about_launcher_update_state_text = PersonalUsageMixin._about_launcher_update_state_text
+
+        dummy = DummyUsage()
+
+        internal_text = dummy._about_launcher_update_state_text(
+            {
+                "status": "behind",
+                "local_version": "1.2.3",
+                "update_info": {"install_mode": "internal", "target_version": "1.2.4"},
+            },
+            supports_internal_update=True,
+            updater_exists=True,
+        )
+        self.assertIn("Windows/受支持平台可使用启动器内置 updater 自更新", internal_text)
+        self.assertIn("下一步：点击“安装启动器更新并重启”", internal_text)
+
+        external_text = dummy._about_launcher_update_state_text(
+            {
+                "status": "behind",
+                "local_version": "1.2.3",
+                "update_info": {
+                    "install_mode": "external",
+                    "target_version": "1.2.4",
+                    "external_url": "https://example.com/update.exe",
+                },
+            },
+            supports_internal_update=True,
+            updater_exists=False,
+        )
+        self.assertIn("启动器会改为下载外部安装包", external_text)
+        self.assertIn("下一步：点击“下载启动器安装包”", external_text)
+
+        external_without_link_text = dummy._about_launcher_update_state_text(
+            {
+                "status": "behind",
+                "local_version": "1.2.3",
+                "update_info": {"install_mode": "external", "target_version": "1.2.4"},
+            },
+            supports_internal_update=True,
+            updater_exists=False,
+        )
+        self.assertIn("当前未拿到可用的安装包下载地址", external_without_link_text)
+
+        manual_without_link_text = dummy._about_launcher_update_state_text(
+            {
+                "status": "behind",
+                "local_version": "1.2.3",
+                "update_info": None,
+                "latest_release_url": "",
+            },
+            supports_internal_update=False,
+            updater_exists=False,
+        )
+        self.assertIn("当前未拿到可用的发布页面或安装包链接", manual_without_link_text)
+
+        current_text = dummy._about_launcher_update_state_text(
+            {"status": "up_to_date", "local_version": "1.2.4"},
+            supports_internal_update=True,
+            updater_exists=True,
+        )
+        self.assertIn("不会同步 GenericAgent 内核仓库", current_text)
+        self.assertIn("内核仓库同步", current_text)
+
+    def test_perform_update_check_falls_back_to_release_asset_when_internal_query_fails(self):
+        class DummyUsage(PersonalUsageMixin):
+            _launcher_update_proxy_url = PersonalUsageMixin._launcher_update_proxy_url
+            _repo_slug_from_url = PersonalUsageMixin._repo_slug_from_url
+            _compare_versions = PersonalUsageMixin._compare_versions
+            _version_tuple = PersonalUsageMixin._version_tuple
+            _build_launcher_external_update_info = PersonalUsageMixin._build_launcher_external_update_info
+            _perform_update_check = PersonalUsageMixin._perform_update_check
+
+            def __init__(self):
+                self.agent_dir = ""
+                self.cfg = {
+                    "launcher_repo_url": "https://github.com/example/launcher",
+                    "launcher_update_proxy_url": "http://127.0.0.1:7890",
+                }
+
+            def _github_json_with_fallback(self, path, **_kwargs):
+                self.fallback_path = path
+                return (
+                    {
+                        "tag_name": "v1.2.4",
+                        "html_url": "https://github.com/example/launcher/releases/tag/v1.2.4",
+                        "assets": [
+                            {
+                                "name": "GenericAgentLauncherSetup-1.2.4.exe",
+                                "browser_download_url": "https://example.com/GenericAgentLauncherSetup-1.2.4.exe",
+                            }
+                        ],
+                    },
+                    "https://api.github.com/repos/example/launcher/releases/latest",
+                    ["https://mirror.example -> timeout (try 1)"],
+                )
+
+        dummy = DummyUsage()
+        with mock.patch.object(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", True), mock.patch.object(
+            lz, "current_launcher_version", return_value="1.2.3"
+        ), mock.patch.object(
+            lz,
+            "query_launcher_update",
+            side_effect=update_manager.UpdateError(
+                update_manager.ERR_RELEASE_FETCH,
+                "拉取最新 Release 失败",
+                phase="query",
+                detail="direct api timeout",
+            ),
+        ), mock.patch.object(lz, "is_valid_agent_dir", return_value=False):
+            result = dummy._perform_update_check()
+
+        launcher = result["launcher"]
+        self.assertEqual(launcher["status"], "behind")
+        self.assertEqual(launcher["update_info"]["install_mode"], "external")
+        self.assertEqual(launcher["update_info"]["external_url"], "https://example.com/GenericAgentLauncherSetup-1.2.4.exe")
+        self.assertIn("Release fallback", launcher["message"])
+        self.assertIn("direct api timeout", launcher["errors"][0])
+        self.assertIn("/repos/example/launcher/releases/latest", dummy.fallback_path)
+
+    def test_start_launcher_update_install_failure_keeps_launcher_open_and_refreshes_diagnostics(self):
+        class DummyUsage(PersonalUsageMixin):
+            _start_launcher_update_install = PersonalUsageMixin._start_launcher_update_install
+            _launcher_update_proxy_url = PersonalUsageMixin._launcher_update_proxy_url
+
+            def __init__(self):
+                self.cfg = {"launcher_update_proxy_url": "http://127.0.0.1:7890"}
+                self._force_exit_requested = False
+                self._launcher_update_install_running = False
+                self._update_check_running = False
+                self._last_update_check_result = {
+                    "launcher": {
+                        "status": "behind",
+                        "update_info": {
+                            "install_mode": "internal",
+                            "target_version": "1.2.4",
+                            "package_url": "https://example.com/update.zip",
+                            "package_sha256": "a" * 64,
+                        },
+                    }
+                }
+                self.refresh_calls = 0
+                self.diag_refresh_calls = 0
+                self.statuses = []
+
+            def _refresh_about_update_widgets(self):
+                self.refresh_calls += 1
+
+            def _refresh_about_update_diagnostics_widgets(self):
+                self.diag_refresh_calls += 1
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyUsage()
+        with mock.patch.object(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", True), mock.patch.object(
+            personal_usage.QMessageBox, "question", return_value=personal_usage.QMessageBox.Yes
+        ), mock.patch.object(
+            personal_usage.QMessageBox, "warning"
+        ) as warning_box, mock.patch.object(
+            lz, "create_update_job", return_value={"job_path": "C:\\demo\\job.json"}
+        ), mock.patch.object(
+            lz, "launch_update_job", side_effect=FileNotFoundError("Updater.exe 不存在")
+        ) as launch_job, mock.patch.object(
+            personal_usage.QTimer, "singleShot"
+        ) as single_shot:
+            dummy._start_launcher_update_install()
+
+        launch_job.assert_called_once_with("C:\\demo\\job.json")
+        single_shot.assert_not_called()
+        self.assertFalse(dummy._force_exit_requested)
+        self.assertFalse(dummy._launcher_update_install_running)
+        self.assertGreaterEqual(dummy.refresh_calls, 2)
+        self.assertGreaterEqual(dummy.diag_refresh_calls, 1)
+        self.assertIn("启动器更新启动失败", dummy.statuses[-1])
+        self.assertIn("启动器不会退出", warning_box.call_args.args[2])
+
+    def test_start_launcher_update_install_create_job_failure_keeps_launcher_open(self):
+        class DummyUsage(PersonalUsageMixin):
+            _start_launcher_update_install = PersonalUsageMixin._start_launcher_update_install
+            _launcher_update_proxy_url = PersonalUsageMixin._launcher_update_proxy_url
+
+            def __init__(self):
+                self.cfg = {}
+                self._force_exit_requested = False
+                self._launcher_update_install_running = False
+                self._update_check_running = False
+                self._last_update_check_result = {
+                    "launcher": {
+                        "status": "behind",
+                        "update_info": {
+                            "install_mode": "internal",
+                            "target_version": "1.2.4",
+                            "package_url": "https://example.com/update.zip",
+                            "package_sha256": "a" * 64,
+                        },
+                    }
+                }
+                self.refresh_calls = 0
+                self.diag_refresh_calls = 0
+                self.statuses = []
+
+            def _refresh_about_update_widgets(self):
+                self.refresh_calls += 1
+
+            def _refresh_about_update_diagnostics_widgets(self):
+                self.diag_refresh_calls += 1
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+        dummy = DummyUsage()
+        with mock.patch.object(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", True), mock.patch.object(
+            personal_usage.QMessageBox, "question", return_value=personal_usage.QMessageBox.Yes
+        ), mock.patch.object(
+            personal_usage.QMessageBox, "warning"
+        ) as warning_box, mock.patch.object(
+            lz, "create_update_job", side_effect=RuntimeError("job path 为空")
+        ) as create_job, mock.patch.object(
+            lz, "launch_update_job"
+        ) as launch_job, mock.patch.object(
+            personal_usage.QTimer, "singleShot"
+        ) as single_shot:
+            dummy._start_launcher_update_install()
+
+        create_job.assert_called_once()
+        launch_job.assert_not_called()
+        single_shot.assert_not_called()
+        self.assertFalse(dummy._force_exit_requested)
+        self.assertFalse(dummy._launcher_update_install_running)
+        self.assertGreaterEqual(dummy.refresh_calls, 2)
+        self.assertGreaterEqual(dummy.diag_refresh_calls, 1)
+        self.assertIn("启动器更新启动失败", dummy.statuses[-1])
+        self.assertIn("启动器不会退出", warning_box.call_args.args[2])
+
+    def test_start_launcher_update_install_success_handoff_requests_exit_after_status_and_diagnostics(self):
+        class DummyUsage(PersonalUsageMixin):
+            _start_launcher_update_install = PersonalUsageMixin._start_launcher_update_install
+            _launcher_update_proxy_url = PersonalUsageMixin._launcher_update_proxy_url
+
+            def __init__(self):
+                self.cfg = {}
+                self._force_exit_requested = False
+                self._launcher_update_install_running = False
+                self._update_check_running = False
+                self._last_update_check_result = {
+                    "launcher": {
+                        "status": "behind",
+                        "update_info": {
+                            "install_mode": "internal",
+                            "target_version": "1.2.4",
+                            "package_url": "https://example.com/update.zip",
+                            "package_sha256": "a" * 64,
+                        },
+                    }
+                }
+                self.diag_refresh_calls = 0
+                self.statuses = []
+                self.closed = False
+
+            def _refresh_about_update_widgets(self):
+                pass
+
+            def _refresh_about_update_diagnostics_widgets(self):
+                self.diag_refresh_calls += 1
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def close(self):
+                self.closed = True
+
+        delayed = []
+        dummy = DummyUsage()
+        with mock.patch.object(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", True), mock.patch.object(
+            personal_usage.QMessageBox, "question", return_value=personal_usage.QMessageBox.Yes
+        ), mock.patch.object(
+            lz, "create_update_job", return_value={"job_path": "C:\\demo\\job.json"}
+        ) as create_job, mock.patch.object(
+            lz, "launch_update_job"
+        ) as launch_job, mock.patch.object(
+            personal_usage.QTimer, "singleShot", side_effect=lambda _ms, cb: delayed.append(cb)
+        ):
+            dummy._start_launcher_update_install()
+
+        create_job.assert_called_once()
+        launch_job.assert_called_once_with("C:\\demo\\job.json")
+        self.assertTrue(dummy._force_exit_requested)
+        self.assertEqual(len(delayed), 1)
+        self.assertGreaterEqual(dummy.diag_refresh_calls, 2)
+        self.assertIn("已成功移交 updater", dummy.statuses[-1])
+        delayed[0]()
+        self.assertTrue(dummy.closed)
+
+    def test_refresh_about_update_widgets_shows_specific_kernel_sync_running_action(self):
+        class DummyLabel:
+            def setText(self, _text):
+                pass
+
+        class DummyButton:
+            def __init__(self):
+                self.text = ""
+                self.enabled = None
+                self.tooltip = ""
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+            def setToolTip(self, text):
+                self.tooltip = str(text)
+
+            def setText(self, text):
+                self.text = str(text)
+
+        class DummyUsage(PersonalUsageMixin):
+            _refresh_about_update_widgets = PersonalUsageMixin._refresh_about_update_widgets
+            _refresh_about_update_diagnostics_widgets = PersonalUsageMixin._refresh_about_update_diagnostics_widgets
+            _apply_personal_button_state = PersonalUsageMixin._apply_personal_button_state
+            _about_update_check_disabled_reason = PersonalUsageMixin._about_update_check_disabled_reason
+            _about_update_install_disabled_reason = PersonalUsageMixin._about_update_install_disabled_reason
+            _kernel_sync_disabled_reason = PersonalUsageMixin._kernel_sync_disabled_reason
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._update_check_running = False
+                self._kernel_repo_sync_running = True
+                self._kernel_repo_sync_action = "pull"
+                self._last_update_check_result = None
+                self.settings_about_update_status = DummyLabel()
+                self.settings_about_update_diag_status = DummyLabel()
+                self.settings_about_check_updates_btn = DummyButton()
+                self.settings_about_install_update_btn = DummyButton()
+                self.settings_about_sync_kernel_fetch_btn = DummyButton()
+                self.settings_about_sync_kernel_pull_btn = DummyButton()
+
+            def _update_history_brief_text(self, limit=3):
+                return "history"
+
+        dummy = DummyUsage()
+        with mock.patch.object(lz, "is_valid_agent_dir", return_value=True):
+            dummy._refresh_about_update_widgets()
+
+        self.assertFalse(dummy.settings_about_sync_kernel_fetch_btn.enabled)
+        self.assertFalse(dummy.settings_about_sync_kernel_pull_btn.enabled)
+        self.assertEqual(dummy.settings_about_sync_kernel_fetch_btn.text, "同步中…")
+        self.assertEqual(dummy.settings_about_sync_kernel_pull_btn.text, "正在 pull --ff-only…")
 
     def test_about_update_install_disabled_reason_requires_manual_update_link_for_partial_macos_metadata(self):
         class DummyUsage(PersonalUsageMixin):

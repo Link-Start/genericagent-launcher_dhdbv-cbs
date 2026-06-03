@@ -2411,6 +2411,131 @@ tg_bot_token = '123'
             win.deleteLater()
             app.processEvents()
 
+    def test_about_update_panel_real_qt_smoke_builds_and_refreshes_controls(self):
+        app = QApplication.instance() or QApplication([])
+        win = None
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = {
+                "agent_dir": td,
+                "auto_check_github_updates": False,
+                "kernel_update_auto_fetch_enabled": True,
+                "launcher_update_proxy_url": "",
+            }
+            with mock.patch.object(launcher_window.lz, "load_config", return_value=cfg), mock.patch.object(
+                launcher_window.lz, "save_config", side_effect=lambda _cfg: None
+            ), mock.patch.object(launcher_window.lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_session_index_warmup", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_local_channel_autostart", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_start_autostart_scheduler", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_lan_interface_autostart", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_startup_update_check", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(
+                launcher_window.QtChatWindow, "_schedule_startup_install_hint", autospec=True, side_effect=lambda self: None
+            ), mock.patch.object(launcher_window.lz, "latest_update_job", return_value={}), mock.patch.object(
+                launcher_window.lz, "read_updater_log_tail", return_value=""
+            ), mock.patch.object(
+                launcher_window.lz, "updater_executable_path", return_value="C:\\demo\\Updater.exe"
+            ), mock.patch.object(
+                personal_usage_mod.os.path, "isfile", return_value=True
+            ), mock.patch.object(
+                launcher_window.lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", True, create=True
+            ):
+                win = launcher_window.QtChatWindow(td)
+                win._drain_timer.stop()
+                win._server_status_timer.stop()
+                win._subagent_status_timer.stop()
+                win._stream_flush_timer.stop()
+                win.resize(1200, 800)
+                win._ensure_settings_page_built()
+                win._show_settings_category("about", reload=True)
+                win._settings_reload(categories=["about"], force=True)
+                app.processEvents()
+
+                required_attrs = (
+                    "settings_about_update_status",
+                    "settings_about_check_updates_btn",
+                    "settings_about_install_update_btn",
+                    "settings_about_update_proxy_edit",
+                    "settings_about_update_diag_status",
+                    "settings_about_sync_kernel_fetch_btn",
+                    "settings_about_sync_kernel_pull_btn",
+                )
+                missing = [name for name in required_attrs if getattr(win, name, None) is None]
+                self.assertEqual(missing, [])
+                self.assertIn("版本状态：尚未检查启动器发布版本", win.settings_about_update_status.text())
+                self.assertEqual(win.settings_about_check_updates_btn.text(), "检测启动器和内核更新")
+                self.assertFalse(win.settings_about_install_update_btn.isEnabled())
+
+                with mock.patch.object(win, "_start_update_check") as start_check:
+                    win.settings_about_check_updates_btn.click()
+                start_check.assert_called_once_with(manual=True)
+
+                win._last_update_check_result = {
+                    "checked_at": 1700000000.0,
+                    "launcher": {
+                        "name": "启动器",
+                        "status": "behind",
+                        "local_version": "1.2.3",
+                        "latest_release_tag": "1.2.4",
+                        "update_info": {"install_mode": "internal", "target_version": "1.2.4"},
+                        "message": "当前版本 1.2.3，GitHub 最新发布 1.2.4。",
+                    },
+                    "kernel": {"name": "GenericAgent 内核", "status": "up_to_date", "message": "已是最新。"},
+                    "has_update": True,
+                }
+                win._refresh_about_update_widgets()
+                app.processEvents()
+
+                status_text = win.settings_about_update_status.text()
+                self.assertIn("版本状态：发现启动器新版本", status_text)
+                self.assertIn("更新方式：Windows/受支持平台可使用启动器内置 updater 自更新", status_text)
+                self.assertIn("下一步：点击“安装启动器更新并重启”", status_text)
+                self.assertTrue(win.settings_about_install_update_btn.isEnabled())
+                self.assertEqual(win.settings_about_install_update_btn.text(), "安装启动器更新并重启")
+
+                win.settings_about_update_proxy_edit.setText("http://127.0.0.1:7890")
+                win._save_launcher_update_proxy()
+                self.assertEqual(win.cfg["launcher_update_proxy_url"], "http://127.0.0.1:7890")
+
+                with mock.patch.object(
+                    personal_usage_mod.QMessageBox, "question", return_value=personal_usage_mod.QMessageBox.Yes
+                ), mock.patch.object(
+                    launcher_window.lz, "create_update_job", return_value={"job_path": "C:\\demo\\job.json"}
+                ) as create_job, mock.patch.object(
+                    launcher_window.lz, "launch_update_job"
+                ) as launch_job, mock.patch.object(
+                    launcher_window.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+                ):
+                    win.settings_about_install_update_btn.click()
+
+                create_job.assert_called_once()
+                created_info = create_job.call_args.args[0]
+                self.assertEqual(created_info["target_version"], "1.2.4")
+                self.assertEqual(created_info["install_mode"], "internal")
+                self.assertEqual(created_info["proxy_url"], "http://127.0.0.1:7890")
+                launch_job.assert_called_once_with("C:\\demo\\job.json")
+                self.assertTrue(win._force_exit_requested)
+
+                win._refresh_about_update_diagnostics_manual()
+                self.assertIn("最近更新任务：暂无记录。", win.settings_about_update_diag_status.text())
+                self.assertEqual(win.settings_about_sync_kernel_fetch_btn.text(), "获取内核远端引用（fetch）")
+                self.assertEqual(win.settings_about_sync_kernel_pull_btn.text(), "拉取并快进（pull --ff-only）")
+
+        if win is not None:
+            try:
+                app.removeEventFilter(win)
+            except Exception:
+                pass
+            win._force_exit_requested = True
+            win.close()
+            win.deleteLater()
+            app.processEvents()
+
     def test_spec_uses_local_hooks_dir(self):
         root = os.path.dirname(os.path.dirname(__file__))
         path = os.path.join(root, "GenericAgentLauncher.spec")
@@ -2673,7 +2798,7 @@ tg_bot_token = '123'
         self.assertIn('"metadata_url"', src)
         self.assertIn("def _launcher_manual_update_payload", src)
         self.assertIn("def _show_launcher_manual_update_dialog", src)
-        self.assertIn("下载更新安装包", src)
+        self.assertIn("下载启动器安装包", src)
         self.assertIn("打开安装说明", src)
         self.assertIn("打开 sha256", src)
         self.assertIn("打开安装元数据", src)
@@ -2718,7 +2843,10 @@ tg_bot_token = '123'
         path = os.path.join(root, "qt_chat_parts", "personal_usage.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertIn("同步内核远端（fetch）", src)
+        self.assertIn("GenericAgent 内核仓库同步", src)
+        self.assertIn("获取内核远端引用（fetch）", src)
+        self.assertIn("fetch 只更新远端引用", src)
+        self.assertIn("pull --ff-only 只在能快进时更新本地代码", src)
         self.assertIn("拉取并快进（pull --ff-only）", src)
         self.assertIn("def _start_kernel_repo_sync", src)
         self.assertIn("def _sync_kernel_repo_fetch", src)

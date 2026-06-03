@@ -325,7 +325,7 @@ class PersonalUsageMixin:
             urls.append(url)
         return urls
 
-    def _github_json_with_fallback(self, path: str, *, allow_404: bool = False, timeout: int = 8):
+    def _github_json_with_fallback(self, path: str, *, allow_404: bool = False, timeout: int = 8, attempts_per_url: int = 2):
         last_errors = []
         proxy_url = self._launcher_update_proxy_url()
         for url in self._build_github_api_urls(path):
@@ -337,19 +337,24 @@ class PersonalUsageMixin:
                 },
                 method="GET",
             )
-            try:
-                with lz.urlopen_with_proxy(req, timeout=max(2, int(timeout or 8)), proxy_url=proxy_url) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                payload = json.loads(raw) if raw.strip() else {}
-                return payload, url, last_errors
-            except HTTPError as e:
-                if allow_404 and int(getattr(e, "code", 0) or 0) == 404:
-                    return None, url, last_errors
-                last_errors.append(f"{url} -> HTTP {int(getattr(e, 'code', 0) or 0)}")
-            except URLError as e:
-                last_errors.append(f"{url} -> {e.reason}")
-            except Exception as e:
-                last_errors.append(f"{url} -> {e}")
+            for attempt in range(1, max(1, int(attempts_per_url or 1)) + 1):
+                try:
+                    with lz.urlopen_with_proxy(req, timeout=max(2, int(timeout or 8)), proxy_url=proxy_url) as resp:
+                        raw = resp.read().decode("utf-8", errors="replace")
+                    payload = json.loads(raw) if raw.strip() else {}
+                    return payload, url, last_errors
+                except HTTPError as e:
+                    if allow_404 and int(getattr(e, "code", 0) or 0) == 404:
+                        return None, url, last_errors
+                    last_errors.append(f"{url} -> HTTP {int(getattr(e, 'code', 0) or 0)} (try {attempt})")
+                    if int(getattr(e, "code", 0) or 0) not in (408, 425, 429) and int(getattr(e, "code", 0) or 0) < 500:
+                        break
+                except URLError as e:
+                    last_errors.append(f"{url} -> {e.reason} (try {attempt})")
+                except Exception as e:
+                    last_errors.append(f"{url} -> {e} (try {attempt})")
+                if attempt < max(1, int(attempts_per_url or 1)):
+                    time.sleep(0.25 * attempt)
         return None, "", last_errors
 
     def _collect_local_repo_context(self, repo_dir: str):
@@ -1123,7 +1128,13 @@ class PersonalUsageMixin:
                 launcher["api_source"] = rel_url or launcher.get("api_source", "")
             local_ver = str(launcher.get("local_version") or "").strip()
             cmp = self._compare_versions(local_ver, tag)
+            error_detail = str(getattr(e, "detail", "") or "").strip()
+            error_code = str(getattr(e, "code", "") or "").strip()
             detail = str(e or "").strip()
+            if error_detail:
+                detail = f"{detail}（{error_detail}）" if detail else error_detail
+            if error_code:
+                detail = f"{error_code}: {detail}" if detail else error_code
             detail_lower = detail.lower()
             is_release_metadata_issue = (
                 "manifest" in detail_lower
@@ -1147,20 +1158,26 @@ class PersonalUsageMixin:
                     launcher["status"] = "up_to_date"
                     launcher["message"] = f"当前版本 {local_ver} 与 GitHub 最新发布 {tag} 一致。"
                 launcher["errors"] = list(rel_errors or [])
-            elif tag and local_ver and is_release_metadata_issue:
+            elif tag and local_ver:
                 fallback_info = self._build_launcher_external_update_info(rel, local_version=local_ver)
                 if cmp < 0:
                     launcher["status"] = "behind"
                     if isinstance(fallback_info, dict):
                         launcher["update_info"] = fallback_info
-                        launcher["message"] = (
-                            f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
-                            "该发布不满足应用内静默升级条件，已自动切换为“下载更新安装包”模式。"
-                        )
+                        if is_release_metadata_issue:
+                            launcher["message"] = (
+                                f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
+                                "该发布不满足应用内静默升级条件，已自动切换为“下载启动器安装包”模式。"
+                            )
+                        else:
+                            launcher["message"] = (
+                                f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
+                                "应用内更新检测失败，但已通过 Release fallback 找到可下载安装包。"
+                            )
                     else:
                         launcher["message"] = (
                             f"当前版本 {local_ver}，GitHub 最新发布 {tag}。"
-                            "但该发布缺少可下载安装资产，暂不能触发更新。"
+                            "应用内更新检测失败，且该发布缺少可下载安装资产；请查看诊断中的失败 URL 后重试或配置代理。"
                         )
                 elif cmp > 0:
                     launcher["status"] = "ahead"
@@ -1168,16 +1185,20 @@ class PersonalUsageMixin:
                 else:
                     launcher["status"] = "up_to_date"
                     launcher["message"] = f"当前版本 {local_ver} 与 GitHub 最新发布 {tag} 一致。"
-                launcher["errors"] = list(rel_errors or [])
+                launcher["errors"] = [detail] + list(rel_errors or [])
             else:
                 launcher["status"] = "error"
-                launcher["message"] = f"当前版本 {local_ver or '未知'}，更新检查失败：{e}"
+                retry_hint = "请稍后重试；如网络受限，请配置更新代理，或手动打开 GitHub Release 页面确认。"
+                fallback_detail = "; ".join((rel_errors or [])[-3:])
+                extra = f" fallback 也失败：{fallback_detail}" if fallback_detail else ""
+                launcher["message"] = f"当前版本 {local_ver or '未知'}，更新检查失败：{e}。{retry_hint}{extra}"
+                launcher["errors"] = [detail] + list(rel_errors or [])
 
         if lz.is_valid_agent_dir(self.agent_dir):
             kernel_ctx = self._collect_local_repo_context(self.agent_dir)
             kernel_repo_url = str(kernel_ctx.get("remote_url") or "").strip() or str(lz.REPO_URL or "").strip()
             kernel = self._check_repo_update(
-                name="agant 内核（GenericAgent）",
+                name="GenericAgent 内核",
                 repo_url=kernel_repo_url,
                 local_repo_dir=str(kernel_ctx.get("repo_dir") or ""),
                 local_sha=str(kernel_ctx.get("local_sha") or ""),
@@ -1185,7 +1206,7 @@ class PersonalUsageMixin:
             )
         else:
             kernel = {
-                "name": "agant 内核（GenericAgent）",
+                "name": "GenericAgent 内核",
                 "repo_url": str(lz.REPO_URL or "").strip(),
                 "repo_slug": self._repo_slug_from_url(str(lz.REPO_URL or "").strip()),
                 "local_sha": "",
@@ -1539,6 +1560,7 @@ class PersonalUsageMixin:
         self,
         *,
         running=False,
+        install_running=False,
         kernel_sync_running=False,
         behind=False,
         update_info=None,
@@ -1546,6 +1568,8 @@ class PersonalUsageMixin:
         updater_exists=False,
         manual_release_url="",
     ):
+        if install_running:
+            return "启动器更新任务正在启动，请查看状态栏和更新诊断。"
         if running:
             return "当前正在检测 GitHub 更新，请稍候。"
         if kernel_sync_running:
@@ -1584,13 +1608,81 @@ class PersonalUsageMixin:
             return "当前没有可用的内核 Git 仓库目录。"
         return ""
 
+    def _about_launcher_update_state_text(self, launcher_row, *, supports_internal_update=False, updater_exists=False):
+        row = launcher_row if isinstance(launcher_row, dict) else {}
+        info = row.get("update_info") if isinstance(row.get("update_info"), dict) else {}
+        status = str(row.get("status") or "").strip().lower()
+        message = str(row.get("message") or "").strip()
+        install_mode = str(info.get("install_mode") or "").strip().lower()
+        local_version = str(row.get("local_version") or info.get("current_version") or "").strip()
+        target_version = str(
+            info.get("target_version")
+            or row.get("latest_release_tag")
+            or row.get("remote_version")
+            or ""
+        ).strip()
+        version_bits = []
+        if local_version:
+            version_bits.append(f"当前 {local_version}")
+        if target_version:
+            version_bits.append(f"目标 {target_version}")
+        if not version_bits:
+            version_bits.append(message or "等待检测结果")
+        if status == "behind":
+            version_state = "发现启动器新版本：" + "，".join(version_bits)
+        elif status in ("ok", "current", "up_to_date"):
+            version_state = "启动器已是最新：" + "，".join(version_bits)
+        elif status in ("error", "failed"):
+            version_state = "启动器更新检测失败：" + (message or "请查看诊断信息")
+        elif status == "need_sync":
+            version_state = "启动器更新状态需要重新同步：" + (message or "请重新检测")
+        else:
+            version_state = message or "尚未检测"
+
+        if not supports_internal_update:
+            update_mode = "更新方式：当前平台不走应用内自更新；请使用 Release 页面、macOS dmg 或安装说明手动升级。"
+            if status == "behind":
+                manual_target = self._about_manual_update_action_target(
+                    update_info=info,
+                    manual_release_url=str(row.get("latest_release_url") or "").strip(),
+                )
+                if manual_target:
+                    next_step = "下一步：点击“查看手动升级说明”，按提示替换当前启动器 app。"
+                else:
+                    next_step = "下一步：当前未拿到可用的发布页面或安装包链接，请重新检测后再手动升级。"
+            else:
+                next_step = "下一步：需要升级时重新检测，然后查看手动升级说明。"
+        elif install_mode == "external":
+            update_mode = "更新方式：此发布不满足内置静默升级条件，启动器会改为下载外部安装包。"
+            external_target = str(info.get("external_url") or info.get("release_url") or "").strip()
+            if external_target:
+                next_step = "下一步：点击“下载启动器安装包”，下载后按安装包提示完成升级。"
+            else:
+                next_step = "下一步：当前未拿到可用的安装包下载地址，请重新检测后再下载。"
+        elif status == "behind":
+            update_mode = "更新方式：Windows/受支持平台可使用启动器内置 updater 自更新。"
+            if updater_exists:
+                next_step = "下一步：点击“安装启动器更新并重启”，更新完成后会重新打开启动器。"
+            else:
+                next_step = "下一步：当前缺少内置 updater，请重新打包或改用发布页安装包。"
+        else:
+            update_mode = "更新方式：启动器自更新只处理启动器本体，不会同步 GenericAgent 内核仓库。"
+            next_step = "下一步：如需同步内核代码，请使用下方“内核仓库同步”区域。"
+        return "\n".join([f"版本状态：{version_state}", update_mode, next_step])
+
     def _refresh_about_update_widgets(self):
         running = bool(getattr(self, "_update_check_running", False))
         kernel_sync_running = bool(getattr(self, "_kernel_repo_sync_running", False))
+        kernel_sync_action = str(getattr(self, "_kernel_repo_sync_action", "") or "").strip().lower()
+        install_running = bool(getattr(self, "_launcher_update_install_running", False))
         status_label = getattr(self, "settings_about_update_status", None)
         if status_label is not None:
             if running:
-                status_label.setText("正在检测 GitHub 更新，请稍候…")
+                status_label.setText(
+                    "版本状态：正在检测 GitHub 更新，请稍候…\n"
+                    "更新方式：会分别检查启动器发布版本和 GenericAgent 内核仓库。\n"
+                    "下一步：检测完成后根据结果选择安装、手动升级或内核同步。"
+                )
             else:
                 last = getattr(self, "_last_update_check_result", None)
                 if isinstance(last, dict):
@@ -1598,14 +1690,26 @@ class PersonalUsageMixin:
                     detail = self._update_history_brief_text(limit=3)
                     if notice:
                         detail = notice + "\n\n" + detail
+                    launcher_row_for_status = last.get("launcher") if isinstance(last.get("launcher"), dict) else {}
+                    supports_internal_update_for_status = bool(getattr(lz, "PLATFORM_SUPPORTS_INTERNAL_UPDATER", os.name == "nt"))
+                    updater_exists_for_status = os.path.isfile(str(getattr(lz, "updater_executable_path", lambda: "")() or "").strip())
                     status_label.setText(
-                        self._update_result_summary(last)
+                        self._about_launcher_update_state_text(
+                            launcher_row_for_status,
+                            supports_internal_update=supports_internal_update_for_status,
+                            updater_exists=updater_exists_for_status,
+                        )
+                        + "\n\n"
+                        + "更新链路说明：启动器自更新、外部安装包/macOS 手动升级、GenericAgent 内核仓库同步是三件不同的事。\n\n"
+                        + self._update_result_summary(last)
                         + "\n\n"
                         + detail
                     )
                 else:
                     status_label.setText(
-                        "尚未检查。支持手动检测；也可勾选开机自动检测。\n\n"
+                        "版本状态：尚未检查启动器发布版本。\n"
+                        "更新方式：启动器更新和 GenericAgent 内核仓库同步会分开处理。\n"
+                        "下一步：点击“检测启动器和内核更新”开始检查；也可勾选开机自动检测。\n\n"
                         + self._update_history_brief_text(limit=3)
                     )
         btn = getattr(self, "settings_about_check_updates_btn", None)
@@ -1619,7 +1723,7 @@ class PersonalUsageMixin:
                     kernel_sync_running=kernel_sync_running,
                 ),
             )
-            btn.setText("正在检测…" if running else "立即检测 GitHub 更新")
+            btn.setText("正在检测…" if running else "检测启动器和内核更新")
         install_btn = getattr(self, "settings_about_install_update_btn", None)
         if install_btn is not None:
             launcher_row = {}
@@ -1649,10 +1753,11 @@ class PersonalUsageMixin:
                 )
                 self._apply_personal_button_state(
                     install_btn,
-                    can_install and (not kernel_sync_running),
-                    enabled_tooltip=("下载对应版本的更新安装包。" if install_mode == "external" else "安装更新并在完成后重启启动器。"),
+                    can_install and (not kernel_sync_running) and (not install_running),
+                    enabled_tooltip=("下载启动器更新安装包；这不会同步 GenericAgent 内核仓库。" if install_mode == "external" else "安装启动器本体更新并在完成后重启；这不会同步 GenericAgent 内核仓库。"),
                     disabled_tooltip=self._about_update_install_disabled_reason(
                         running=running,
+                        install_running=install_running,
                         kernel_sync_running=kernel_sync_running,
                         behind=behind,
                         update_info=info,
@@ -1661,14 +1766,18 @@ class PersonalUsageMixin:
                         manual_release_url=manual_release_url,
                     ),
                 )
-                install_btn.setText("下载更新安装包" if install_mode == "external" else "安装更新并重启")
+                if install_running:
+                    install_btn.setText("正在启动 updater…")
+                else:
+                    install_btn.setText("下载启动器安装包" if install_mode == "external" else "安装启动器更新并重启")
             else:
                 self._apply_personal_button_state(
                     install_btn,
-                    (not running) and behind and (not kernel_sync_running) and bool(manual_target),
-                    enabled_tooltip="查看当前版本对应的手动升级说明。",
+                    (not running) and behind and (not kernel_sync_running) and (not install_running) and bool(manual_target),
+                    enabled_tooltip="查看启动器手动升级说明；这不会同步 GenericAgent 内核仓库。",
                     disabled_tooltip=self._about_update_install_disabled_reason(
                         running=running,
+                        install_running=install_running,
                         kernel_sync_running=kernel_sync_running,
                         behind=behind,
                         update_info=info,
@@ -1683,7 +1792,7 @@ class PersonalUsageMixin:
             self._apply_personal_button_state(
                 fetch_btn,
                 (not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir),
-                enabled_tooltip="执行 git fetch，同步内核仓库远端引用。",
+                enabled_tooltip="只执行 git fetch：更新 GenericAgent 内核仓库的远端引用，不改动本地工作区。",
                 disabled_tooltip=self._kernel_sync_disabled_reason(
                     "fetch",
                     running=running,
@@ -1691,13 +1800,13 @@ class PersonalUsageMixin:
                     valid_agent_dir=lz.is_valid_agent_dir(self.agent_dir),
                 ),
             )
-            fetch_btn.setText("同步中…" if kernel_sync_running else "同步内核远端（fetch）")
+            fetch_btn.setText("正在 fetch…" if kernel_sync_running and kernel_sync_action == "fetch" else ("同步中…" if kernel_sync_running else "获取内核远端引用（fetch）"))
         pull_btn = getattr(self, "settings_about_sync_kernel_pull_btn", None)
         if pull_btn is not None:
             self._apply_personal_button_state(
                 pull_btn,
                 (not running) and (not kernel_sync_running) and lz.is_valid_agent_dir(self.agent_dir),
-                enabled_tooltip="执行 git pull --ff-only，快进同步内核仓库。",
+                enabled_tooltip="执行 git pull --ff-only：仅在可快进时同步 GenericAgent 内核仓库。",
                 disabled_tooltip=self._kernel_sync_disabled_reason(
                     "pull",
                     running=running,
@@ -1705,7 +1814,7 @@ class PersonalUsageMixin:
                     valid_agent_dir=lz.is_valid_agent_dir(self.agent_dir),
                 ),
             )
-            pull_btn.setText("同步中…" if kernel_sync_running else "拉取并快进（pull --ff-only）")
+            pull_btn.setText("正在 pull --ff-only…" if kernel_sync_running and kernel_sync_action == "pull" else ("同步中…" if kernel_sync_running else "拉取并快进（pull --ff-only）"))
         self._refresh_about_update_diagnostics_widgets()
 
     def _on_toggle_update_auto_check(self, checked):
@@ -1759,6 +1868,7 @@ class PersonalUsageMixin:
                 return
         holder = {"ok": False, "detail": "", "action": action, "branch": branch}
         self._kernel_repo_sync_running = True
+        self._kernel_repo_sync_action = action
         self._refresh_about_update_widgets()
         self._set_status(f"正在同步内核仓库（{action} {branch}）…")
 
@@ -1780,6 +1890,7 @@ class PersonalUsageMixin:
                 QTimer.singleShot(120, poll)
                 return
             self._kernel_repo_sync_running = False
+            self._kernel_repo_sync_action = ""
             self._refresh_about_update_widgets()
             if holder.get("ok"):
                 self._set_status(f"内核仓库同步成功（{action} {branch}）。")
@@ -1855,7 +1966,7 @@ class PersonalUsageMixin:
                 result_holder["result"] = {
                     "checked_at": time.time(),
                     "launcher": {"name": "启动器", "status": "error", "message": str(e)},
-                    "kernel": {"name": "agant 内核（GenericAgent）", "status": "error", "message": "更新检查中断"},
+                    "kernel": {"name": "GenericAgent 内核", "status": "error", "message": "更新检查中断"},
                     "has_update": False,
                 }
         thread = threading.Thread(target=worker, name="launcher-update-check", daemon=True)
@@ -1904,7 +2015,7 @@ class PersonalUsageMixin:
         result = getattr(self, "_last_update_check_result", None)
         launcher_row = (result or {}).get("launcher") if isinstance(result, dict) else None
         if not isinstance(launcher_row, dict):
-            QMessageBox.information(self, "暂无更新信息", "请先执行一次“立即检测 GitHub 更新”。")
+            QMessageBox.information(self, "暂无更新信息", "请先执行一次“检测启动器和内核更新”。")
             return
         info = launcher_row.get("update_info")
         if not isinstance(info, dict):
@@ -1925,7 +2036,7 @@ class PersonalUsageMixin:
             if (
                 QMessageBox.question(
                     self,
-                    "下载更新安装包",
+                    "下载启动器安装包",
                     f"将打开版本 {target_version} 的下载链接{asset_hint}。\n\n"
                     "下载并安装后，原有设置与使用数据会保留，是否继续？",
                 )
@@ -1949,6 +2060,9 @@ class PersonalUsageMixin:
             != QMessageBox.Yes
         ):
             return
+        self._launcher_update_install_running = True
+        self._refresh_about_update_widgets()
+        self._set_status(f"正在创建启动器更新任务（目标版本 {target_version}）…")
         try:
             info = dict(info)
             proxy_url = self._launcher_update_proxy_url()
@@ -1958,12 +2072,24 @@ class PersonalUsageMixin:
             job_path = str(created.get("job_path") or "").strip()
             if not job_path:
                 raise RuntimeError("创建更新任务失败：job_path 为空")
+            self._set_status(f"更新任务已创建，正在启动 updater：{job_path}")
+            self._refresh_about_update_diagnostics_widgets()
             lz.launch_update_job(job_path)
-            self._set_status(f"已启动更新任务，目标版本 {target_version}。即将重启启动器…")
+            self._refresh_about_update_diagnostics_widgets()
+            self._set_status(f"已成功移交 updater，目标版本 {target_version}。即将重启启动器…")
             self._force_exit_requested = True
             QTimer.singleShot(220, self.close)
         except Exception as e:
-            QMessageBox.warning(self, "启动更新失败", str(e))
+            self._launcher_update_install_running = False
+            self._refresh_about_update_widgets()
+            self._refresh_about_update_diagnostics_widgets()
+            self._set_status("启动器更新启动失败；请查看更新诊断后重试。")
+            QMessageBox.warning(
+                self,
+                "启动更新失败",
+                f"{e}\n\n启动器不会退出。请查看“更新诊断”里的最近任务状态和 updater.log；"
+                "如果是网络问题，请配置更新代理后重新检测并安装。",
+            )
 
     def _reload_personal_preferences(self):
         sound_box = getattr(self, "settings_disable_reply_sound", None)
@@ -3870,7 +3996,6 @@ class PersonalUsageMixin:
             baseline = plot_rect.bottom()
             tick_count = 4
             grid_pen = QPen(self._usage_qcolor(C["stroke_default"], alpha=130), 1, Qt.DashLine)
-            text_color = self._usage_qcolor(C["text"])
             soft_text = self._usage_qcolor(C["text_soft"])
             accent = self._usage_qcolor(C["accent_text"])
             label_font = painter.font()
@@ -5470,42 +5595,88 @@ class PersonalUsageMixin:
             history = self._update_history_items()
             if history:
                 self._last_update_check_result = history[-1]
+
+        def add_about_inset(parent_box, title_text, desc_text=""):
+            card = QFrame()
+            card.setObjectName("cardInset")
+            box = QVBoxLayout(card)
+            box.setContentsMargins(12, 10, 12, 10)
+            box.setSpacing(8)
+            title = QLabel(title_text)
+            title.setObjectName("cardTitle")
+            box.addWidget(title)
+            if desc_text:
+                desc = QLabel(desc_text)
+                desc.setWordWrap(True)
+                desc.setObjectName("cardDesc")
+                box.addWidget(desc)
+            parent_box.addWidget(card)
+            return card, box
+
         update_card = self._panel_card()
         update_box = QVBoxLayout(update_card)
         update_box.setContentsMargins(14, 12, 14, 12)
         update_box.setSpacing(8)
-        update_title = QLabel("更新检测")
+        update_title = QLabel("启动器更新")
         update_title.setObjectName("cardTitle")
         update_box.addWidget(update_title)
         update_desc = QLabel(
-            "支持分别检查“启动器仓库”和“agant 内核仓库（GenericAgent）”是否有新提交。"
-            "检测会优先直连 GitHub API，失败后自动尝试镜像代理地址（更适合国内网络）。"
-            "如果当前网络需要代理，可在这里填写，检测和安装更新都会复用它。"
+            "这里处理启动器本体的版本检测和升级入口。GenericAgent 内核仓库同步是另一条链路，放在下方单独操作。"
         )
         update_desc.setWordWrap(True)
         update_desc.setObjectName("cardDesc")
         update_box.addWidget(update_desc)
+
+        _, status_box = add_about_inset(
+            update_box,
+            "启动器版本状态",
+            "展示当前版本、目标版本、更新方式和下一步动作；不会直接修改 GenericAgent 内核仓库。",
+        )
         self.settings_about_update_status = QLabel("")
         self.settings_about_update_status.setWordWrap(True)
-        self.settings_about_update_status.setObjectName("mutedText")
+        self.settings_about_update_status.setObjectName("softTextSmall")
         self.settings_about_update_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        update_box.addWidget(self.settings_about_update_status)
+        status_box.addWidget(self.settings_about_update_status)
+        update_action_row = QHBoxLayout()
+        update_action_row.setSpacing(8)
+        self.settings_about_check_updates_btn = QPushButton("检测启动器和内核更新")
+        self.settings_about_check_updates_btn.setStyleSheet(self._action_button_style(primary=True))
+        self.settings_about_check_updates_btn.clicked.connect(lambda: self._start_update_check(manual=True))
+        update_action_row.addWidget(self.settings_about_check_updates_btn, 0)
+        self.settings_about_install_update_btn = QPushButton("安装启动器更新并重启")
+        self.settings_about_install_update_btn.setStyleSheet(self._action_button_style())
+        self.settings_about_install_update_btn.clicked.connect(self._start_launcher_update_install)
+        update_action_row.addWidget(self.settings_about_install_update_btn, 0)
+        update_action_row.addStretch(1)
+        status_box.addLayout(update_action_row)
+
+        _, options_box = add_about_inset(
+            update_box,
+            "检测选项",
+            "检测会优先直连 GitHub API，失败后自动尝试镜像代理地址；需要代理时可在下方保存。",
+        )
         self.settings_about_auto_check_updates = QCheckBox("每次启动启动器时自动检测 GitHub 更新")
         self.settings_about_auto_check_updates.setChecked(bool(self.cfg.get("auto_check_github_updates", True)))
         self.settings_about_auto_check_updates.toggled.connect(self._on_toggle_update_auto_check)
-        update_box.addWidget(self.settings_about_auto_check_updates)
+        options_box.addWidget(self.settings_about_auto_check_updates)
         self.settings_about_auto_fetch_kernel = QCheckBox("检测内核更新时自动同步远端引用（git fetch）")
         self.settings_about_auto_fetch_kernel.setChecked(bool(self.cfg.get("kernel_update_auto_fetch_enabled", True)))
         self.settings_about_auto_fetch_kernel.toggled.connect(self._on_toggle_kernel_update_auto_fetch)
-        update_box.addWidget(self.settings_about_auto_fetch_kernel)
+        options_box.addWidget(self.settings_about_auto_fetch_kernel)
+
+        _, proxy_box = add_about_inset(
+            update_box,
+            "更新代理",
+            "留空表示直连；填写后会同时用于 GitHub API、manifest / signature 和启动器更新包下载。",
+        )
         self.settings_about_update_proxy_edit = QLineEdit()
         self.settings_about_update_proxy_edit.setPlaceholderText("例如：http://127.0.0.1:7890")
         self.settings_about_update_proxy_edit.setText(self._launcher_update_proxy_url())
-        update_box.addWidget(self._langfuse_input_row("更新代理", self.settings_about_update_proxy_edit))
-        update_proxy_hint = QLabel("留空表示直连；填写后会同时用于 GitHub API、manifest / signature 和更新包下载。")
+        proxy_box.addWidget(self._langfuse_input_row("代理地址", self.settings_about_update_proxy_edit))
+        update_proxy_hint = QLabel("代理只影响启动器的 GitHub 检测和安装包下载；GenericAgent 内核仓库的 git 命令仍使用你的 Git 环境配置。")
         update_proxy_hint.setWordWrap(True)
-        update_proxy_hint.setObjectName("mutedText")
-        update_box.addWidget(update_proxy_hint)
+        update_proxy_hint.setObjectName("softTextSmall")
+        proxy_box.addWidget(update_proxy_hint)
         update_proxy_row = QHBoxLayout()
         update_proxy_row.setSpacing(8)
         save_proxy_btn = QPushButton("保存代理")
@@ -5517,20 +5688,35 @@ class PersonalUsageMixin:
         clear_proxy_btn.clicked.connect(lambda: (self.settings_about_update_proxy_edit.setText(""), self._save_launcher_update_proxy()))
         update_proxy_row.addWidget(clear_proxy_btn, 0)
         update_proxy_row.addStretch(1)
-        update_box.addLayout(update_proxy_row)
-        update_action_row = QHBoxLayout()
-        update_action_row.setSpacing(8)
-        self.settings_about_check_updates_btn = QPushButton("立即检测 GitHub 更新")
-        self.settings_about_check_updates_btn.setStyleSheet(self._action_button_style(primary=True))
-        self.settings_about_check_updates_btn.clicked.connect(lambda: self._start_update_check(manual=True))
-        update_action_row.addWidget(self.settings_about_check_updates_btn, 0)
-        self.settings_about_install_update_btn = QPushButton("安装更新并重启")
-        self.settings_about_install_update_btn.setStyleSheet(self._action_button_style())
-        self.settings_about_install_update_btn.clicked.connect(self._start_launcher_update_install)
-        update_action_row.addWidget(self.settings_about_install_update_btn, 0)
-        update_action_row.addStretch(1)
-        update_box.addLayout(update_action_row)
+        proxy_box.addLayout(update_proxy_row)
         self.settings_about_list_layout.addWidget(update_card)
+
+        kernel_card = self._panel_card()
+        kernel_box = QVBoxLayout(kernel_card)
+        kernel_box.setContentsMargins(14, 12, 14, 12)
+        kernel_box.setSpacing(8)
+        kernel_title = QLabel("GenericAgent 内核仓库同步")
+        kernel_title.setObjectName("cardTitle")
+        kernel_box.addWidget(kernel_title)
+        kernel_desc = QLabel(
+            "这里只对本地 GenericAgent 仓库执行 git 操作。fetch 只更新远端引用；pull --ff-only 只在能快进时更新本地代码。"
+        )
+        kernel_desc.setWordWrap(True)
+        kernel_desc.setObjectName("cardDesc")
+        kernel_box.addWidget(kernel_desc)
+        kernel_actions = QHBoxLayout()
+        kernel_actions.setSpacing(8)
+        self.settings_about_sync_kernel_fetch_btn = QPushButton("获取内核远端引用（fetch）")
+        self.settings_about_sync_kernel_fetch_btn.setStyleSheet(self._action_button_style())
+        self.settings_about_sync_kernel_fetch_btn.clicked.connect(self._sync_kernel_repo_fetch)
+        kernel_actions.addWidget(self.settings_about_sync_kernel_fetch_btn, 0)
+        self.settings_about_sync_kernel_pull_btn = QPushButton("拉取并快进（pull --ff-only）")
+        self.settings_about_sync_kernel_pull_btn.setStyleSheet(self._action_button_style())
+        self.settings_about_sync_kernel_pull_btn.clicked.connect(self._sync_kernel_repo_pull)
+        kernel_actions.addWidget(self.settings_about_sync_kernel_pull_btn, 0)
+        kernel_actions.addStretch(1)
+        kernel_box.addLayout(kernel_actions)
+        self.settings_about_list_layout.addWidget(kernel_card)
 
         diag_card = self._panel_card()
         diag_box = QVBoxLayout(diag_card)
@@ -5539,13 +5725,13 @@ class PersonalUsageMixin:
         diag_title = QLabel("更新诊断")
         diag_title.setObjectName("cardTitle")
         diag_box.addWidget(diag_title)
-        diag_desc = QLabel("用于排查更新异常，包含最近任务状态、错误码、updater.log 尾部日志，以及内核仓库同步操作。")
+        diag_desc = QLabel("用于排查启动器自更新失败，包含最近任务状态、错误码和 updater.log 尾部日志。内核仓库同步操作已单独放在上方。")
         diag_desc.setWordWrap(True)
         diag_desc.setObjectName("cardDesc")
         diag_box.addWidget(diag_desc)
         self.settings_about_update_diag_status = QLabel("")
         self.settings_about_update_diag_status.setWordWrap(True)
-        self.settings_about_update_diag_status.setObjectName("mutedText")
+        self.settings_about_update_diag_status.setObjectName("softTextSmall")
         self.settings_about_update_diag_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         diag_box.addWidget(self.settings_about_update_diag_status)
         diag_actions = QHBoxLayout()
@@ -5554,14 +5740,6 @@ class PersonalUsageMixin:
         refresh_diag_btn.setStyleSheet(self._action_button_style())
         refresh_diag_btn.clicked.connect(self._refresh_about_update_diagnostics_manual)
         diag_actions.addWidget(refresh_diag_btn, 0)
-        self.settings_about_sync_kernel_fetch_btn = QPushButton("同步内核远端（fetch）")
-        self.settings_about_sync_kernel_fetch_btn.setStyleSheet(self._action_button_style())
-        self.settings_about_sync_kernel_fetch_btn.clicked.connect(self._sync_kernel_repo_fetch)
-        diag_actions.addWidget(self.settings_about_sync_kernel_fetch_btn, 0)
-        self.settings_about_sync_kernel_pull_btn = QPushButton("拉取并快进（pull --ff-only）")
-        self.settings_about_sync_kernel_pull_btn.setStyleSheet(self._action_button_style())
-        self.settings_about_sync_kernel_pull_btn.clicked.connect(self._sync_kernel_repo_pull)
-        diag_actions.addWidget(self.settings_about_sync_kernel_pull_btn, 0)
         diag_actions.addStretch(1)
         diag_box.addLayout(diag_actions)
         self.settings_about_list_layout.addWidget(diag_card)
@@ -5618,7 +5796,7 @@ class PersonalUsageMixin:
             ("当前状态", "可用，且正持续把 Tk 时代的设置与工具页并到 Qt"),
             ("启动器版本", str(lz.current_launcher_version())),
             ("启动器仓库", launcher_repo_url),
-            ("agant 内核仓库", lz.REPO_URL),
+            ("GenericAgent 内核仓库", lz.REPO_URL),
             ("当前配置文件", lz.CONFIG_PATH),
             ("用户数据目录", lz.DATA_ROOT),
         ]
