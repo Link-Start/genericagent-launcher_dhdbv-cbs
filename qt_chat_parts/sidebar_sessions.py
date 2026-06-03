@@ -790,7 +790,7 @@ class SidebarSessionsMixin:
         current_scope, _current_did = self._session_device_scope_id(self.current_session or {})
         return current_scope == "remote"
 
-    def _sync_remote_device_launcher_sessions(self, *, force=False, device_id="", trigger_refresh=True):
+    def _sync_remote_device_launcher_sessions(self, *, force=False, device_id="", trigger_refresh=True, include_all_channels=False):
         req_device_id = str(device_id or "").strip()
         if not self._auto_ssh_remote_devices(req_device_id):
             return
@@ -802,6 +802,8 @@ class SidebarSessionsMixin:
         if running:
             if force:
                 self._remote_launcher_sync_pending_force = True
+            if include_all_channels:
+                self._remote_launcher_sync_pending_include_all_channels = True
             did = str(device_id or "").strip()
             if did:
                 self._remote_launcher_sync_pending_device_id = did
@@ -811,6 +813,7 @@ class SidebarSessionsMixin:
         self._remote_launcher_sync_running = True
         req_force = bool(force)
         req_refresh = bool(trigger_refresh)
+        req_include_all_channels = bool(include_all_channels)
         context = capture_runtime_context(self)
         agent_dir = str(context.get("agent_dir") or "").strip()
 
@@ -821,6 +824,7 @@ class SidebarSessionsMixin:
                     self._sync_remote_device_launcher_sessions_blocking(
                         force=req_force,
                         device_id=req_device_id,
+                        include_all_channels=req_include_all_channels,
                         agent_dir=agent_dir,
                         runtime_context=context,
                     )
@@ -837,14 +841,17 @@ class SidebarSessionsMixin:
                 pending_force = bool(getattr(self, "_remote_launcher_sync_pending_force", False))
                 pending_device_id = str(getattr(self, "_remote_launcher_sync_pending_device_id", "") or "").strip()
                 pending_refresh = bool(getattr(self, "_remote_launcher_sync_pending_refresh", False))
+                pending_include_all_channels = bool(getattr(self, "_remote_launcher_sync_pending_include_all_channels", False))
                 self._remote_launcher_sync_pending_force = False
                 self._remote_launcher_sync_pending_device_id = ""
                 self._remote_launcher_sync_pending_refresh = False
-                if pending_force or pending_device_id or pending_refresh:
+                self._remote_launcher_sync_pending_include_all_channels = False
+                if pending_force or pending_device_id or pending_refresh or pending_include_all_channels:
                     self._sync_remote_device_launcher_sessions(
                         force=pending_force,
                         device_id=pending_device_id,
                         trigger_refresh=pending_refresh,
+                        include_all_channels=(req_include_all_channels or pending_include_all_channels),
                     )
 
             self._sidebar_post_ui(done)
@@ -2234,7 +2241,7 @@ class SidebarSessionsMixin:
         mode = str(getattr(self, "_sidebar_view_mode", "roots") or "roots").strip().lower()
         scope, did = self._current_device_context()
         if scope == "remote" and mode in ("channels", "sessions") and self._remote_device_auto_ssh_enabled(did):
-            self._sync_remote_device_launcher_sessions(device_id=did)
+            self._sync_remote_device_launcher_sessions(device_id=did, include_all_channels=True)
         if mode == "sessions":
             rows = [row for row in self._sidebar_session_rows(self._sidebar_channel_id) if self._sidebar_row_matches_keyword(row, keyword)]
         elif mode == "channels":

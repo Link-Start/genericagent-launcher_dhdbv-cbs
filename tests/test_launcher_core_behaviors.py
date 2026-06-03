@@ -6,6 +6,7 @@ import json
 import types
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -1677,6 +1678,161 @@ tg_bot_token = '123'
             self.assertEqual(rows[0].get("session_kind"), "channel_process")
             repaired_index = sessions_mod._load_sessions_index(td)
             self.assertEqual(repaired_index[sid].get("channel_id"), "wechat")
+
+    def test_channel_capture_env_installs_sitecustomize_and_sets_runtime_flags(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = lz.channel_capture_env({"PYTHONPATH": "old-path", "OTHER": "1"}, td, pathsep=";")
+
+            runtime_dir = os.path.join(td, "temp", "launcher_channel_capture")
+            sitecustomize_path = os.path.join(runtime_dir, "sitecustomize.py")
+            self.assertTrue(os.path.isfile(sitecustomize_path))
+            self.assertEqual(env["PYTHONPATH"], runtime_dir + ";old-path")
+            self.assertEqual(env["GA_LAUNCHER_CHANNEL_CAPTURE"], "1")
+            self.assertEqual(os.path.normcase(env["GA_LAUNCHER_AGENT_DIR"]), os.path.normcase(os.path.abspath(td)))
+            self.assertEqual(env["OTHER"], "1")
+            with open(sitecustomize_path, "r", encoding="utf-8") as f:
+                source = f.read()
+            self.assertIn("def _ga_patch_display_queue", source)
+            self.assertIn("channel_conversation", source)
+
+    def test_channel_capture_runtime_records_assistant_when_frontend_does_not_read_queue(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            frontends_dir = os.path.join(td, "frontends")
+            os.makedirs(frontends_dir, exist_ok=True)
+            with open(os.path.join(td, "agentmain.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import queue, threading, time\n"
+                    "\n"
+                    "class Backend:\n"
+                    "    def __init__(self):\n"
+                    "        self.history = []\n"
+                    "        self.context_win = 4096\n"
+                    "\n"
+                    "class LLMClient:\n"
+                    "    def __init__(self):\n"
+                    "        self.backend = Backend()\n"
+                    "\n"
+                    "class GeneraticAgent:\n"
+                    "    def __init__(self):\n"
+                    "        self.llmclient = LLMClient()\n"
+                    "        self.history = []\n"
+                    "        self.llm_no = 2\n"
+                    "        self.is_running = False\n"
+                    "\n"
+                    "    def put_task(self, query, source='user', images=None):\n"
+                    "        display_queue = queue.Queue()\n"
+                    "        self.is_running = True\n"
+                    "        def worker():\n"
+                    "            time.sleep(0.2)\n"
+                    "            self.llmclient.backend.history = [\n"
+                    "                {'role': 'user', 'content': query},\n"
+                    "                {'role': 'assistant', 'content': 'assistant reply'},\n"
+                    "            ]\n"
+                    "            self.history = [{'role': 'assistant', 'content': 'assistant reply'}]\n"
+                    "            self.is_running = False\n"
+                    "            display_queue.put({'done': 'assistant reply'})\n"
+                    "        threading.Thread(target=worker, daemon=True).start()\n"
+                    "        return display_queue\n"
+                )
+            with open(os.path.join(frontends_dir, "fake_channel.py"), "w", encoding="utf-8") as f:
+                f.write(
+                    "import os, sys\n"
+                    "import time\n"
+                    "sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\n"
+                    "from agentmain import GeneraticAgent\n"
+                    "\n"
+                    "agent = GeneraticAgent()\n"
+                    "\n"
+                    "def receive_one(chat_id, message_id, uid):\n"
+                    "    agent.put_task(\n"
+                    "        'If you need to show files to user, use [FILE:filepath] in your response.\\n\\nhello from tg',\n"
+                    "        source='telegram',\n"
+                    "    )\n"
+                    "\n"
+                    "receive_one('chat-42', 'msg-99', 'raw-user-id')\n"
+                    "time.sleep(1.0)\n"
+                )
+
+            env = lz.channel_capture_env(os.environ.copy(), td)
+            proc = subprocess.run(
+                [sys.executable, "-u", os.path.join(frontends_dir, "fake_channel.py")],
+                cwd=td,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+            session_dir = os.path.join(td, "temp", "launcher_sessions")
+            files = [name for name in os.listdir(session_dir) if name.endswith(".json")]
+            self.assertEqual(len(files), 1)
+            with open(os.path.join(session_dir, files[0]), "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            self.assertEqual(payload.get("session_kind"), "channel_conversation")
+            self.assertEqual(payload.get("channel_id"), "telegram")
+            self.assertEqual(payload.get("channel_label"), "Telegram / 纸飞机")
+            self.assertEqual(
+                [(item.get("role"), item.get("text")) for item in payload.get("bubbles", [])],
+                [("user", "hello from tg"), ("assistant", "assistant reply")],
+            )
+            self.assertTrue(payload.get("backend_history"))
+            self.assertTrue(payload.get("agent_history"))
+            self.assertEqual(payload.get("llm_idx"), 2)
+            self.assertEqual(payload.get("snapshot", {}).get("kind"), "turn_complete")
+            self.assertNotIn("raw-user-id", json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("external_user_label", json.dumps(payload, ensure_ascii=False))
+
+            rows = lz.list_sessions(td)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("channel_id"), "telegram")
+            self.assertEqual(rows[0].get("session_kind"), "channel_conversation")
+
+    def test_list_sessions_repairs_stale_index_for_channel_conversation(self):
+        with tempfile.TemporaryDirectory() as td:
+            sid = "channel_telegram_demo"
+            session = {
+                "id": sid,
+                "title": "新 Telegram 对话",
+                "created_at": 100.0,
+                "updated_at": 300.0,
+                "session_kind": "channel_conversation",
+                "channel_id": "telegram",
+                "channel_label": "Telegram / 纸飞机",
+                "bubbles": [{"role": "user", "text": "hello"}],
+                "backend_history": [{"role": "user", "content": "hello"}],
+                "agent_history": [{"role": "user", "content": "hello"}],
+            }
+            lz.save_session(td, session, touch=False)
+            fp = os.path.join(lz.sessions_dir(td), f"{sid}.json")
+            sessions_mod._save_sessions_index(
+                td,
+                {
+                    sid: {
+                        "id": sid,
+                        "title": "旧标题",
+                        "updated_at": 100.0,
+                        "pinned": False,
+                        "channel_id": "launcher",
+                        "channel_label": "启动器",
+                        "session_kind": "",
+                        "path": fp,
+                    }
+                },
+            )
+
+            rows = lz.list_sessions(td)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("title"), "新 Telegram 对话")
+            self.assertEqual(rows[0].get("updated_at"), 300.0)
+            self.assertEqual(rows[0].get("channel_id"), "telegram")
+            self.assertEqual(rows[0].get("session_kind"), "channel_conversation")
+            repaired_index = sessions_mod._load_sessions_index(td)
+            self.assertEqual(repaired_index[sid].get("channel_id"), "telegram")
+            self.assertEqual(repaired_index[sid].get("session_kind"), "channel_conversation")
 
     def test_purge_archived_sessions(self):
         with tempfile.TemporaryDirectory() as td:

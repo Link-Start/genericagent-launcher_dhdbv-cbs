@@ -3327,6 +3327,7 @@ class ChannelRuntimeMixin:
             f"script_rel = {script_rel!r}\n"
             f"conflicts = {conflicts!r}\n"
             "base = os.getcwd()\n"
+            f"channel_capture_source = {lz.channel_capture_sitecustomize_source()!r}\n"
             "sess_dir = os.path.join(base, 'temp', 'launcher_sessions')\n"
             "log_dir = os.path.join(base, 'temp', 'launcher_channels')\n"
             "os.makedirs(sess_dir, exist_ok=True)\n"
@@ -3362,6 +3363,28 @@ class ChannelRuntimeMixin:
             "            text = f.read()\n"
             "        return text[-int(limit or 12000):]\n"
             "    except Exception:\n"
+            "        return ''\n"
+            "\n"
+            "def install_channel_capture_runtime():\n"
+            "    if not str(channel_capture_source or '').strip():\n"
+            "        return ''\n"
+            "    runtime_dir = os.path.join(base, 'temp', 'launcher_channel_capture')\n"
+            "    path = os.path.join(runtime_dir, 'sitecustomize.py')\n"
+            "    try:\n"
+            "        os.makedirs(runtime_dir, exist_ok=True)\n"
+            "        old = ''\n"
+            "        if os.path.isfile(path):\n"
+            "            try:\n"
+            "                with open(path, 'r', encoding='utf-8', errors='replace') as f:\n"
+            "                    old = f.read()\n"
+            "            except Exception:\n"
+            "                old = ''\n"
+            "        if old != channel_capture_source:\n"
+            "            with open(path, 'w', encoding='utf-8') as f:\n"
+            "                f.write(channel_capture_source)\n"
+            "        return runtime_dir\n"
+            "    except Exception as e:\n"
+            "        print(f'[launcher channel capture] install failed: {e}')\n"
             "        return ''\n"
             "\n"
             "def wechat_lock_occupied():\n"
@@ -3533,6 +3556,12 @@ class ChannelRuntimeMixin:
             "py_bin = str(os.environ.get('GA_PY_BIN') or 'python3').strip() or 'python3'\n"
             "log_path = os.path.join(log_dir, f'{channel_id}.log')\n"
             "proc_env = dict(os.environ)\n"
+            "capture_dir = install_channel_capture_runtime()\n"
+            "if capture_dir:\n"
+            "    prev_path = str(proc_env.get('PYTHONPATH') or '').strip()\n"
+            "    proc_env['PYTHONPATH'] = capture_dir if not prev_path else (capture_dir + os.pathsep + prev_path)\n"
+            "    proc_env['GA_LAUNCHER_CHANNEL_CAPTURE'] = '1'\n"
+            "    proc_env['GA_LAUNCHER_AGENT_DIR'] = base\n"
             "user_site = ''\n"
             "user_base = ''\n"
             "try:\n"
@@ -4373,6 +4402,10 @@ class ChannelRuntimeMixin:
             log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
             log_handle.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {channel_id} ====\n")
             py_env = lz._external_subprocess_env()
+            try:
+                py_env = lz.channel_capture_env(py_env, self.agent_dir)
+            except Exception as capture_err:
+                self._set_status(f"渠道对话记录准备失败，本次仍会继续启动渠道：{capture_err}")
             if str(channel_id or "").strip().lower() == "conductor":
                 py_env["GA_LAUNCHER_AGENT_DIR"] = str(self.agent_dir or "").strip()
             proc = lz._popen_external_subprocess(

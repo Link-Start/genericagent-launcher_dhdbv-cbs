@@ -555,6 +555,10 @@ def _session_meta_needs_quick_refresh(row):
         return True
     channel_id = _normalize_usage_channel_id(row.get("channel_id"), "launcher")
     session_kind = str(row.get("session_kind") or "").strip().lower()
+    if not session_kind:
+        return True
+    if session_kind == "channel_conversation":
+        return True
     if session_kind == "channel_process" and channel_id == "launcher":
         return True
     if channel_id != "launcher":
@@ -609,11 +613,9 @@ def list_sessions(agent_dir):
                 quick = _quick_read_session_meta(fp, sid)
                 if isinstance(quick, dict):
                     quick["path"] = fp
-                    quick_channel = _normalize_usage_channel_id(quick.get("channel_id"), "launcher")
-                    row_channel = _normalize_usage_channel_id(row.get("channel_id"), "launcher")
-                    quick_kind = str(quick.get("session_kind") or "").strip().lower()
-                    row_kind = str(row.get("session_kind") or "").strip().lower()
-                    if (quick_channel != row_channel) or (quick_kind != row_kind):
+                    row_meta = _session_meta_from_payload(row, sid=sid, path=fp)
+                    quick_meta = _session_meta_from_payload(quick, sid=sid, path=fp)
+                    if quick_meta != row_meta:
                         row = quick
                         index[sid] = row
                         changed_index = True

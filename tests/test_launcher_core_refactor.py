@@ -1783,6 +1783,18 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertEqual(dummy.new_session_calls, [(False, "local", "local", False)])
         info_box.assert_not_called()
 
+    def test_channel_conversation_session_is_not_channel_process_read_only(self):
+        class DummyShell(SessionShellMixin):
+            _is_channel_process_session = SessionShellMixin._is_channel_process_session
+
+            def __init__(self):
+                self.current_session = {}
+
+        dummy = DummyShell()
+
+        self.assertTrue(dummy._is_channel_process_session({"session_kind": "channel_process"}))
+        self.assertFalse(dummy._is_channel_process_session({"session_kind": "channel_conversation"}))
+
     def test_input_text_edit_keeps_focus_and_typing_when_slash_popup_visible(self):
         app = launcher_window.QApplication.instance() or launcher_window.QApplication([])
         editor = chat_common.InputTextEdit(lambda: None)
@@ -4339,6 +4351,59 @@ class LauncherCoreFacadeTests(unittest.TestCase):
 
         self.assertEqual(dummy.calls, ["done"])
 
+    def test_remote_launcher_sync_pending_preserves_include_all_channels(self):
+        class HoldingThread:
+            created = []
+
+            def __init__(self, target=None, name=None, daemon=None):
+                self._target = target
+                HoldingThread.created.append(self)
+
+            def start(self):
+                return None
+
+            def run_now(self):
+                if callable(self._target):
+                    self._target()
+
+        class DummySidebar(SidebarSessionsMixin):
+            _sync_remote_device_launcher_sessions = SidebarSessionsMixin._sync_remote_device_launcher_sessions
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self._runtime_context_generation = 3
+                self.current_session = None
+                self._next_remote_launcher_sync_at = 0.0
+                self._remote_launcher_sync_running = False
+                self.blocking_calls = []
+
+            def _auto_ssh_remote_devices(self, target_id=""):
+                return [{"id": str(target_id or "box-1")}]
+
+            def _sync_remote_device_launcher_sessions_blocking(self, **kwargs):
+                self.blocking_calls.append(dict(kwargs))
+                return False
+
+            def _sidebar_post_ui(self, callback):
+                if callable(callback):
+                    callback()
+
+            def _should_refresh_remote_sync_ui(self):
+                return False
+
+        HoldingThread.created = []
+        dummy = DummySidebar()
+        with mock.patch.object(sidebar_sessions.threading, "Thread", HoldingThread):
+            dummy._sync_remote_device_launcher_sessions(device_id="box-1", include_all_channels=False)
+            self.assertTrue(dummy._remote_launcher_sync_running)
+            dummy._sync_remote_device_launcher_sessions(device_id="box-1", include_all_channels=True)
+            self.assertEqual(len(HoldingThread.created), 1)
+            HoldingThread.created[0].run_now()
+            self.assertEqual(len(HoldingThread.created), 2)
+            HoldingThread.created[1].run_now()
+
+        self.assertEqual([bool(call.get("include_all_channels")) for call in dummy.blocking_calls], [False, True])
+
     def test_trigger_settings_remote_session_sync_passes_captured_agent_dir_and_context(self):
         class ImmediateThread:
             def __init__(self, target=None, name=None, daemon=None):
@@ -5779,6 +5844,102 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("load_source", dummy.calls)
         self.assertIn(("save", "C:\\demo\\channels\\mykey.py"), dummy.calls)
+
+    def test_start_channel_process_injects_channel_capture_runtime_env(self):
+        class DummyProc:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        class DummyChannel(ChannelRuntimeMixin):
+            _start_channel_process = ChannelRuntimeMixin._start_channel_process
+
+            def __init__(self):
+                self.agent_dir = "C:\\demo"
+                self.cfg = {}
+                self._runtime_context_generation = 1
+                self._channel_procs = {}
+                self._qt_channel_py_path = "C:\\demo\\channels\\mykey.py"
+                self._qt_channel_parse_error = ""
+                self._qt_channel_configs = []
+                self._qt_channel_passthrough = []
+                self._qt_channel_extras = {}
+
+            def _channel_target_context(self):
+                return False, None, {"is_remote": False}
+
+            def _qt_channels_save(self, silent=False, apply_running=True):
+                return True
+
+            def _channel_proc_alive(self, channel_id):
+                return False
+
+            def _channel_conflict_message(self, channel_id):
+                return ""
+
+            def _check_runtime_dependencies(self, **kwargs):
+                return True
+
+            def _channel_missing_required(self, channel_id, values):
+                return []
+
+            def _channel_log_path(self, channel_id):
+                return "C:\\demo\\temp\\launcher_channels\\telegram.log"
+
+            def _create_channel_process_session(self, channel_id, proc, log_path):
+                return "sess-telegram"
+
+            def _sync_channel_process_session(self, channel_id, final=False, exit_code=None):
+                return None
+
+            def _reload_channels_editor_state(self):
+                return None
+
+            def _refresh_sessions(self):
+                return None
+
+        def channel_capture_env(base_env, agent_dir):
+            env = dict(base_env or {})
+            env["GA_LAUNCHER_CHANNEL_CAPTURE"] = "1"
+            env["GA_LAUNCHER_AGENT_DIR"] = str(agent_dir)
+            env["PYTHONPATH"] = "capture-runtime"
+            return env
+
+        dummy = DummyChannel()
+        with mock.patch.object(
+            channel_runtime.lz,
+            "COMM_CHANNEL_INDEX",
+            {"telegram": {"id": "telegram", "label": "Telegram", "script": "tgapp.py", "fields": []}},
+        ), mock.patch.object(
+            channel_runtime.lz, "is_valid_agent_dir", return_value=True
+        ), mock.patch.object(
+            channel_runtime.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            channel_runtime.lz, "_resolve_configured_python_exe", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_find_system_python", return_value="python"
+        ), mock.patch.object(
+            channel_runtime.lz, "_external_subprocess_env", return_value={"BASE": "1"}
+        ), mock.patch.object(
+            channel_runtime.lz, "channel_capture_env", side_effect=channel_capture_env
+        ) as capture_env_mock, mock.patch.object(
+            channel_runtime.lz, "_popen_external_subprocess", return_value=DummyProc()
+        ) as popen_mock, mock.patch.object(
+            channel_runtime.QTimer, "singleShot", side_effect=lambda *_args, **_kwargs: None
+        ), mock.patch(
+            "builtins.open", mock.mock_open()
+        ):
+            ok = dummy._start_channel_process("telegram", show_errors=False)
+
+        self.assertTrue(ok)
+        capture_env_mock.assert_called_once_with({"BASE": "1"}, "C:\\demo")
+        popen_mock.assert_called_once()
+        env = dict(popen_mock.call_args.kwargs.get("env") or {})
+        self.assertEqual(env.get("BASE"), "1")
+        self.assertEqual(env.get("GA_LAUNCHER_CHANNEL_CAPTURE"), "1")
+        self.assertEqual(env.get("GA_LAUNCHER_AGENT_DIR"), "C:\\demo")
+        self.assertEqual(env.get("PYTHONPATH"), "capture-runtime")
 
     def test_start_channel_process_telegram_does_not_open_wechat_qr_dialog(self):
         class DummyProc:
@@ -7951,6 +8112,35 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertIn("find_wechat_pids", script)
         self.assertIn("if not terminate_pid_force(existing_pid):", script)
         self.assertIn("'restarted': bool(restarted)", script)
+
+    def test_remote_start_channel_process_blocking_installs_channel_capture_runtime(self):
+        class DummyChannel(ChannelRuntimeMixin):
+            _remote_start_channel_process_blocking = ChannelRuntimeMixin._remote_start_channel_process_blocking
+
+            def __init__(self):
+                self.scripts = []
+
+            def _remote_exec_json_script(self, device, script, timeout=120):
+                self.scripts.append(str(script))
+                return True, {"ok": True, "pid": 654}, ""
+
+        dummy = DummyChannel()
+        ok, msg, payload = dummy._remote_start_channel_process_blocking(
+            {"id": "box-1"},
+            "telegram",
+            {"id": "telegram", "label": "Telegram / 纸飞机", "script": "tgapp.py", "conflicts_with": []},
+        )
+
+        self.assertTrue(ok, msg=msg)
+        self.assertEqual(payload.get("pid"), 654)
+        self.assertEqual(len(dummy.scripts), 1)
+        script = dummy.scripts[0]
+        self.assertIn("channel_capture_source =", script)
+        self.assertIn("def install_channel_capture_runtime():", script)
+        self.assertIn("launcher_channel_capture", script)
+        self.assertIn("sitecustomize.py", script)
+        self.assertIn("proc_env['GA_LAUNCHER_CHANNEL_CAPTURE'] = '1'", script)
+        self.assertIn("proc_env['GA_LAUNCHER_AGENT_DIR'] = base", script)
 
     def test_remote_prepare_runtime_dependencies_blocking_uses_self_contained_remote_installer(self):
         class DummyChannel(ChannelRuntimeMixin):
