@@ -136,7 +136,7 @@ class LauncherCoreFacadeTests(unittest.TestCase):
                 runtime.DATA_ROOT = original_data_root
 
     def test_runtime_python_exe_helpers_expand_user_home_path(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             original_app_dir = runtime.APP_DIR
             original_data_root = runtime.DATA_ROOT
             runtime.APP_DIR = os.path.join(td, "launcher")
