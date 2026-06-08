@@ -10,17 +10,697 @@ import threading
 import time
 import uuid
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QStyle, QSystemTrayIcon, QVBoxLayout
 
 from launcher_app import core as lz
 from launcher_app.theme import C
 
-from .common import _session_copy, normalize_remote_agent_dir, normalize_ssh_error_text
+from .common import (
+    _session_copy,
+    chat_auto_jump_latest_enabled,
+    normalize_remote_agent_dir,
+    normalize_ssh_error_text,
+    remote_device_agent_dir,
+    remote_device_agent_mode,
+    remote_device_container_name,
+)
+
+_RUNTIME_REASONING_EFFORT_CHOICES = [
+    ("", "跟随配置"),
+    ("none", "none"),
+    ("minimal", "minimal"),
+    ("low", "low"),
+    ("medium", "medium"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+]
+_RUNTIME_REASONING_EFFORT_VALUES = {value for value, _label in _RUNTIME_REASONING_EFFORT_CHOICES if value}
 
 
 class BridgeRuntimeMixin:
+    def _set_tray_message_ready(self, tray, ready: bool):
+        if tray is None:
+            return
+        try:
+            tray.setProperty("_ga_launcher_tray_message_ready", bool(ready))
+            return
+        except Exception:
+            pass
+        try:
+            setattr(tray, "_ga_launcher_tray_message_ready", bool(ready))
+        except Exception:
+            pass
+
+    def _tray_message_ready(self, tray) -> bool:
+        if tray is None:
+            return False
+        try:
+            prop = tray.property("_ga_launcher_tray_message_ready")
+        except Exception:
+            prop = getattr(tray, "_ga_launcher_tray_message_ready", None)
+        if prop is not None:
+            return bool(prop)
+        visible_getter = getattr(tray, "isVisible", None)
+        if callable(visible_getter):
+            try:
+                return bool(visible_getter())
+            except Exception:
+                pass
+        return True
+
+    def _show_tray_message(self, tray, title: str, message: str, *, timeout_ms: int = 1500):
+        if tray is None:
+            return
+        try:
+            tray.show()
+        except Exception:
+            pass
+
+        def _deliver():
+            self._set_tray_message_ready(tray, True)
+            try:
+                tray.showMessage(str(title or ""), str(message or ""), QSystemTrayIcon.Information, int(timeout_ms or 0))
+            except Exception:
+                pass
+
+        if self._tray_message_ready(tray):
+            _deliver()
+            return
+        delay_ms = 180 if os.name == "nt" else 0
+        try:
+            QTimer.singleShot(delay_ms, _deliver)
+        except Exception:
+            _deliver()
+
+    def _upstream_optional_slash_command_items(self):
+        agent_dir = str(getattr(self, "agent_dir", "") or "").strip()
+        if (not agent_dir) or (not lz.is_valid_agent_dir(agent_dir)):
+            return []
+        frontends_dir = os.path.join(agent_dir, "frontends")
+        out = []
+        has_continue = os.path.isfile(os.path.join(frontends_dir, "continue_cmd.py"))
+        has_export = os.path.isfile(os.path.join(frontends_dir, "export_cmd.py"))
+        has_session_names = os.path.isfile(os.path.join(frontends_dir, "session_names.py"))
+        if has_continue:
+            out.extend(
+                [
+                    {
+                        "command": "/continue",
+                        "insert_text": "/continue",
+                        "description": "恢复上游可恢复会话快照",
+                        "aliases": ["/continue"],
+                    },
+                    {
+                        "command": "/continue N",
+                        "insert_text": "/continue ",
+                        "description": "恢复第 N 个上游会话快照",
+                        "aliases": ["/continue", "/continue "],
+                    },
+                ]
+            )
+            if has_session_names:
+                out.append(
+                    {
+                        "command": "/continue <name>",
+                        "insert_text": "/continue ",
+                        "description": "按上游会话名恢复可恢复快照",
+                        "aliases": ["/continue", "/continue "],
+                    }
+                )
+        if has_session_names:
+            out.append(
+                {
+                    "command": "/rename <name>",
+                    "insert_text": "/rename ",
+                    "description": "给当前上游可恢复会话起一个持久化名字",
+                    "aliases": ["/rename", "/rename "],
+                }
+            )
+        if has_export:
+            out.extend(
+                [
+                    {
+                        "command": "/export",
+                        "insert_text": "/export",
+                        "description": "查看导出上一条回复的可用方式",
+                        "aliases": ["/export"],
+                    },
+                    {
+                        "command": "/export clip",
+                        "insert_text": "/export clip",
+                        "description": "把上一条回复整理成可复制文本",
+                        "aliases": ["/export", "/export "],
+                    },
+                    {
+                        "command": "/export all",
+                        "insert_text": "/export all",
+                        "description": "显示当前上游完整日志路径",
+                        "aliases": ["/export", "/export "],
+                    },
+                    {
+                        "command": "/export <file>",
+                        "insert_text": "/export ",
+                        "description": "把上一条回复导出到 temp/<file>",
+                        "aliases": ["/export", "/export "],
+                    },
+                ]
+            )
+        if os.path.isfile(os.path.join(frontends_dir, "btw_cmd.py")):
+            out.append(
+                {
+                    "command": "/btw <q>",
+                    "insert_text": "/btw ",
+                    "description": "临时插问主 agent 进展，不打断当前任务",
+                    "aliases": ["/btw", "/btw "],
+                }
+            )
+        if os.path.isfile(os.path.join(frontends_dir, "review_cmd.py")):
+            out.append(
+                {
+                    "command": "/review [scope]",
+                    "insert_text": "/review",
+                    "description": "让上游主 agent 在当前会话里直接做代码审查",
+                    "aliases": ["/review", "/review "],
+                }
+            )
+        return out
+
+    def _local_slash_command_items(self):
+        return [
+            {"command": "/help", "insert_text": "/help", "description": "显示启动器支持的斜杠命令"},
+            {"command": "/stop", "insert_text": "/stop", "description": "停止当前回复任务"},
+            {"command": "/new", "insert_text": "/new", "description": "新建一个当前设备上下文会话"},
+            {
+                "command": "/cost",
+                "insert_text": "/cost",
+                "description": "查看当前会话的 /cost 口径 token、缓存与上下文窗口",
+                "aliases": ["/cost"],
+            },
+            {
+                "command": "/cost all",
+                "insert_text": "/cost all",
+                "description": "汇总当前设备上下文内所有会话的 /cost 口径统计",
+                "aliases": ["/cost", "/cost "],
+            },
+            {
+                "command": "/llm",
+                "insert_text": "/llm",
+                "description": "显示当前模型列表",
+                "aliases": ["/llm"],
+            },
+            {
+                "command": "/llm N",
+                "insert_text": "/llm ",
+                "description": "切换到第 N 个模型编号",
+                "aliases": ["/llm", "/llm "],
+            },
+            *self._upstream_optional_slash_command_items(),
+            {
+                "command": "/session.<attr>=<val>",
+                "insert_text": "/session.",
+                "description": "透传给上游 agant 的运行时参数覆盖",
+                "aliases": ["/session."],
+            },
+        ]
+
+    def _local_slash_command_suggestions(self, query_text="", *, editor=None):
+        query = str(query_text or "").strip().lower()
+        items = list(self._local_slash_command_items())
+        if not query or query == "/":
+            return items
+        matched = []
+        for item in items:
+            patterns = [str(item.get("command") or "").strip().lower(), str(item.get("insert_text") or "").strip().lower()]
+            patterns += [str(value or "").strip().lower() for value in (item.get("aliases") or [])]
+            patterns = [value for value in patterns if value]
+            if any(value.startswith(query) or query.startswith(value) for value in patterns):
+                matched.append(item)
+        return matched or items
+
+    def _apply_bridge_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _bridge_attachment_remove_disabled_reason(self, *, active_mode=False):
+        if bool(active_mode):
+            return "当前这一轮还没有结束；本轮已附带图片会在回复完成后自动清除。"
+        return ""
+
+    def _bridge_llm_combo_disabled_reason(self):
+        if bool(getattr(self, "llms", None)):
+            return ""
+        return "当前还没有可用的 LLM 配置。"
+
+    def _bridge_reasoning_effort_combo_disabled_reason(self):
+        if bool(getattr(self, "llms", None)):
+            return ""
+        return "当前还没有可用的 LLM 配置。"
+
+    def _local_slash_help_text(self):
+        lines = [
+            "/help - 显示帮助",
+            "/stop - 停止当前任务",
+            "/new - 触发启动器新建会话",
+            "/cost - 查看当前会话的 /cost 口径 token 与缓存统计",
+            "/cost all - 查看当前设备上下文内全部会话的 /cost 汇总",
+            "/llm - 查看当前模型列表",
+            "/llm N - 切换到第 N 个模型",
+        ]
+        commands = {str(item.get("command") or "").strip(): item for item in self._upstream_optional_slash_command_items()}
+        if "/continue" in commands:
+            lines.append("/continue - 恢复上游可恢复会话快照")
+        if "/continue N" in commands:
+            lines.append("/continue N - 恢复第 N 个上游会话快照")
+        if "/continue <name>" in commands:
+            lines.append("/continue <name> - 按上游会话名恢复可恢复快照")
+        if "/rename <name>" in commands:
+            lines.append("/rename <name> - 给当前上游可恢复会话起一个持久化名字")
+        if "/export" in commands:
+            lines.append("/export - 查看导出上一条回复的可用方式")
+        if "/export clip" in commands:
+            lines.append("/export clip - 把上一条回复整理成可复制文本")
+        if "/export all" in commands:
+            lines.append("/export all - 显示当前上游完整日志路径")
+        if "/export <file>" in commands:
+            lines.append("/export <file> - 把上一条回复导出到 temp/<file>")
+        if "/btw <q>" in commands:
+            lines.append("/btw <q> - 临时插问主 agent 进展，不打断当前任务")
+        if "/review [scope]" in commands:
+            lines.append("/review [scope] - 让上游主 agent 在当前会话里直接做代码审查")
+        lines.append("/session.<attr>=<val> - 透传给上游 agant 执行运行时参数覆盖")
+        return "\n".join(lines)
+
+    def _local_slash_llm_text(self):
+        if not self.llms:
+            return "当前没有可用的 LLM 配置。"
+        lines = []
+        for pos, llm in enumerate(self.llms):
+            marker = "→" if llm.get("current") else "  "
+            label = str(llm.get("name") or "(未命名)").strip() or "(未命名)"
+            lines.append(f"{marker} [{int(llm.get('idx', pos) or pos)}] {label}")
+        return "LLMs:\n" + "\n".join(lines)
+
+    def _show_local_slash_feedback(self, title: str, body: str = "", *, status_text: str = ""):
+        parts = [str(title or "").strip(), str(body or "").strip()]
+        text = "\n".join(part for part in parts if part)
+        if not text:
+            text = str(status_text or "").strip()
+        if text:
+            bucket = getattr(self, "_transient_chat_feedback", None)
+            if not isinstance(bucket, list):
+                bucket = []
+                self._transient_chat_feedback = bucket
+            key_resolver = getattr(self, "_transient_chat_feedback_key", None)
+            key = ""
+            if callable(key_resolver):
+                try:
+                    key = str(key_resolver(self.current_session if isinstance(getattr(self, "current_session", None), dict) else None) or "")
+                except Exception:
+                    key = ""
+            bucket.append({"key": key, "role": "assistant", "text": text})
+            if len(bucket) > 24:
+                del bucket[:-24]
+            renderer = getattr(self, "_render_session", None)
+            if callable(renderer):
+                try:
+                    renderer(self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+                except Exception:
+                    pass
+            else:
+                adder = getattr(self, "_add_message_row", None)
+                if callable(adder):
+                    try:
+                        adder("assistant", text, finished=True, auto_scroll=True)
+                    except Exception:
+                        pass
+            refresher = getattr(self, "_refresh_floating_chat_window", None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except Exception:
+                    pass
+        setter = getattr(self, "_set_status", None)
+        final_status = str(status_text or title or "").strip()
+        if callable(setter) and final_status:
+            setter(final_status)
+
+    def _local_slash_clear_input(self, source_editor=None):
+        editors = []
+        for editor in (
+            source_editor,
+            getattr(self, "input_box", None),
+            getattr(getattr(self, "_floating_chat_window", None), "input_box", None),
+        ):
+            if editor is None or any(editor is existing for existing in editors):
+                continue
+            editors.append(editor)
+        for editor in editors:
+            try:
+                editor.clear()
+            except Exception:
+                pass
+        self._pending_input_attachments_data = []
+        refresher = getattr(self, "_refresh_input_attachment_bar", None)
+        if callable(refresher):
+            refresher()
+        sync_to_floating = getattr(self, "_sync_draft_to_floating", None)
+        if callable(sync_to_floating):
+            try:
+                sync_to_floating(force=True)
+            except Exception:
+                pass
+
+    def _local_slash_switch_llm(self, llm_idx):
+        try:
+            target = int(llm_idx)
+        except Exception:
+            return False
+        combo = getattr(self, "llm_combo", None)
+        if combo is None:
+            return False
+        for pos, llm in enumerate(self.llms):
+            try:
+                candidate = int(llm.get("idx", pos) or pos)
+            except Exception:
+                continue
+            if candidate != target:
+                continue
+            self._ignore_llm_change = True
+            try:
+                combo.setCurrentIndex(pos)
+            finally:
+                self._ignore_llm_change = False
+            self._on_llm_changed(pos)
+            return True
+        return False
+
+    def _local_slash_continue_rows(self):
+        scope = "local"
+        did = "local"
+        resolver = getattr(self, "_current_device_context", None)
+        if callable(resolver):
+            try:
+                scope, did = resolver()
+            except Exception:
+                scope, did = "local", "local"
+        rows = list(self._active_sessions_for_channel("launcher", device_scope=scope, device_id=did))
+        current_sid = str((self.current_session or {}).get("id") or "").strip()
+        rows = [row for row in rows if str(row.get("id") or "").strip() and str(row.get("id") or "").strip() != current_sid]
+        rows.sort(key=lambda row: float(row.get("updated_at", 0) or 0), reverse=True)
+        return rows
+
+    def _local_slash_restore_session(self, index: int):
+        rows = self._local_slash_continue_rows()
+        if not rows:
+            self._show_local_slash_feedback("没有可恢复的历史会话。", status_text="没有可恢复的历史会话。")
+            return True
+        target = int(index or 0)
+        if target < 0 or target >= len(rows):
+            detail = f"历史会话索引越界（有效范围 1-{len(rows)}）。"
+            self._show_local_slash_feedback("恢复失败", detail, status_text=detail)
+            return True
+        sid = str(rows[target].get("id") or "").strip()
+        if not sid:
+            self._show_local_slash_feedback("恢复失败", "目标历史会话无效。", status_text="目标历史会话无效。")
+            return True
+        self._load_session_by_id(sid)
+        return True
+
+    def _local_slash_cost_number(self, value):
+        try:
+            num = max(0, int(value or 0))
+        except Exception:
+            num = 0
+        if num < 1000:
+            return str(num)
+        if num < 1_000_000:
+            scaled = num / 1000.0
+            return f"{scaled:.1f}K" if scaled < 100 else f"{int(scaled)}K"
+        scaled = num / 1_000_000.0
+        return f"{scaled:.2f}M" if scaled < 100 else f"{int(scaled)}M"
+
+    def _local_slash_cost_time_label(self, ts):
+        try:
+            value = float(ts or 0)
+        except Exception:
+            value = 0.0
+        if value <= 0:
+            return "暂无"
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
+
+    def _local_slash_cost_context_metrics(self, session):
+        data = session if isinstance(session, dict) else {}
+        snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+        try:
+            cap = max(0, int(snapshot.get("context_window_chars", 0) or 0))
+        except Exception:
+            cap = 0
+        try:
+            used = max(0, int(snapshot.get("current_input_chars", 0) or 0))
+        except Exception:
+            used = 0
+        if used <= 0:
+            history = data.get("backend_history")
+            if isinstance(history, list):
+                try:
+                    used = sum(len(json.dumps(item, ensure_ascii=False)) for item in history)
+                except Exception:
+                    used = 0
+        return {"context_window_chars": cap, "current_input_chars": used}
+
+    def _local_slash_cost_session_rows(self):
+        if not lz.is_valid_agent_dir(getattr(self, "agent_dir", "")):
+            return []
+        scope = "local"
+        device_id = "local"
+        resolver = getattr(self, "_current_device_context", None)
+        if callable(resolver):
+            try:
+                scope, device_id = resolver()
+            except Exception:
+                scope, device_id = "local", "local"
+        channel_id = str(((self.current_session or {}).get("channel_id")) or "launcher").strip().lower() or "launcher"
+        rows = []
+        for meta in self._active_sessions_for_channel(channel_id, device_scope=scope, device_id=device_id):
+            sid = str(meta.get("id") or "").strip()
+            if not sid:
+                continue
+            try:
+                session = lz.load_session(self.agent_dir, sid)
+            except Exception:
+                session = None
+            if not session:
+                continue
+            summary = lz.summarize_session_usage(session)
+            if int(summary.get("event_count", 0) or 0) <= 0 and int(summary.get("usage_total_tokens", 0) or 0) <= 0:
+                continue
+            title = str(session.get("title") or meta.get("title") or "").strip() or "(未命名会话)"
+            rows.append(
+                {
+                    "session": session,
+                    "summary": summary,
+                    "title": title,
+                    "last_active": float(session.get("updated_at", 0) or 0),
+                }
+            )
+        rows.sort(
+            key=lambda item: (
+                int(((item.get("summary") or {}).get("usage_total_tokens", 0) or 0)),
+                float(item.get("last_active", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return rows
+
+    def _local_slash_cost_section_lines(self, heading: str, summary: dict, *, session=None):
+        data = summary if isinstance(summary, dict) else {}
+        title = str(heading or "").strip() or "Token usage"
+        total = int(data.get("usage_total_tokens", lz.usage_total_consumed_tokens(data)) or 0)
+        input_side = int(data.get("input_side_tokens", lz.usage_input_side_tokens(data)) or 0)
+        output_tokens = int(data.get("output_tokens", 0) or 0)
+        cache_read = int(data.get("cache_read_input_tokens", 0) or 0)
+        cache_create = int(data.get("cache_creation_input_tokens", 0) or 0)
+        api_calls = int(data.get("api_calls", 0) or 0)
+        hit_rate = float(data.get("cache_hit_rate", lz.usage_cache_hit_rate(data)) or 0.0)
+        lines = [title]
+        lines.append(
+            f"Token usage: {self._local_slash_cost_number(total)} total "
+            f"({self._local_slash_cost_number(input_side)} input + {self._local_slash_cost_number(output_tokens)} output)"
+        )
+        if cache_read or cache_create:
+            lines.append(
+                f"Cache: {self._local_slash_cost_number(cache_read)} read · "
+                f"{self._local_slash_cost_number(cache_create)} created · {hit_rate:.1f}% hit"
+            )
+        lines.append(f"Requests: {self._local_slash_cost_number(api_calls)}")
+        if isinstance(session, dict):
+            context = self._local_slash_cost_context_metrics(session)
+            cap = int(context.get("context_window_chars", 0) or 0)
+            used = int(context.get("current_input_chars", 0) or 0)
+            if cap > 0:
+                pct_left = max(0.0, (cap - used) / float(cap) * 100.0)
+                lines.append(
+                    f"Context window: {pct_left:.0f}% left "
+                    f"({self._local_slash_cost_number(used)} chars used / {self._local_slash_cost_number(cap)} cap)"
+                )
+        return lines
+
+    def _handle_local_slash_cost(self, parts, *, source_editor=None):
+        args = [str(item or "").strip().lower() for item in list(parts or [])[1:] if str(item or "").strip()]
+        if args and args[0] != "all":
+            self._local_slash_clear_input(source_editor=source_editor)
+            self._show_local_slash_feedback("用法错误", "用法: /cost 或 /cost all", status_text="斜杠命令 /cost 执行失败。")
+            return True
+        self._local_slash_clear_input(source_editor=source_editor)
+        if args and args[0] == "all":
+            rows = self._local_slash_cost_session_rows()
+            if not rows:
+                self._show_local_slash_feedback("当前设备暂无 /cost 统计。", status_text="当前设备暂无 /cost 统计。")
+                return True
+            aggregate = lz.summarize_usage_rows([item.get("summary") or {} for item in rows])
+            lines = ["✦ Token usage（当前设备上下文）", *self._local_slash_cost_section_lines("合计", aggregate), "", "会话明细"]
+            for idx, item in enumerate(rows, 1):
+                summary = item.get("summary") or {}
+                lines.append(
+                    f"{idx}. {item.get('title')} · "
+                    f"{self._local_slash_cost_number(summary.get('usage_total_tokens', 0))} total · "
+                    f"API {self._local_slash_cost_number(summary.get('api_calls', 0))} · "
+                    f"{self._local_slash_cost_time_label(item.get('last_active'))}"
+                )
+            self._show_local_slash_feedback("全部会话 /cost", "\n".join(lines), status_text="已显示当前设备的 /cost 汇总。")
+            return True
+        session = self.current_session if isinstance(getattr(self, "current_session", None), dict) else None
+        if not session:
+            self._show_local_slash_feedback("当前还没有可统计的会话。", status_text="当前还没有可统计的会话。")
+            return True
+        summary = lz.summarize_session_usage(session)
+        if int(summary.get("event_count", 0) or 0) <= 0 and int(summary.get("usage_total_tokens", 0) or 0) <= 0:
+            self._show_local_slash_feedback("当前会话还没有 /cost 统计。", status_text="当前会话还没有 /cost 统计。")
+            return True
+        title = str(session.get("title") or "").strip() or "当前会话"
+        lines = ["✦ Token usage", *self._local_slash_cost_section_lines(title, summary, session=session)]
+        self._show_local_slash_feedback("当前会话 /cost", "\n".join(lines), status_text="已显示当前会话的 /cost 统计。")
+        return True
+
+    def _handle_local_slash_command(self, text: str, *, source_editor=None):
+        cmd = str(text or "").strip()
+        if not cmd.startswith("/"):
+            return False
+        if cmd.startswith("/session."):
+            return False
+        parts = cmd.split()
+        op = str(parts[0] if parts else "").strip().lower()
+        if op == "/help":
+            self._local_slash_clear_input(source_editor=source_editor)
+            self._show_local_slash_feedback("启动器斜杠命令", self._local_slash_help_text(), status_text="已显示启动器支持的斜杠命令。")
+            return True
+        if op == "/stop":
+            self._local_slash_clear_input(source_editor=source_editor)
+            self._abort()
+            self._show_local_slash_feedback("已请求中断当前任务。", status_text="已请求中断当前任务。")
+            return True
+        if op == "/new":
+            self._local_slash_clear_input(source_editor=source_editor)
+            scope, did = ("local", "local")
+            resolver = getattr(self, "_current_device_context", None)
+            if callable(resolver):
+                try:
+                    scope, did = resolver()
+                except Exception:
+                    scope, did = "local", "local"
+            self._new_session(scope=scope, device_id=did, prompt_device=False)
+            return True
+        if op == "/cost":
+            return self._handle_local_slash_cost(parts, source_editor=source_editor)
+        if op == "/llm":
+            self._local_slash_clear_input(source_editor=source_editor)
+            if len(parts) == 1:
+                self._show_local_slash_feedback("当前模型列表", self._local_slash_llm_text(), status_text="已显示当前模型列表。")
+                return True
+            disabled_reason = ""
+            channel_checker = getattr(self, "_is_channel_process_session", None)
+            try:
+                if callable(channel_checker) and channel_checker():
+                    disabled_reason = "渠道进程会话仅支持查看日志，不能切换模型。"
+            except Exception:
+                disabled_reason = ""
+            if disabled_reason:
+                self._show_local_slash_feedback("当前会话只读", disabled_reason, status_text=disabled_reason)
+                return True
+            if self._local_slash_switch_llm(parts[1]):
+                self._show_local_slash_feedback("已切换模型。", status_text="已切换模型。")
+                return True
+            valid_ids = []
+            for pos, llm in enumerate(self.llms):
+                try:
+                    valid_ids.append(str(int(llm.get("idx", pos) or pos)))
+                except Exception:
+                    continue
+            detail = f"有效编号: {', '.join(dict.fromkeys(valid_ids))}" if valid_ids else "当前没有可用的 LLM 配置。"
+            self._show_local_slash_feedback("切换失败", f"用法: /llm N\n{detail}", status_text="斜杠命令 /llm 执行失败。")
+            return True
+        return False
+
+    def _normalize_reasoning_effort_value(self, value):
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return text if text in _RUNTIME_REASONING_EFFORT_VALUES else ""
+
+    def _session_snapshot_reasoning_effort_source(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return ""
+        source = str(((data.get("snapshot") or {}).get("reasoning_effort_source")) or "").strip().lower()
+        return source if source in {"override", "runtime"} else ""
+
+    def _current_session_reasoning_effort_override(self):
+        session = self.current_session if isinstance(getattr(self, "current_session", None), dict) else None
+        if isinstance(session, dict):
+            if "reasoning_effort" in session:
+                return self._normalize_reasoning_effort_value(session.get("reasoning_effort"))
+            if self._session_snapshot_reasoning_effort_source(session) == "override":
+                return self._session_snapshot_reasoning_effort(session)
+            return ""
+        return self._normalize_reasoning_effort_value(getattr(self, "_pending_reasoning_effort_override", None))
+
+    def _session_snapshot_reasoning_effort(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return ""
+        return self._normalize_reasoning_effort_value((data.get("snapshot") or {}).get("reasoning_effort"))
+
+    def _session_reasoning_effort_payload(self, session=None):
+        data = session if isinstance(session, dict) else (self.current_session if isinstance(getattr(self, "current_session", None), dict) else None)
+        if not isinstance(data, dict):
+            return False, None
+        if "reasoning_effort" in data:
+            return True, self._normalize_reasoning_effort_value(data.get("reasoning_effort")) or None
+        if self._session_snapshot_reasoning_effort_source(data) == "override":
+            snapshot_value = self._session_snapshot_reasoning_effort(data) or None
+            if snapshot_value:
+                return True, snapshot_value
+        snapshot_value = self._session_snapshot_reasoning_effort(data) or None
+        return False, None
+
+    def _current_reasoning_effort_selection(self):
+        override = self._current_session_reasoning_effort_override()
+        if override:
+            return override
+        if isinstance(getattr(self, "current_session", None), dict):
+            return ""
+        if self._is_remote_session():
+            return ""
+        return self._normalize_reasoning_effort_value(getattr(self, "_bridge_reasoning_effort", None))
+
     def _remote_parse_bridge_event_text(self, text):
         raw = str(text or "").strip()
         if not raw:
@@ -43,15 +723,41 @@ class BridgeRuntimeMixin:
         return None
 
     def _resolve_bridge_python(self):
+        def _norm_path(value):
+            text = str(value or "").strip()
+            if not text:
+                return ""
+            return os.path.normcase(os.path.normpath(text))
+
         cfg_py = str((getattr(self, "cfg", {}) or {}).get("python_exe") or "").strip()
+        cfg_resolved = ""
         if cfg_py:
-            resolved = lz._resolve_config_path(cfg_py)
-            if resolved and os.path.isfile(resolved):
-                return resolved, None
+            cfg_resolved = lz._resolve_configured_python_exe(cfg_py, agent_dir=self.agent_dir)
 
         cached = getattr(self, "_last_dependency_check", None) or {}
         cached_py = str(cached.get("python") or "").strip()
-        if cached_py and os.path.isfile(cached_py):
+        cache_ok = bool(cached.get("ok"))
+        cache_matches = cache_ok
+        cache_key_getter = getattr(self, "_dependency_check_cache_key", None)
+        if cache_ok and callable(cache_key_getter):
+            try:
+                cache_matches = cached.get("key") == cache_key_getter(extra_packages=[])
+            except TypeError:
+                cache_matches = cached.get("key") == cache_key_getter()
+            except Exception:
+                cache_matches = False
+
+        if cfg_resolved and os.path.isfile(cfg_resolved):
+            if cache_ok and cache_matches and _norm_path(cached_py) == _norm_path(cfg_resolved):
+                return cfg_resolved, None
+            try:
+                ok, _detail = lz._probe_python_agent_compat(cfg_resolved, self.agent_dir)
+            except Exception:
+                ok = False
+            if ok:
+                return cfg_resolved, None
+
+        if cache_ok and cache_matches and cached_py and os.path.isfile(cached_py):
             return cached_py, None
 
         return lz._find_compatible_system_python(self.agent_dir)
@@ -61,7 +767,7 @@ class BridgeRuntimeMixin:
         if not py:
             return
         try:
-            rel = lz._make_config_relative_path(py)
+            rel = lz._make_python_exe_config_path(py, agent_dir=self.agent_dir)
         except Exception:
             return
         if not rel:
@@ -107,10 +813,7 @@ class BridgeRuntimeMixin:
                 widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
-        pending_items = list(self._pending_input_attachments())
-        active_items = list(self._active_turn_attachments())
-        active_mode = bool(active_items)
-        items = active_items if active_mode else pending_items
+        items = list(self._attachment_bar_display_items())
         host.setVisible(bool(items))
         if list_widget is not None:
             list_widget.setVisible(bool(items))
@@ -119,10 +822,7 @@ class BridgeRuntimeMixin:
             layout.invalidate()
             self._refresh_attachment_geometry(host)
             return
-        if active_mode:
-            summary.setText(f"本轮已附带 {len(items)} 张图片。当前回复结束后会自动清除。")
-        else:
-            summary.setText(f"本轮将附带 {len(items)} 张图片。发送成功后它们只对这一轮有效。")
+        summary.setText(f"本轮将附带 {len(items)} 张图片。发送成功后它们只对这一轮有效。")
         for idx, item in enumerate(items):
             row = QFrame()
             row.setObjectName("cardInset")
@@ -156,13 +856,21 @@ class BridgeRuntimeMixin:
 
             remove_btn = QPushButton("移除")
             remove_btn.setStyleSheet(self._action_button_style())
-            remove_btn.setEnabled(not active_mode)
-            if not active_mode:
-                remove_btn.clicked.connect(lambda _=False, i=idx: self._remove_pending_input_attachment(i))
+            disabled_reason = self._bridge_attachment_remove_disabled_reason(active_mode=False)
+            self._apply_bridge_widget_state(
+                remove_btn,
+                not bool(disabled_reason),
+                enabled_tooltip="把这张图片从下一轮输入中移除。",
+                disabled_tooltip=disabled_reason,
+            )
+            remove_btn.clicked.connect(lambda _=False, i=idx: self._remove_pending_input_attachment(i))
             box.addWidget(remove_btn, 0)
             layout.addWidget(row)
         layout.invalidate()
         self._refresh_attachment_geometry(host)
+
+    def _attachment_bar_display_items(self):
+        return list(self._pending_input_attachments())
 
     def _refresh_attachment_geometry(self, host):
         current = host
@@ -302,7 +1010,21 @@ class BridgeRuntimeMixin:
     def _ensure_reply_notify_tray(self):
         tray = getattr(self, "_reply_notify_tray", None)
         if tray is not None:
-            return tray
+            if getattr(self, "_launcher_tray_icon", None) is None:
+                visible_getter = getattr(tray, "isVisible", None)
+                if callable(visible_getter):
+                    try:
+                        if not bool(visible_getter()):
+                            try:
+                                tray.hide()
+                            except Exception:
+                                pass
+                            tray = None
+                            self._reply_notify_tray = None
+                    except Exception:
+                        pass
+            if tray is not None:
+                return tray
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return None
         icon = self.windowIcon()
@@ -315,6 +1037,7 @@ class BridgeRuntimeMixin:
         tray = QSystemTrayIcon(icon, self)
         tray.setToolTip("GenericAgent 启动器")
         tray.show()
+        self._set_tray_message_ready(tray, False)
         self._reply_notify_tray = tray
         return tray
 
@@ -324,6 +1047,28 @@ class BridgeRuntimeMixin:
     def _reply_message_enabled(self):
         return not bool(self.cfg.get("disable_reply_message", False))
 
+    def _chat_auto_jump_latest_enabled(self):
+        return chat_auto_jump_latest_enabled(getattr(self, "cfg", None))
+
+    def _set_turn_auto_jump_latest(self, enabled: bool):
+        self._turn_auto_jump_latest = bool(enabled)
+
+    def _turn_auto_jump_latest_enabled(self):
+        return bool(getattr(self, "_turn_auto_jump_latest", False)) and self._chat_auto_jump_latest_enabled()
+
+    def _arm_current_turn_auto_jump(self, user_row):
+        anchor_setter = getattr(self, "_set_current_turn_user_row", None)
+        if callable(anchor_setter):
+            anchor_setter(user_row)
+        auto_jump = self._chat_auto_jump_latest_enabled()
+        self._set_turn_auto_jump_latest(auto_jump)
+        follower = getattr(self, "_set_follow_latest_user", None)
+        if callable(follower):
+            follower(auto_jump)
+        if auto_jump:
+            self._user_scrolled_up = False
+            self._scroll_row_to_top(user_row, preserve_scroll_state=True)
+
     def _play_reply_done_sound(self):
         if not self._reply_sound_enabled():
             return
@@ -331,6 +1076,11 @@ class BridgeRuntimeMixin:
             try:
                 import winsound
 
+                try:
+                    winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                    return
+                except Exception:
+                    pass
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 return
             except Exception:
@@ -346,16 +1096,31 @@ class BridgeRuntimeMixin:
         self._play_reply_done_sound()
         if not self._reply_message_enabled():
             return
-        tray = self._ensure_reply_notify_tray()
-        if tray is None:
-            return
         msg = "AI 回复已完成"
         preview = str(final_text or "").strip().replace("\r", " ").replace("\n", " ")
         if preview:
             if len(preview) > 72:
                 preview = preview[:72].rstrip() + "…"
             msg = f"{msg}：{preview}"
-        tray.showMessage("GenericAgent 启动器", msg, QSystemTrayIcon.Information, 1500)
+        tray = None
+        launcher_tray_getter = getattr(self, "_ensure_launcher_tray_icon", None)
+        if callable(launcher_tray_getter):
+            try:
+                tray = launcher_tray_getter()
+            except Exception:
+                tray = None
+        if tray is None:
+            tray = self._ensure_reply_notify_tray()
+        if tray is None:
+            if lz.IS_MACOS:
+                setter = getattr(self, "_set_status", None)
+                if callable(setter):
+                    try:
+                        setter(msg)
+                    except Exception:
+                        pass
+            return
+        self._show_tray_message(tray, "GenericAgent 启动器", msg, timeout_ms=1500)
 
     def _request_backend_state(self, session_id=None):
         sid = session_id or ((self.current_session or {}).get("id"))
@@ -364,7 +1129,18 @@ class BridgeRuntimeMixin:
         self._state_request_seq += 1
         self._send_cmd({"cmd": "get_state", "session_id": sid, "request_id": self._state_request_seq})
 
-    def _apply_state_to_session(self, session_id, backend_history, agent_history, llm_idx=None, process_pid=None, snapshot_ts=None):
+    def _apply_state_to_session(
+        self,
+        session_id,
+        backend_history,
+        agent_history,
+        llm_idx=None,
+        process_pid=None,
+        snapshot_ts=None,
+        reasoning_effort=None,
+        context_window_chars=None,
+        current_input_chars=None,
+    ):
         if not session_id:
             return
         target = None
@@ -389,6 +1165,12 @@ class BridgeRuntimeMixin:
                 target["process_pid"] = int(process_pid)
             except Exception:
                 pass
+        had_explicit_override = bool("reasoning_effort" in target or self._session_snapshot_reasoning_effort_source(target) == "override")
+        normalized_reasoning_effort = self._normalize_reasoning_effort_value(reasoning_effort)
+        if had_explicit_override and normalized_reasoning_effort:
+            target["reasoning_effort"] = normalized_reasoning_effort
+        else:
+            target.pop("reasoning_effort", None)
         snapshot = dict(target.get("snapshot") or {})
         snapshot["version"] = int(snapshot.get("version", 1) or 1)
         snapshot["kind"] = "turn_complete"
@@ -398,9 +1180,33 @@ class BridgeRuntimeMixin:
         snapshot["process_pid"] = int(target.get("process_pid", 0) or 0)
         snapshot["has_backend_history"] = bool(target["backend_history"])
         snapshot["has_agent_history"] = bool(target["agent_history"])
+        if context_window_chars is not None:
+            try:
+                snapshot["context_window_chars"] = max(0, int(context_window_chars or 0))
+            except Exception:
+                snapshot["context_window_chars"] = 0
+        if current_input_chars is not None:
+            try:
+                snapshot["current_input_chars"] = max(0, int(current_input_chars or 0))
+            except Exception:
+                snapshot["current_input_chars"] = 0
+        cap = int(snapshot.get("context_window_chars", 0) or 0)
+        used = int(snapshot.get("current_input_chars", 0) or 0)
+        if cap > 0:
+            snapshot["context_window_left_pct"] = round(max(0.0, (cap - used) / float(cap) * 100.0), 1)
+        else:
+            snapshot.pop("context_window_left_pct", None)
+        if normalized_reasoning_effort:
+            snapshot["reasoning_effort"] = normalized_reasoning_effort
+            snapshot["reasoning_effort_source"] = "override" if ("reasoning_effort" in target) else "runtime"
+        else:
+            snapshot.pop("reasoning_effort", None)
+            snapshot.pop("reasoning_effort_source", None)
         target["snapshot"] = snapshot
         if self.current_session and self.current_session.get("id") == session_id:
             self.current_session = target
+            self._bridge_reasoning_effort = normalized_reasoning_effort
+            self._sync_reasoning_effort_combo()
         self._persist_session(target)
 
     def _current_llm_name(self):
@@ -411,6 +1217,83 @@ class BridgeRuntimeMixin:
         if idx >= 0:
             return str(self.llm_combo.itemText(idx) or "").strip()
         return ""
+
+    def _current_api_card_info(self):
+        idx = 0
+        try:
+            idx = self._current_llm_index()
+        except Exception:
+            idx = 0
+        try:
+            mykey_path = lz.resolve_mykey_source_path(self.agent_dir)
+            configs = (lz.parse_mykey_source(mykey_path).get("configs") or [])
+        except Exception:
+            configs = []
+        cfg = configs[idx] if 0 <= int(idx or 0) < len(configs) else None
+        if isinstance(cfg, dict):
+            var = str(cfg.get("var") or "").strip()
+            data = cfg.get("data") if isinstance(cfg.get("data"), dict) else {}
+            label = str(data.get("name") or data.get("model") or var).strip() or var
+            return {"llm_idx": int(idx or 0), "api_card_var": var, "api_card_label": label}
+        return {"llm_idx": int(idx or 0), "api_card_var": "", "api_card_label": ""}
+
+    def _current_usage_target_info(self):
+        session = self.current_session if isinstance(getattr(self, "current_session", None), dict) else {}
+        scope = str(session.get("device_scope") or "local").strip().lower()
+        if scope not in ("local", "remote"):
+            scope = "local"
+        device_id = str(session.get("device_id") or "").strip() if scope == "remote" else "local"
+        if scope == "remote" and not device_id:
+            scope = "local"
+            device_id = "local"
+        return {"device_scope": scope, "device_id": device_id, "target_key": lz.usage_pricing_target_key(scope, device_id)}
+
+    def _build_usage_event(self, *, text="", model="", source="estimate"):
+        api_card = self._current_api_card_info()
+        target = self._current_usage_target_info()
+        input_tokens = lz._estimate_tokens(text)
+        event = {
+            "ts": time.time(),
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "total_tokens": input_tokens,
+            "channel_id": str((self.current_session or {}).get("channel_id") or "launcher").strip().lower(),
+            "model": str(model or self._current_llm_name() or "").strip(),
+            "usage_source": str(source or "estimate").strip().lower() or "estimate",
+            "billing_mode": "pending",
+            **api_card,
+            **target,
+        }
+        if not event.get("api_card_var"):
+            event.pop("api_card_var", None)
+            event.pop("api_card_label", None)
+        return event
+
+    def _finalize_usage_event_billing(self, event):
+        if not isinstance(event, dict):
+            return event
+        if lz.usage_event_is_priced(event):
+            return event
+        scope = str(event.get("device_scope") or (self.current_session or {}).get("device_scope") or "local").strip().lower()
+        device_id = str(event.get("device_id") or (self.current_session or {}).get("device_id") or "local").strip()
+        api_var = str(event.get("api_card_var") or "").strip()
+        if not api_var:
+            api_card = self._current_api_card_info()
+            api_var = str(api_card.get("api_card_var") or "").strip()
+            if api_var:
+                event["api_card_var"] = api_var
+                event["api_card_label"] = str(api_card.get("api_card_label") or api_var).strip() or api_var
+                event["llm_idx"] = int(api_card.get("llm_idx", event.get("llm_idx", 0)) or 0)
+        if not api_var:
+            event["billing_mode"] = "legacy_unpriced"
+            return event
+        pricing = lz.normalize_usage_pricing_config(getattr(self, "cfg", {}) or {})
+        rule = lz.usage_price_rule(getattr(self, "cfg", {}) or {}, scope, device_id, api_var)
+        snapshot = lz.usage_price_snapshot(rule, pricing.get("currency") or "USD")
+        if not snapshot:
+            event["billing_mode"] = "unpriced"
+            return event
+        return lz.apply_usage_price_snapshot(event, snapshot)
 
     def _mark_current_llm_index(self, combo_index: int):
         try:
@@ -444,12 +1327,42 @@ class BridgeRuntimeMixin:
                 current_idx = pos
         if current_idx >= 0:
             self.llm_combo.setCurrentIndex(current_idx)
-        self.llm_combo.setEnabled(bool(self.llms))
         if not self.llms:
             self.llm_combo.addItem("未配置 LLM", -1)
-            self.llm_combo.setEnabled(False)
+        disabled_reason = self._bridge_llm_combo_disabled_reason()
+        self._apply_bridge_widget_state(
+            getattr(self, "llm_combo", None),
+            not bool(disabled_reason),
+            enabled_tooltip="切换当前会话使用的模型。",
+            disabled_tooltip=disabled_reason,
+        )
         self._ignore_llm_change = False
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
+        if callable(floating_sync):
+            floating_sync()
+
+    def _sync_reasoning_effort_combo(self):
+        combo = getattr(self, "reasoning_effort_combo", None)
+        if combo is None:
+            return
+        self._ignore_reasoning_effort_change = True
+        combo.clear()
+        current_value = self._current_reasoning_effort_selection()
+        current_idx = 0
+        for idx, (value, label) in enumerate(_RUNTIME_REASONING_EFFORT_CHOICES):
+            combo.addItem(label, value)
+            if value == current_value:
+                current_idx = idx
+        combo.setCurrentIndex(current_idx)
+        disabled_reason = self._bridge_reasoning_effort_combo_disabled_reason()
+        self._apply_bridge_widget_state(
+            combo,
+            not bool(disabled_reason),
+            enabled_tooltip="切换当前会话使用的思考强度。",
+            disabled_tooltip=disabled_reason,
+        )
+        self._ignore_reasoning_effort_change = False
+        floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
         if callable(floating_sync):
             floating_sync()
 
@@ -478,18 +1391,58 @@ class BridgeRuntimeMixin:
         if not self._bridge_ready:
             return
         self._send_cmd({"cmd": "switch_llm", "idx": int(target)})
+        override = self._current_session_reasoning_effort_override()
+        if override:
+            self._send_cmd({"cmd": "switch_reasoning_effort", "reasoning_effort": override})
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
         if callable(floating_sync):
             floating_sync()
 
+    def _on_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False) or index < 0:
+            return
+        combo = getattr(self, "reasoning_effort_combo", None)
+        if combo is None:
+            return
+        value = self._normalize_reasoning_effort_value(combo.itemData(index))
+        self._pending_reasoning_effort_override = value or None
+        if isinstance(self.current_session, dict):
+            snapshot = dict(self.current_session.get("snapshot") or {})
+            if value:
+                self.current_session["reasoning_effort"] = value
+                snapshot["reasoning_effort"] = value
+                snapshot["reasoning_effort_source"] = "override"
+            else:
+                self.current_session.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+            self.current_session["snapshot"] = snapshot
+            self._persist_session(self.current_session)
+        if self._is_remote_session():
+            self._set_status("远程会话思考强度已记录，将在下一次发送时传给服务器 agant。")
+            floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+            if callable(floating_sync):
+                floating_sync()
+            return
+        self._bridge_reasoning_effort = value
+        if not self._bridge_ready:
+            return
+        self._send_cmd({"cmd": "switch_reasoning_effort", "reasoning_effort": (value or None)})
+        floating_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+        if callable(floating_sync):
+            floating_sync()
+
     def _current_llm_index(self) -> int:
-        for pos, llm in enumerate(self.llms):
+        for pos, llm in enumerate(getattr(self, "llms", None) or []):
             if llm.get("current"):
                 try:
                     return int(llm.get("idx", pos) or pos)
                 except Exception:
                     return pos
-        idx = self.llm_combo.currentIndex()
+        combo = getattr(self, "llm_combo", None)
+        if combo is None:
+            return 0
+        idx = combo.currentIndex()
         if idx >= 0:
             data = self.llm_combo.itemData(idx)
             try:
@@ -499,7 +1452,20 @@ class BridgeRuntimeMixin:
         return 0
 
     def _set_status(self, text: str):
-        self.status_label.setText(text)
+        new_text = str(text or "")
+        if new_text == "桥接进程已就绪。":
+            try:
+                last_done_at = float(getattr(self, "_last_task_complete_status_at", 0.0) or 0.0)
+            except Exception:
+                last_done_at = 0.0
+            if last_done_at > 0 and (time.time() - last_done_at) <= 6.0:
+                try:
+                    current = str(self.status_label.text() or "").strip()
+                except Exception:
+                    current = ""
+                if current in {"已完成。", "正在中断…", "已发送中断请求。"}:
+                    return
+        self.status_label.setText(new_text)
         self._refresh_info_tooltip()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
@@ -593,6 +1559,48 @@ class BridgeRuntimeMixin:
                 pass
         return remote_bridge
 
+    def _remote_device_stage_root(self, device) -> str:
+        dev = device if isinstance(device, dict) else {}
+        raw = str(dev.get("id") or dev.get("host") or "remote-device").strip() or "remote-device"
+        safe = "".join(ch for ch in raw if (ch.isalnum() or ch in ("_", "-")))
+        if not safe:
+            safe = uuid.uuid4().hex[:12]
+        return f"/tmp/genericagent_launcher_remote/{safe}"
+
+    def _remote_stage_bridge_runtime_for_device(self, client, device):
+        dev = device if isinstance(device, dict) else {}
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
+        if remote_device_agent_mode(dev) != "docker":
+            return self._remote_stage_bridge_runtime(client, remote_dir)
+        runtime_dir = posixpath.join(str(remote_dir).rstrip("/"), "temp", "launcher_runtime")
+        host_stage_root = self._remote_device_stage_root(dev)
+        host_stage_fp = posixpath.join(host_stage_root, "bridge.py")
+        container = remote_device_container_name(dev)
+        rc, _out, err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(host_stage_root)}", timeout=20)
+        if rc != 0:
+            raise RuntimeError(str(err or "创建远端 bridge 暂存目录失败。").strip() or "创建远端 bridge 暂存目录失败。")
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(host_stage_fp, "wb") as fp:
+                fp.write(self._remote_bridge_source_text().encode("utf-8"))
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        cmd = (
+            f"docker exec {shlex.quote(container)} sh -lc {shlex.quote('mkdir -p ' + shlex.quote(runtime_dir))} && "
+            f"docker cp {shlex.quote(host_stage_fp)} {shlex.quote(container + ':' + posixpath.join(runtime_dir, 'bridge.py'))}"
+        )
+        rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+        if rc != 0:
+            raise RuntimeError(str(err or "写入容器内 bridge 运行文件失败。").strip() or "写入容器内 bridge 运行文件失败。")
+        try:
+            self._vps_exec_remote(client, f"rm -f {shlex.quote(host_stage_fp)} >/dev/null 2>&1 || true", timeout=10)
+        except Exception:
+            pass
+        return posixpath.join(runtime_dir, "bridge.py")
+
     def _remote_stage_chat_images(self, client, remote_dir: str, images):
         local_images = [str(p or "").strip() for p in (images or []) if os.path.isfile(str(p or "").strip())]
         if not local_images:
@@ -617,11 +1625,61 @@ class BridgeRuntimeMixin:
                 pass
         return remote_paths
 
-    def _remote_cleanup_files(self, client, remote_paths):
+    def _remote_stage_chat_images_for_device(self, client, device, images):
+        dev = device if isinstance(device, dict) else {}
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
+        if remote_device_agent_mode(dev) != "docker":
+            return self._remote_stage_chat_images(client, remote_dir, images)
+        local_images = [str(p or "").strip() for p in (images or []) if os.path.isfile(str(p or "").strip())]
+        if not local_images:
+            return []
+        upload_dir = posixpath.join(str(remote_dir).rstrip("/"), "temp", "launcher_runtime", "chat_uploads")
+        host_stage_root = self._remote_device_stage_root(dev)
+        container = remote_device_container_name(dev)
+        rc, _out, err = self._vps_exec_remote(client, f"mkdir -p {shlex.quote(host_stage_root)}", timeout=20)
+        if rc != 0:
+            raise RuntimeError(str(err or "创建远端图片暂存目录失败。").strip() or "创建远端图片暂存目录失败。")
+        rc, _out, err = self._vps_exec_remote(
+            client,
+            f"docker exec {shlex.quote(container)} sh -lc {shlex.quote('mkdir -p ' + shlex.quote(upload_dir))}",
+            timeout=20,
+        )
+        if rc != 0:
+            raise RuntimeError(str(err or "创建容器内图片上传目录失败。").strip() or "创建容器内图片上传目录失败。")
+        remote_paths = []
+        sftp = client.open_sftp()
+        try:
+            for local_fp in local_images:
+                name = f"{uuid.uuid4().hex[:12]}_{os.path.basename(local_fp)}"
+                host_stage_fp = posixpath.join(host_stage_root, name)
+                container_fp = posixpath.join(upload_dir, name)
+                sftp.put(local_fp, host_stage_fp)
+                cmd = f"docker cp {shlex.quote(host_stage_fp)} {shlex.quote(container + ':' + container_fp)}"
+                rc, _out, err = self._vps_exec_remote(client, cmd, timeout=30)
+                if rc != 0:
+                    raise RuntimeError(str(err or "复制图片到容器失败。").strip() or "复制图片到容器失败。")
+                try:
+                    self._vps_exec_remote(client, f"rm -f {shlex.quote(host_stage_fp)} >/dev/null 2>&1 || true", timeout=10)
+                except Exception:
+                    pass
+                remote_paths.append(container_fp)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        return remote_paths
+
+    def _remote_cleanup_files(self, client, remote_paths, *, device=None):
         paths = [str(p or "").strip() for p in (remote_paths or []) if str(p or "").strip()]
         if (client is None) or (not paths):
             return
-        cmd = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
+        if remote_device_agent_mode(device) == "docker":
+            container = remote_device_container_name(device)
+            inner = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
+            cmd = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(inner)}"
+        else:
+            cmd = "rm -f " + " ".join(shlex.quote(path) for path in paths) + " >/dev/null 2>&1 || true"
         try:
             self._vps_exec_remote(client, cmd, timeout=20)
         except Exception:
@@ -635,8 +1693,10 @@ class BridgeRuntimeMixin:
 
     def _remote_exec_chat_turn(self, session, prompt_text: str, images):
         dev, payload = self._remote_device_payload(session)
-        remote_dir = normalize_remote_agent_dir(dev.get("agent_dir"), username=dev.get("username"))
+        remote_dir = remote_device_agent_dir(dev, username=dev.get("username"))
         python_cmd = str(dev.get("python_cmd") or "python3").strip() or "python3"
+        agent_mode = remote_device_agent_mode(dev)
+        container = remote_device_container_name(dev)
         client, err_msg, detail, missing = self._open_vps_ssh_client(payload, timeout=12)
         if client is None:
             if missing:
@@ -645,23 +1705,27 @@ class BridgeRuntimeMixin:
             raise RuntimeError(normalize_ssh_error_text(text, context="远端 SSH 连接"))
         remote_cleanup = []
         try:
-            remote_bridge = self._remote_stage_bridge_runtime(client, remote_dir)
-            remote_images = self._remote_stage_chat_images(client, remote_dir, images)
+            remote_bridge = self._remote_stage_bridge_runtime_for_device(client, dev)
+            remote_images = self._remote_stage_chat_images_for_device(client, dev, images)
             remote_cleanup.extend(remote_images)
             try:
+                inner_cmd = (
+                    "set -e; "
+                    f"cd {shlex.quote(remote_dir)}; "
+                    f"PY_BIN={shlex.quote(python_cmd)}; "
+                    "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
+                    "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
+                    "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
+                    "else echo '{\"event\":\"error\",\"msg\":\"远端设备未检测到 Python，可在设备配置里指定 python_cmd。\"}'; exit 62; fi; "
+                    "fi; "
+                    "export PYTHONIOENCODING=utf-8 PYTHONUTF8=1; "
+                    f"\"$PY_BIN\" -u {shlex.quote(remote_bridge)} {shlex.quote(remote_dir)}"
+                )
+                exec_cmd = inner_cmd
+                if agent_mode == "docker":
+                    exec_cmd = f"docker exec -i {shlex.quote(container)} sh -lc {shlex.quote(inner_cmd)}"
                 stdin, stdout, stderr = client.exec_command(
-                    (
-                        "set -e; "
-                        f"cd {shlex.quote(remote_dir)}; "
-                        f"PY_BIN={shlex.quote(python_cmd)}; "
-                        "if ! command -v \"$PY_BIN\" >/dev/null 2>&1; then "
-                        "if command -v python3 >/dev/null 2>&1; then PY_BIN=python3; "
-                        "elif command -v python >/dev/null 2>&1; then PY_BIN=python; "
-                        "else echo '{\"event\":\"error\",\"msg\":\"远端设备未检测到 Python，可在设备配置里指定 python_cmd。\"}'; exit 62; fi; "
-                        "fi; "
-                        "export PYTHONIOENCODING=utf-8 PYTHONUTF8=1; "
-                        f"\"$PY_BIN\" -u {shlex.quote(remote_bridge)} {shlex.quote(remote_dir)}"
-                    ),
+                    exec_cmd,
                     timeout=7200,
                     get_pty=False,
                 )
@@ -714,6 +1778,9 @@ class BridgeRuntimeMixin:
                 "agent_history": list((session or {}).get("agent_history") or []),
                 "llm_idx": (session or {}).get("llm_idx", (((session or {}).get("snapshot") or {}).get("llm_idx"))),
             }
+            include_reasoning, reasoning_value = self._session_reasoning_effort_payload(session)
+            if include_reasoning:
+                state_payload["reasoning_effort"] = reasoning_value
             send_payload = {
                 "cmd": "send",
                 "text": str(prompt_text or ""),
@@ -785,8 +1852,11 @@ class BridgeRuntimeMixin:
                         "backend_history": ev.get("backend_history") or [],
                         "agent_history": ev.get("agent_history") or [],
                         "llm_idx": ev.get("llm_idx"),
+                        "reasoning_effort": ev.get("reasoning_effort"),
                         "process_pid": ev.get("process_pid"),
                         "snapshot_ts": ev.get("snapshot_ts"),
+                        "context_window_chars": ev.get("context_window_chars"),
+                        "current_input_chars": ev.get("current_input_chars"),
                     }
                     self._remote_emit_bridge_event(payload, session_id=(ev.get("session_id") or session_id))
                     if done_seen:
@@ -798,6 +1868,9 @@ class BridgeRuntimeMixin:
                         "backend_history": ev.get("backend_history") or [],
                         "agent_history": ev.get("agent_history") or [],
                         "llm_idx": ev.get("llm_idx"),
+                        "reasoning_effort": ev.get("reasoning_effort"),
+                        "context_window_chars": ev.get("context_window_chars"),
+                        "current_input_chars": ev.get("current_input_chars"),
                     }
                     self._remote_emit_bridge_event(payload, session_id=(ev.get("session_id") or session_id))
                     continue
@@ -826,7 +1899,7 @@ class BridgeRuntimeMixin:
                 raise RuntimeError("远端返回为空，请检查服务器日志。")
             return done_text
         finally:
-            self._remote_cleanup_files(client, remote_cleanup)
+            self._remote_cleanup_files(client, remote_cleanup, device=dev)
             try:
                 client.close()
             except Exception:
@@ -853,12 +1926,10 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
-        follower = getattr(self, "_set_follow_latest_user", None)
-        if callable(follower):
-            follower(True)
-        self._scroll_row_to_top(user_row)
+        self._arm_current_turn_auto_jump(user_row)
         self._busy = True
         self._abort_requested = False
+        self._suppress_next_done_after_abort = False
         self._current_stream_text = ""
         self._pending_stream_text = None
         self.send_btn.setEnabled(False)
@@ -867,15 +1938,7 @@ class BridgeRuntimeMixin:
         self._refresh_composer_enabled()
 
         usage = self.current_session.get("token_usage") or {}
-        event = {
-            "ts": time.time(),
-            "input_tokens": lz._estimate_tokens(clean_text),
-            "output_tokens": 0,
-            "total_tokens": lz._estimate_tokens(clean_text),
-            "channel_id": str(self.current_session.get("channel_id") or "launcher").strip().lower(),
-            "model": "remote",
-            "usage_source": "estimate",
-        }
+        event = self._build_usage_event(text=clean_text, model="remote", source="estimate")
         usage.setdefault("events", []).append(event)
         usage["last_model"] = "remote"
         self.current_session["token_usage"] = usage
@@ -927,7 +1990,9 @@ class BridgeRuntimeMixin:
             raise RuntimeError(f"bridge.py 不存在：{bridge}")
         self._bridge_ready = False
         self.llms = []
+        self._bridge_reasoning_effort = ""
         self._sync_llm_combo()
+        self._sync_reasoning_effort_combo()
         self._set_status("正在启动桥接进程…")
         self._stderr_buf = []
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1002,6 +2067,8 @@ class BridgeRuntimeMixin:
         ]
         if not text and not attachments:
             return False
+        if self._handle_local_slash_command(text, source_editor=source_editor):
+            return False
         if self._is_channel_process_session():
             QMessageBox.information(self, "不可发送", "当前选中的是渠道进程会话，只能回顾快照，不能从这里继续发送消息。")
             return False
@@ -1022,12 +2089,10 @@ class BridgeRuntimeMixin:
         user_row = self._add_message_row("user", display_text, finished=True, auto_scroll=False)
         self.current_session.setdefault("bubbles", []).append({"role": "user", "text": display_text})
         self._stream_row = self._add_message_row("assistant", "", finished=False, auto_scroll=False)
-        follower = getattr(self, "_set_follow_latest_user", None)
-        if callable(follower):
-            follower(True)
-        self._scroll_row_to_top(user_row)
+        self._arm_current_turn_auto_jump(user_row)
         self._busy = True
         self._abort_requested = False
+        self._suppress_next_done_after_abort = False
         self._current_stream_text = ""
         self._pending_stream_text = None
         self.send_btn.setEnabled(False)
@@ -1036,15 +2101,7 @@ class BridgeRuntimeMixin:
         self._refresh_composer_enabled()
 
         usage = self.current_session.get("token_usage") or {}
-        event = {
-            "ts": time.time(),
-            "input_tokens": lz._estimate_tokens(text),
-            "output_tokens": 0,
-            "total_tokens": lz._estimate_tokens(text),
-            "channel_id": str(self.current_session.get("channel_id") or "launcher").strip().lower(),
-            "model": self._current_llm_name(),
-            "usage_source": "estimate",
-        }
+        event = self._build_usage_event(text=text, model=self._current_llm_name(), source="estimate")
         usage.setdefault("events", []).append(event)
         usage["last_model"] = event["model"]
         self.current_session["token_usage"] = usage
@@ -1069,9 +2126,27 @@ class BridgeRuntimeMixin:
                 refresher()
             return True
         except Exception as e:
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
+            self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
+            follower = getattr(self, "_set_follow_latest_user", None)
+            if callable(follower):
+                follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self._refresh_composer_enabled()
+            self._refresh_token_label()
             QMessageBox.critical(self, "发送失败", str(e))
             refresher = getattr(self, "_refresh_floating_chat_window", None)
             if callable(refresher):
@@ -1090,11 +2165,8 @@ class BridgeRuntimeMixin:
         self._current_stream_text = cumulative_text or ""
         self._refresh_token_label()
         self._update_stream_row_tokens(live=True)
-        refresher = getattr(self, "_refresh_floating_chat_window", None)
-        if callable(refresher):
-            refresher()
         if not self._stream_flush_timer.isActive():
-            self._stream_flush_timer.start(70)
+            self._stream_flush_timer.start(90)
 
     def _flush_stream_render(self):
         if self._stream_row is None:
@@ -1105,11 +2177,15 @@ class BridgeRuntimeMixin:
             return
         self._stream_row.update_content(pending, finished=False)
         self._update_stream_row_tokens(live=True)
-        sync_view = getattr(self, "_sync_current_turn_view", None)
-        if callable(sync_view):
-            sync_view()
-        else:
-            self._scroll_to_bottom()
+        if self._turn_auto_jump_latest_enabled():
+            sync_view = getattr(self, "_sync_current_turn_view", None)
+            if callable(sync_view):
+                sync_view()
+            else:
+                self._scroll_to_bottom()
+        refresher = getattr(self, "_refresh_floating_chat_window", None)
+        if callable(refresher):
+            refresher()
 
     def _format_interrupted_text(self, final_text=None):
         text = (final_text or "").strip()
@@ -1127,6 +2203,7 @@ class BridgeRuntimeMixin:
         was_aborted = bool(self._abort_requested)
         if self._abort_requested:
             final_text = self._format_interrupted_text(final_text)
+        self._suppress_next_done_after_abort = False
         finished_row = self._stream_row
         if finished_row is not None:
             finished_row.update_content(final_text or "…", finished=True)
@@ -1137,9 +2214,13 @@ class BridgeRuntimeMixin:
         self._pending_stream_text = None
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self._last_task_complete_status_at = float(time.time())
         self._set_status("已完成。")
         self._refresh_composer_enabled()
         self._clear_active_turn_attachments()
+        anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+        if callable(anchor_clearer):
+            anchor_clearer()
         if not was_aborted:
             self._notify_reply_done(final_text)
 
@@ -1180,6 +2261,7 @@ class BridgeRuntimeMixin:
                 target["total_tokens"] = int(target.get("input_tokens", 0) or 0) + output_tokens
                 target["usage_source"] = str(target.get("usage_source") or "estimate")
             target["model"] = target.get("model") or self._current_llm_name()
+            self._finalize_usage_event_billing(target)
             usage["events"] = events
             usage["last_model"] = target.get("model") or ""
             self.current_session["token_usage"] = usage
@@ -1194,17 +2276,20 @@ class BridgeRuntimeMixin:
             if not self._is_remote_session(self.current_session):
                 self._request_backend_state(self.current_session.get("id"))
         self._refresh_token_label()
+        turn_auto_jump = self._turn_auto_jump_latest_enabled()
         follower = getattr(self, "_set_follow_latest_user", None)
         if callable(follower):
             follower(False)
-        sync_view = getattr(self, "_sync_current_turn_view", None)
-        if callable(sync_view):
-            sync_view(force=True)
+        if turn_auto_jump:
+            sync_view = getattr(self, "_sync_current_turn_view", None)
+            if callable(sync_view):
+                sync_view(force=True)
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
             refresher()
-        else:
+        elif turn_auto_jump:
             self._scroll_to_bottom()
+        self._set_turn_auto_jump_latest(False)
 
     def _abort(self):
         if not self._busy or self._abort_requested:
@@ -1222,14 +2307,23 @@ class BridgeRuntimeMixin:
         try:
             self._send_cmd({"cmd": "abort"})
         except Exception as e:
+            self._stream_done("", provider_usage=None)
+            self._set_status("中断失败，已恢复输入。")
             QMessageBox.warning(self, "中断失败", str(e))
 
     def _drain_events(self):
+        self._drain_events_rescheduled = False
+        started_at = time.perf_counter()
+        processed = 0
+        budget_seconds = 0.012
+        max_events = 160
+        more_pending = False
         while True:
             try:
                 ev = self._event_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             if isinstance(ev, str):
                 text = ev.strip()
                 if not text:
@@ -1243,6 +2337,21 @@ class BridgeRuntimeMixin:
             elif not isinstance(ev, dict):
                 ev = {"event": "bridge_text", "text": str(ev)}
             self._handle_event(ev)
+            if processed >= max_events or (time.perf_counter() - started_at) >= budget_seconds:
+                try:
+                    more_pending = not self._event_queue.empty()
+                except Exception:
+                    more_pending = True
+                break
+        if more_pending and (not bool(getattr(self, "_drain_events_rescheduled", False))):
+            self._drain_events_rescheduled = True
+            try:
+                QTimer.singleShot(0, self, self._drain_events)
+            except Exception:
+                try:
+                    QTimer.singleShot(0, self._drain_events)
+                except Exception:
+                    self._drain_events_rescheduled = False
         proc = self.bridge_proc
         if proc is not None and proc.poll() is not None and not self._bridge_ready and not self._busy:
             self._clear_active_turn_attachments()
@@ -1256,6 +2365,18 @@ class BridgeRuntimeMixin:
             return
         et = ev.get("event")
         if et == "bridge_text":
+            return
+        if et == "subagent_runtime_count":
+            target_key = str(ev.get("target_key") or "").strip()
+            if str(getattr(self, "_subagent_runtime_refresh_inflight_key", "") or "").strip() == target_key:
+                self._subagent_runtime_refresh_inflight_key = ""
+            applier = getattr(self, "_apply_subagent_runtime_count", None)
+            if callable(applier):
+                applier(
+                    ev.get("count"),
+                    target_key=target_key,
+                    scanned_at=ev.get("scanned_at"),
+                )
             return
         if et == "remote_done":
             target_sid = str(ev.get("session_id") or "").strip()
@@ -1278,6 +2399,9 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
+                context_window_chars=ev.get("context_window_chars"),
+                current_input_chars=ev.get("current_input_chars"),
             )
             return
         if et == "remote_turn_snapshot":
@@ -1286,19 +2410,45 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
                 process_pid=ev.get("process_pid"),
                 snapshot_ts=ev.get("snapshot_ts"),
+                context_window_chars=ev.get("context_window_chars"),
+                current_input_chars=ev.get("current_input_chars"),
             )
             return
         if et == "remote_error":
+            target_sid = str(ev.get("session_id") or "").strip()
+            current_sid = str((self.current_session or {}).get("id") or "").strip()
+            if target_sid and current_sid and target_sid != current_sid:
+                return
             msg = str(ev.get("msg") or "远程执行失败。").strip() or "远程执行失败。"
             self._clear_active_turn_attachments()
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
             self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
+            follower = getattr(self, "_set_follow_latest_user", None)
+            if callable(follower):
+                follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self._set_status(msg)
             self._refresh_composer_enabled()
+            self._refresh_token_label()
+            refresher = getattr(self, "_refresh_floating_chat_window", None)
+            if callable(refresher):
+                refresher()
             QMessageBox.warning(self, "远程聊天失败", msg)
             return
         if et == "launcher_autonomous_trigger":
@@ -1310,20 +2460,24 @@ class BridgeRuntimeMixin:
         if et == "ready":
             self._bridge_ready = True
             self.llms = ev.get("llms", [])
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
             self._sync_llm_combo()
+            self._sync_reasoning_effort_combo()
             self._set_status("桥接进程已就绪。")
             if self._pending_state_session:
                 data = _session_copy(self._pending_state_session)
                 self.current_session = data
                 self._render_session(data)
-                self._send_cmd(
-                    {
-                        "cmd": "set_state",
-                        "backend_history": data.get("backend_history") or [],
-                        "agent_history": data.get("agent_history") or [],
-                        "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
-                    }
-                )
+                payload = {
+                    "cmd": "set_state",
+                    "backend_history": data.get("backend_history") or [],
+                    "agent_history": data.get("agent_history") or [],
+                    "llm_idx": data.get("llm_idx", ((data.get("snapshot") or {}).get("llm_idx"))),
+                }
+                include_reasoning, reasoning_value = self._session_reasoning_effort_payload(data)
+                if include_reasoning:
+                    payload["reasoning_effort"] = reasoning_value
+                self._send_cmd(payload)
                 self._request_backend_state(data.get("id"))
                 self._pending_state_session = None
             self._refresh_composer_enabled()
@@ -1332,11 +2486,21 @@ class BridgeRuntimeMixin:
             self._stream_update(ev.get("text", ""))
             return
         if et == "done":
+            if bool(getattr(self, "_suppress_next_done_after_abort", False)) and not bool(getattr(self, "_busy", False)):
+                self._suppress_next_done_after_abort = False
+                return
+            if (not bool(getattr(self, "_busy", False))) and getattr(self, "_stream_row", None) is None:
+                return
             provider_usage = ev.get("usage") if isinstance(ev.get("usage"), dict) else None
             self._stream_done(ev.get("text", ""), provider_usage=provider_usage)
             return
         if et == "aborted":
-            self._set_status("已发送中断请求。")
+            if bool(getattr(self, "_busy", False)) and bool(getattr(self, "_abort_requested", False)):
+                self._stream_done("", provider_usage=None)
+                self._suppress_next_done_after_abort = True
+                self._set_status("已中断。")
+            else:
+                self._set_status("已发送中断请求。")
             return
         if et == "state":
             self._apply_state_to_session(
@@ -1344,6 +2508,9 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
+                context_window_chars=ev.get("context_window_chars"),
+                current_input_chars=ev.get("current_input_chars"),
             )
             return
         if et == "turn_snapshot":
@@ -1352,17 +2519,43 @@ class BridgeRuntimeMixin:
                 ev.get("backend_history") or [],
                 ev.get("agent_history") or [],
                 llm_idx=ev.get("llm_idx"),
+                reasoning_effort=ev.get("reasoning_effort"),
                 process_pid=ev.get("process_pid"),
                 snapshot_ts=ev.get("snapshot_ts"),
+                context_window_chars=ev.get("context_window_chars"),
+                current_input_chars=ev.get("current_input_chars"),
             )
             return
         if et == "llm_switched":
             self.llms = ev.get("llms", self.llms)
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
             self._sync_llm_combo()
+            self._sync_reasoning_effort_combo()
             if self.current_session:
                 self.current_session["llm_idx"] = int(self._current_llm_index() or 0)
                 self._persist_session(self.current_session)
             self._set_status("模型已切换。")
+            self._refresh_composer_enabled()
+            return
+        if et == "reasoning_effort_switched":
+            self._bridge_reasoning_effort = self._normalize_reasoning_effort_value(ev.get("reasoning_effort"))
+            if isinstance(self.current_session, dict):
+                explicit_override = bool("reasoning_effort" in self.current_session or self._session_snapshot_reasoning_effort_source(self.current_session) == "override")
+                if explicit_override and self._bridge_reasoning_effort:
+                    self.current_session["reasoning_effort"] = self._bridge_reasoning_effort
+                else:
+                    self.current_session.pop("reasoning_effort", None)
+                snapshot = dict(self.current_session.get("snapshot") or {})
+                if self._bridge_reasoning_effort:
+                    snapshot["reasoning_effort"] = self._bridge_reasoning_effort
+                    snapshot["reasoning_effort_source"] = "override" if explicit_override else "runtime"
+                else:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
+                self.current_session["snapshot"] = snapshot
+                self._persist_session(self.current_session)
+            self._sync_reasoning_effort_combo()
+            self._set_status("思考强度已切换。")
             self._refresh_composer_enabled()
             return
         if et == "tools_reinjected":
@@ -1375,14 +2568,31 @@ class BridgeRuntimeMixin:
             msg = ev.get("msg", "")
             trace = ev.get("trace", "")
             self._clear_active_turn_attachments()
+            discard_stream = getattr(self, "_discard_stream_row", None)
+            if callable(discard_stream):
+                discard_stream(self._stream_row)
+            else:
+                self._stream_row = None
             self._busy = False
+            self._abort_requested = False
+            self._current_stream_text = ""
+            self._pending_stream_text = None
+            self._active_token_event_ts = None
+            self._set_turn_auto_jump_latest(False)
             follower = getattr(self, "_set_follow_latest_user", None)
             if callable(follower):
                 follower(False)
+            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
+            if callable(anchor_clearer):
+                anchor_clearer()
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self._set_status(f"错误: {msg}")
             self._refresh_composer_enabled()
+            self._refresh_token_label()
+            refresher = getattr(self, "_refresh_floating_chat_window", None)
+            if callable(refresher):
+                refresher()
             if trace:
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Warning)

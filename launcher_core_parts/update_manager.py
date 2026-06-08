@@ -29,9 +29,11 @@ from .runtime import (
     launch_installed_updater,
     launcher_data_path,
     load_version_state,
+    normalize_proxy_url,
     resolved_versions_dir,
     save_version_state,
     updater_log,
+    urlopen_with_proxy,
     verify_authenticode_signature,
     verify_manifest_signature,
     verify_sha256,
@@ -60,6 +62,7 @@ ERR_PACKAGE_EXTRACT = "UPD-E-PACKAGE-EXTRACT"
 ERR_PACKAGE_CONTENT = "UPD-E-PACKAGE-CONTENT"
 ERR_INSTALL = "UPD-E-INSTALL"
 ERR_AUTHENTICODE = "UPD-E-AUTHENTICODE-INVALID"
+ERR_UPDATER_LAUNCH = "UPD-E-UPDATER-LAUNCH"
 ERR_BOOTSTRAP = "UPD-E-BOOTSTRAP"
 ERR_HEALTH_STARTUP_TIMEOUT = "UPD-E-HEALTH-STARTUP-TIMEOUT"
 ERR_HEALTH_ALIVE_TIMEOUT = "UPD-E-HEALTH-ALIVE-TIMEOUT"
@@ -193,8 +196,8 @@ def _call_with_retry(func, *, attempts=3, retry_if=None):
     raise final_err if final_err is not None else RuntimeError("retry failed without exception")
 
 
-def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, attempts_per_url=3):
-    last_errors = []
+def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, attempts_per_url=3, proxy_url=""):
+    last_errors: list[str] = []
     for url in _build_github_api_urls(path, custom_candidates=custom_candidates):
         req = urllib.request.Request(
             url,
@@ -206,7 +209,7 @@ def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, a
         )
 
         def _request():
-            with urllib.request.urlopen(req, timeout=max(4, int(timeout or 12))) as resp:
+            with urlopen_with_proxy(req, timeout=max(4, int(timeout or 12)), proxy_url=proxy_url) as resp:
                 return resp.read().decode("utf-8", errors="replace")
 
         try:
@@ -222,7 +225,7 @@ def _http_json_with_fallback(path: str, *, custom_candidates=None, timeout=12, a
     return None, "", last_errors
 
 
-def _fetch_text(url: str, *, timeout=20, attempts=3):
+def _fetch_text(url: str, *, timeout=20, attempts=3, proxy_url=""):
     req = urllib.request.Request(
         str(url or "").strip(),
         headers={"User-Agent": "GenericAgentLauncher-Updater", "Accept": "application/json, text/plain, */*"},
@@ -230,7 +233,7 @@ def _fetch_text(url: str, *, timeout=20, attempts=3):
     )
 
     def _request():
-        with urllib.request.urlopen(req, timeout=max(5, int(timeout or 20))) as resp:
+        with urlopen_with_proxy(req, timeout=max(5, int(timeout or 20)), proxy_url=proxy_url) as resp:
             return resp.read()
 
     return _call_with_retry(_request, attempts=max(1, int(attempts or 3)))
@@ -248,7 +251,7 @@ def _asset_by_name(release: dict, names):
 
 def _version_tuple(version_text: str):
     text = str(version_text or "").strip().lower().lstrip("v")
-    parts = []
+    parts: list[int | str] = []
     for chunk in re.split(r"[.+-]", text):
         if chunk.isdigit():
             parts.append(int(chunk))
@@ -261,7 +264,7 @@ def _is_newer_version(target: str, current: str):
     return _version_tuple(target) > _version_tuple(current)
 
 
-def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
+def _release_to_launcher_update_info(release: dict, *, public_key_pem: str, proxy_url: str = ""):
     if not isinstance(release, dict):
         raise UpdateError(ERR_RELEASE_FETCH, "GitHub release payload 无效", phase="query")
     manifest_asset = _asset_by_name(release, _MANIFEST_NAMES)
@@ -271,7 +274,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
     if not manifest_url:
         raise UpdateError(ERR_MANIFEST_INVALID, "manifest 资产缺少下载地址", phase="manifest")
     try:
-        manifest_bytes = _fetch_text(manifest_url, timeout=20, attempts=3)
+        manifest_bytes = _fetch_text(manifest_url, timeout=20, attempts=3, proxy_url=proxy_url)
         manifest = json.loads(manifest_bytes.decode("utf-8", errors="replace"))
     except Exception as e:
         raise UpdateError(ERR_MANIFEST_INVALID, "读取或解析 manifest 失败", phase="manifest", detail=str(e)) from e
@@ -285,7 +288,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
             raise UpdateError(ERR_MANIFEST_SIGNATURE, "release 缺少 manifest.sig", phase="manifest-signature")
         signature_url = str(signature_asset.get("browser_download_url") or "").strip()
         try:
-            signature_text = _fetch_text(signature_url, timeout=20, attempts=3).decode("utf-8", errors="replace").strip()
+            signature_text = _fetch_text(signature_url, timeout=20, attempts=3, proxy_url=proxy_url).decode("utf-8", errors="replace").strip()
         except Exception as e:
             raise UpdateError(ERR_MANIFEST_SIGNATURE, "下载 manifest.sig 失败", phase="manifest-signature", detail=str(e)) from e
     if not signature_text:
@@ -327,6 +330,7 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
     return {
         "target_version": target_version,
         "channel": channel,
+        "install_mode": "internal",
         "package_url": package_url,
         "package_sha256": package_sha256,
         "release_url": str(release.get("html_url") or "").strip(),
@@ -339,25 +343,28 @@ def _release_to_launcher_update_info(release: dict, *, public_key_pem: str):
     }
 
 
-def query_launcher_update(*, repo_url: str = "", current_version: str = "", public_key_pem: str = "", api_candidates=None):
+def query_launcher_update(*, repo_url: str = "", current_version: str = "", public_key_pem: str = "", api_candidates=None, proxy_url: str = ""):
     repo = str(repo_url or "").strip() or LAUNCHER_REPO_URL
     slug = _repo_slug_from_url(repo)
     if not slug:
         raise UpdateError(ERR_REPO_INVALID, "launcher_repo_url 不是合法 GitHub 仓库地址", phase="query")
+    normalized_proxy = normalize_proxy_url(proxy_url)
     payload, source, errors = _http_json_with_fallback(
         f"/repos/{slug}/releases/latest",
         custom_candidates=api_candidates,
         timeout=12,
         attempts_per_url=3,
+        proxy_url=normalized_proxy,
     )
     if not isinstance(payload, dict):
         detail = "; ".join(errors[-3:]) if errors else "no_response"
         raise UpdateError(ERR_RELEASE_FETCH, "拉取最新 Release 失败", phase="query", detail=detail)
-    info = _release_to_launcher_update_info(payload, public_key_pem=public_key_pem)
+    info = _release_to_launcher_update_info(payload, public_key_pem=public_key_pem, proxy_url=normalized_proxy)
     cur = str(current_version or "").strip() or current_launcher_version()
     info["current_version"] = cur
     info["is_update_available"] = _is_newer_version(info["target_version"], cur)
     info["api_source"] = source
+    info["proxy_url"] = normalized_proxy
     return info
 
 
@@ -388,6 +395,7 @@ def create_update_job(update_info: dict):
         "release_url": str(info.get("release_url") or "").strip(),
         "release_tag": str(info.get("release_tag") or "").strip(),
         "manifest_url": str(info.get("manifest_url") or "").strip(),
+        "proxy_url": normalize_proxy_url(info.get("proxy_url")),
         "status": "queued",
         "phase": "queued",
         "error_code": "",
@@ -407,7 +415,53 @@ def create_update_job(update_info: dict):
 
 
 def launch_update_job(job_path: str):
-    return launch_installed_updater(str(job_path or "").strip())
+    job_file = str(job_path or "").strip()
+    job = _read_json_file(job_file, {}) if job_file else {}
+    if not isinstance(job, dict):
+        job = {}
+    job_id = str(job.get("job_id") or os.path.splitext(os.path.basename(job_file))[0] if job_file else "").strip()
+    try:
+        # Fail before closing the UI if a previous updater left an active or
+        # uncertain lock behind. Confirmed-stale locks are cleaned here.
+        with _update_lock(timeout_seconds=3):
+            pass
+        launched = launch_installed_updater(job_file)
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="handoff",
+                phase="updater-launched",
+                error_code="",
+                error_detail="",
+                handoff_at=float(time.time()),
+            )
+        updater_log(f"[{job_id or 'unknown'}] updater handoff launched: {job_file}")
+        return launched
+    except UpdateError as e:
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="failed",
+                phase=e.phase,
+                error_code=e.code,
+                error_detail=_trim_detail(e.detail or str(e)),
+                completed_at=float(time.time()),
+            )
+        raise
+    except Exception as e:
+        if job_file and job:
+            _save_job_state(
+                job_file,
+                job,
+                status="failed",
+                phase="launch",
+                error_code=ERR_UPDATER_LAUNCH,
+                error_detail=_trim_detail(str(e)),
+                completed_at=float(time.time()),
+            )
+        raise
 
 
 def _save_job_state(job_file: str, job: dict, **patch):
@@ -419,20 +473,186 @@ def _save_job_state(job_file: str, job: dict, **patch):
     return payload
 
 
+_MALFORMED_UPDATE_LOCK_STALE_SECONDS = 2.0
+
+
+def _parse_update_lock_owner_pid(raw_text) -> int:
+    text = str(raw_text or "").strip()
+    if not text:
+        return 0
+    try:
+        return int(text)
+    except Exception:
+        pass
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    try:
+        return int(payload.get("pid") or 0)
+    except Exception:
+        return 0
+
+
+def _update_lock_owner_running(pid: int):
+    target = _int_or(pid, 0, minimum=0)
+    if target <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(target, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        kernel32 = getattr(ctypes, "windll", None)
+        kernel32 = getattr(kernel32, "kernel32", None)
+    if kernel32 is None:
+        return None
+    process_access = 0x1000 | 0x00100000
+    still_active = 259
+    error_access_denied = 5
+    error_invalid_parameter = 87
+    try:
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+    except Exception:
+        pass
+
+    def _last_error() -> int:
+        try:
+            err = int(ctypes.get_last_error() or 0)
+            if err:
+                return err
+        except Exception:
+            pass
+        try:
+            getter = getattr(kernel32, "GetLastError", None)
+            if getter is not None:
+                return int(getter() or 0)
+        except Exception:
+            pass
+        return 0
+
+    try:
+        ctypes.set_last_error(0)
+    except Exception:
+        pass
+    try:
+        handle = kernel32.OpenProcess(process_access, False, target)
+    except Exception:
+        return None
+    if not handle:
+        err = _last_error()
+        if err == error_access_denied:
+            return True
+        if err == error_invalid_parameter:
+            return False
+        return None
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None
+        return int(exit_code.value) == still_active
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _classify_update_lock(lock_path: str):
+    try:
+        stat = os.stat(lock_path)
+    except FileNotFoundError:
+        return "missing", ""
+    except OSError as e:
+        return "uncertain", f"stat failed: {e}"
+    try:
+        with open(lock_path, "r", encoding="utf-8", errors="ignore") as f:
+            raw_text = f.read(256)
+    except FileNotFoundError:
+        return "missing", ""
+    except OSError as e:
+        return "uncertain", f"read failed: {e}"
+    owner_pid = _parse_update_lock_owner_pid(raw_text)
+    if owner_pid > 0:
+        running = _update_lock_owner_running(owner_pid)
+        if running is True:
+            return "active", f"pid={owner_pid}"
+        if running is False:
+            return "stale", f"pid={owner_pid} not running"
+        return "uncertain", f"pid={owner_pid} status unknown"
+    age_seconds = max(0.0, float(time.time()) - float(getattr(stat, "st_mtime", 0.0) or 0.0))
+    if age_seconds >= _MALFORMED_UPDATE_LOCK_STALE_SECONDS:
+        text = str(raw_text or "").strip()
+        if not text:
+            return "stale", "empty lock payload"
+        preview = text.replace("\r", " ").replace("\n", " ")[:80]
+        return "stale", f"invalid lock payload: {preview}"
+    return "uncertain", "lock payload not ready"
+
+
 @contextmanager
 def _update_lock(timeout_seconds=30):
     lock_path = launcher_data_path("updates", "update.lock")
     started = time.time()
+    last_wait_detail = ""
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         except FileExistsError:
+            state, detail = _classify_update_lock(lock_path)
+            last_wait_detail = f"{state}: {detail}" if detail else str(state or "existing")
+            if state == "missing":
+                last_wait_detail = "missing: lock disappeared before retry"
+                continue
+            if state == "stale":
+                try:
+                    os.remove(lock_path)
+                except FileNotFoundError:
+                    last_wait_detail = "missing: stale lock disappeared before cleanup"
+                    continue
+                except OSError as e:
+                    last_wait_detail = _trim_detail(
+                        f"stale cleanup failed ({detail or 'unknown stale lock'}): {e}",
+                        limit=240,
+                    )
+                else:
+                    updater_log(f"[lock] removed stale update.lock: {detail}")
+                    continue
             if time.time() - started > max(3, int(timeout_seconds or 30)):
-                raise UpdateError(ERR_LOCK_TIMEOUT, "更新锁等待超时", phase="prepare")
+                raise UpdateError(
+                    ERR_LOCK_TIMEOUT,
+                    "更新锁等待超时",
+                    phase="prepare",
+                    detail=last_wait_detail or "lock state unknown",
+                )
             time.sleep(0.25)
             continue
         try:
             os.write(fd, f"{os.getpid()}".encode("utf-8"))
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
             yield lock_path
         finally:
             try:
@@ -538,9 +758,9 @@ def _rollback_to_previous(job_file: str, job: dict, *, previous_version: str, er
     }
 
 
-def _download_package_with_retry(package_url: str, package_file: str, *, attempts: int, timeout_seconds: int):
+def _download_package_with_retry(package_url: str, package_file: str, *, attempts: int, timeout_seconds: int, proxy_url: str = ""):
     def _do_download():
-        return download_to_file(package_url, package_file, timeout=timeout_seconds)
+        return download_to_file(package_url, package_file, timeout=timeout_seconds, proxy_url=proxy_url)
 
     try:
         return _call_with_retry(_do_download, attempts=max(1, int(attempts or 1)))
@@ -620,6 +840,7 @@ def apply_update_job(job_path: str):
                 package_file,
                 attempts=_int_or(job.get("download_attempts"), 3, minimum=1, maximum=8),
                 timeout_seconds=180,
+                proxy_url=str(job.get("proxy_url") or "").strip(),
             )
             try:
                 verify_sha256(package_file, package_sha256)

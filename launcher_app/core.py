@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import subprocess
 import sys
+import threading
 from urllib.parse import urlparse
 
 import qrcode
@@ -65,9 +66,42 @@ def _import_requests_with_repair():
         raise first_error
 
 
-requests = _import_requests_with_repair()
+_REQUESTS_MODULE = None
+_REQUESTS_LOCK = threading.Lock()
+
+
+def _load_requests_module():
+    global _REQUESTS_MODULE
+    if _REQUESTS_MODULE is not None:
+        return _REQUESTS_MODULE
+    with _REQUESTS_LOCK:
+        if _REQUESTS_MODULE is None:
+            _REQUESTS_MODULE = _import_requests_with_repair()
+    return _REQUESTS_MODULE
+
+
+class _LazyRequestsModule:
+    def __getattr__(self, name):
+        return getattr(_load_requests_module(), name)
+
+    def __dir__(self):
+        try:
+            return sorted(set(dir(type(self)) + dir(_load_requests_module())))
+        except Exception:
+            return sorted(set(dir(type(self))))
+
+    def __repr__(self):
+        target = _REQUESTS_MODULE
+        if target is None:
+            return "<lazy requests module>"
+        return repr(target)
+
+
+requests = _LazyRequestsModule()
 
 from launcher_core_parts import channels as _channels
+from launcher_core_parts import channel_capture as _channel_capture
+from launcher_core_parts import conductor_runtime as _conductor_runtime
 from launcher_core_parts import constants as _constants
 from launcher_core_parts import markup as _markup
 from launcher_core_parts import model_api as _model_api
@@ -87,6 +121,8 @@ _MODULES = (
     _model_api,
     _sessions,
     _channels,
+    _channel_capture,
+    _conductor_runtime,
     _upstream_dependencies,
     _markup,
 )

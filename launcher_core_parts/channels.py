@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ast as _ast
 import importlib.util as _il_util
+import json
 import os
 import re
+
+from . import conductor_runtime as _conductor_runtime
 
 KIND_LABEL = {
     "native_claude": "原生 Claude",
@@ -20,6 +23,8 @@ EXTRA_KEYS = {
     "langfuse_config",
     "tg_bot_token",
     "tg_allowed_users",
+    "discord_bot_token",
+    "discord_allowed_users",
     "qq_app_id",
     "qq_app_secret",
     "qq_allowed_users",
@@ -36,14 +41,14 @@ EXTRA_KEYS = {
 }
 
 
-COMM_CHANNEL_SPECS = [
+COMM_CHANNEL_SPECS: list[dict[str, object]] = [
     {
         "id": "wechat",
         "label": "微信",
         "subtitle": "个人微信扫码登录",
         "script": "wechatapp.py",
         "log_name": "wechatapp.log",
-        "pip": "pycryptodome qrcode requests charset-normalizer",
+        "pip": "pycryptodome qrcode requests charset-normalizer Pillow",
         "fields": [],
         "required": [],
         "notes": "无需在 mykey.py 填 Key。首次启动会弹二维码完成绑定。",
@@ -62,6 +67,50 @@ COMM_CHANNEL_SPECS = [
         ],
         "required": ["tg_bot_token", "tg_allowed_users"],
         "notes": "Telegram 前端要求填写允许访问的用户 ID，留空会直接退出。",
+        "conflicts_with": [],
+    },
+    {
+        "id": "discord",
+        "label": "Discord",
+        "subtitle": "Discord Bot",
+        "script": "dcapp.py",
+        "log_name": "dcapp.log",
+        "pip": "discord.py",
+        "fields": [
+            {"key": "discord_bot_token", "label": "Bot Token", "kind": "password", "placeholder": "Discord bot token"},
+            {"key": "discord_allowed_users", "label": "允许用户", "kind": "list_str", "placeholder": "user_id，逗号分隔；可填 *"},
+        ],
+        "required": ["discord_bot_token"],
+        "notes": "需要在 Discord Developer Portal 开启 Message Content Intent。",
+        "conflicts_with": [],
+    },
+    {
+        "id": "tui",
+        "label": "终端 TUI",
+        "subtitle": "TUI v3 / Textual v2 终端会话入口",
+        "script": "tui_v3.py",
+        "script_candidates": ["tui_v3.py", "tuiapp_v2.py", "tuiapp.py"],
+        "log_name": "tuiapp.log",
+        "pip": "prompt_toolkit rich Pillow textual",
+        "launch_mode": "terminal",
+        "fields": [],
+        "required": [],
+        "notes": "优先打开上游最新的 tui_v3.py；旧版仓库会自动回退到 tuiapp_v2.py / tuiapp.py。",
+        "conflicts_with": [],
+    },
+    {
+        "id": "conductor",
+        "label": "Conductor 总管台",
+        "subtitle": "本机子 Agent 编排网页控制台",
+        "script": "conductor.py",
+        "log_name": "conductor.log",
+        "pip": "fastapi uvicorn[standard] pydantic",
+        "launch_mode": "web",
+        "local_only": True,
+        "web_url": "http://127.0.0.1:8900/",
+        "fields": [],
+        "required": [],
+        "notes": "启动后会托管本地网页控制台，并由上游脚本自动尝试打开浏览器；当前仅支持启动器本机使用，不支持远端托管。",
         "conflicts_with": [],
     },
     {
@@ -131,8 +180,73 @@ COMM_CHANNEL_SPECS = [
     },
 ]
 
-COMM_CHANNEL_INDEX = {spec["id"]: spec for spec in COMM_CHANNEL_SPECS}
+COMM_CHANNEL_INDEX: dict[str, dict[str, object]] = {
+    str(spec.get("id") or ""): spec for spec in COMM_CHANNEL_SPECS
+}
 
+
+def _channel_spec_row(channel_or_spec):
+    if isinstance(channel_or_spec, dict):
+        return dict(channel_or_spec)
+    cid = str(channel_or_spec or "").strip()
+    if not cid:
+        return {}
+    row = COMM_CHANNEL_INDEX.get(cid)
+    if row:
+        return dict(row)
+    for spec in COMM_CHANNEL_SPECS:
+        if str((spec or {}).get("id") or "").strip() == cid:
+            return dict(spec)
+    return {}
+
+
+def channel_script_candidates(channel_or_spec):
+    spec = _channel_spec_row(channel_or_spec)
+    seen = set()
+    out = []
+    for raw in [spec.get("script"), *(spec.get("script_candidates") or [])]:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def resolve_channel_script(channel_or_spec, agent_dir="", *, existing_only=False):
+    candidates = channel_script_candidates(channel_or_spec)
+    if not candidates:
+        return ""
+    root = str(agent_dir or "").strip()
+    if root:
+        frontends_dir = os.path.join(root, "frontends")
+        for name in candidates:
+            if os.path.isfile(os.path.join(frontends_dir, name)):
+                return name
+    return "" if existing_only else candidates[0]
+
+
+def channel_script_rel(channel_or_spec, agent_dir="", *, existing_only=False):
+    name = resolve_channel_script(channel_or_spec, agent_dir=agent_dir, existing_only=existing_only)
+    return (("frontends/" + name).replace("\\", "/")) if name else ""
+
+
+def channel_script_rel_candidates(channel_or_spec):
+    return [(("frontends/" + name).replace("\\", "/")) for name in channel_script_candidates(channel_or_spec)]
+
+
+def channel_script_path(agent_dir, channel_or_spec, *, existing_only=False):
+    root = str(agent_dir or "").strip()
+    spec = COMM_CHANNEL_INDEX.get(channel_or_spec, {}) if isinstance(channel_or_spec, str) else dict(channel_or_spec or {})
+    if str(spec.get("id") or "").strip().lower() == "conductor":
+        return str((_conductor_runtime.ensure_launcher_conductor_runtime() or {}).get("script") or "").strip()
+    if not root:
+        return ""
+    name = resolve_channel_script(channel_or_spec, agent_dir=root, existing_only=existing_only)
+    return os.path.join(root, "frontends", name) if name else ""
 
 
 def _classify_config_kind(var_name):
@@ -225,6 +339,47 @@ def parse_mykey_py(path):
     return out
 
 
+def parse_mykey_json(path):
+    out = {"configs": [], "extras": {}, "passthrough": [], "error": None}
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            values = json.load(f)
+    except Exception as e:
+        out["error"] = f"JSON 解析失败: {e}"
+        return out
+    if not isinstance(values, dict):
+        out["error"] = "JSON 根节点必须是对象。"
+        return out
+    for name, value in values.items():
+        if name in EXTRA_KEYS:
+            out["extras"][name] = value
+        elif _is_config_var(name, value):
+            out["configs"].append({"var": name, "kind": _classify_config_kind(name), "data": dict(value)})
+        elif _is_passthrough_var(name, value):
+            out["passthrough"].append({"name": name, "value": value})
+    return out
+
+
+def parse_mykey_source(path):
+    suffix = os.path.splitext(str(path or "").strip())[1].lower()
+    if suffix == ".json":
+        return parse_mykey_json(path)
+    return parse_mykey_py(path)
+
+
+def resolve_mykey_source_path(agent_dir):
+    root = str(agent_dir or "").strip()
+    py_path = os.path.join(root, "mykey.py")
+    json_path = os.path.join(root, "mykey.json")
+    if os.path.isfile(py_path):
+        return py_path
+    if os.path.isfile(json_path):
+        return json_path
+    return py_path
+
+
 _FIELD_ORDER = [
     "name",
     "apikey",
@@ -285,26 +440,25 @@ def serialize_mykey_py(configs, extras, passthrough=None):
         "# ══════════════════════════════════════════════════════════════════════════════\n"
     )
 
-    groups = [
-        ("mixin", "# ── Mixin 故障转移 ───────────────────────────────────────────────"),
-        ("native_claude", "# ── NativeClaudeSession 渠道 ──────────────────────────────────────"),
-        ("native_oai", "# ── NativeOAISession 渠道 ─────────────────────────────────────────"),
-        ("claude", "# ── ClaudeSession 渠道 (deprecated) ───────────────────────────────"),
-        ("oai", "# ── LLMSession 渠道 (deprecated) ──────────────────────────────────"),
-        ("unknown", "# ── 其它 ─────────────────────────────────────────────────────────"),
-    ]
-    by_kind = {}
-    for c in configs:
-        by_kind.setdefault(c.get("kind", "unknown"), []).append(c)
+    group_titles = {
+        "mixin": "# ── Mixin 故障转移 ───────────────────────────────────────────────",
+        "native_claude": "# ── NativeClaudeSession 渠道 ──────────────────────────────────────",
+        "native_oai": "# ── NativeOAISession 渠道 ─────────────────────────────────────────",
+        "claude": "# ── ClaudeSession 渠道 (deprecated) ───────────────────────────────",
+        "oai": "# ── LLMSession 渠道 (deprecated) ──────────────────────────────────",
+        "unknown": "# ── 其它 ─────────────────────────────────────────────────────────",
+    }
 
     parts = [header]
-    for kind, title in groups:
-        items = by_kind.get(kind, [])
-        if not items:
-            continue
-        parts.append("\n" + title + "\n")
-        for c in items:
-            parts.append(f"{c['var']} = {_fmt_dict(c.get('data') or {})}\n")
+    last_kind = None
+    for c in configs:
+        kind = str(c.get("kind") or "unknown").strip() or "unknown"
+        if kind not in group_titles:
+            kind = "unknown"
+        if kind != last_kind:
+            parts.append("\n" + group_titles[kind] + "\n")
+            last_kind = kind
+        parts.append(f"{c['var']} = {_fmt_dict(c.get('data') or {})}\n")
 
     passthrough = list(passthrough or [])
     if passthrough:
@@ -322,6 +476,8 @@ def serialize_mykey_py(configs, extras, passthrough=None):
             "langfuse_config",
             "tg_bot_token",
             "tg_allowed_users",
+            "discord_bot_token",
+            "discord_allowed_users",
             "qq_app_id",
             "qq_app_secret",
             "qq_allowed_users",
@@ -341,6 +497,80 @@ def serialize_mykey_py(configs, extras, passthrough=None):
                 parts.append(f"{name} = {extras[name]!r}\n")
 
     return "".join(parts)
+
+
+def validate_api_config_references(configs):
+    rows = [dict(item) for item in (configs or []) if isinstance(item, dict)]
+    session_names = []
+    session_names_set = set()
+    for row in rows:
+        kind = str(row.get("kind") or "").strip()
+        if kind == "mixin":
+            continue
+        data = dict(row.get("data") or {})
+        name = str(data.get("name") or "").strip()
+        if not name or name in session_names_set:
+            continue
+        session_names.append(name)
+        session_names_set.add(name)
+
+    errors = []
+    for row in rows:
+        kind = str(row.get("kind") or "").strip()
+        if kind != "mixin":
+            continue
+        var_name = str(row.get("var") or "mixin_config").strip() or "mixin_config"
+        data = dict(row.get("data") or {})
+        llm_nos = data.get("llm_nos")
+        if not isinstance(llm_nos, (list, tuple)) or not llm_nos:
+            errors.append(f"{var_name}.llm_nos 不能为空。")
+            continue
+        for idx, target in enumerate(llm_nos):
+            if isinstance(target, int):
+                if 0 <= int(target) < len(session_names):
+                    continue
+                errors.append(
+                    f"{var_name}.llm_nos[{idx}]={target} 超出可用会话范围；当前可引用 {len(session_names)} 个非 mixin API 会话。"
+                )
+                continue
+            target_name = str(target or "").strip()
+            if not target_name:
+                errors.append(f"{var_name}.llm_nos[{idx}] 不能为空字符串。")
+                continue
+            if target_name not in session_names_set:
+                available = "、".join(session_names) if session_names else "（无）"
+                errors.append(
+                    f"{var_name}.llm_nos[{idx}]={target_name!r} 找不到同名 API 会话；当前可引用 name 为：{available}。"
+                )
+    return errors
+
+
+def validate_runnable_api_configs(configs):
+    rows = [dict(item) for item in (configs or []) if isinstance(item, dict)]
+    errors = [str(err or "").strip() for err in validate_api_config_references(rows) if str(err or "").strip()]
+    runnable_count = 0
+    incomplete = []
+    for row in rows:
+        kind = str(row.get("kind") or "").strip().lower()
+        if kind == "mixin":
+            continue
+        data = dict(row.get("data") or {})
+        ident = str(data.get("name") or row.get("var") or "未命名配置").strip() or "未命名配置"
+        missing = []
+        for key in ("apikey", "apibase"):
+            if not str(data.get(key) or "").strip():
+                missing.append(key)
+        if missing:
+            incomplete.append(f"{ident} 缺少 {' / '.join(missing)}")
+            continue
+        runnable_count += 1
+    if runnable_count > 0:
+        return errors
+    if incomplete:
+        errors.append("当前没有可直接运行的非 mixin API 会话：" + "；".join(incomplete))
+    else:
+        errors.append("当前没有可直接运行的非 mixin API 会话。请先填写至少一条模型配置。")
+    return errors
 
 
 def auto_config_var(kind, existing_vars):
@@ -381,7 +611,7 @@ def sync_config_var_kind(kind, current_var, existing_vars):
     return auto_config_var(kind, existing)
 
 
-CHANNEL_TEMPLATES = [
+CHANNEL_TEMPLATES: list[tuple[str, str, str, dict[str, object]]] = [
     ("anthropic", "Anthropic 官方", "native_claude", {"apibase": "https://api.anthropic.com", "model": "claude-opus-4-7[1m]"}),
     ("cc-switch", "CC Switch / 反代中转", "native_claude", {"apibase": "", "model": "claude-opus-4-7", "fake_cc_system_prompt": True}),
     ("crs-claude", "CRS 反代 Claude Max", "native_claude", {"apibase": "", "model": "claude-opus-4-7[1m]", "fake_cc_system_prompt": True, "max_tokens": 32768, "read_timeout": 180}),
@@ -391,6 +621,19 @@ CHANNEL_TEMPLATES = [
     ("oai-generic", "通用 OAI 原生", "native_oai", {"apibase": "", "model": "gpt-5.4"}),
     ("openai", "OpenAI 官方", "native_oai", {"apibase": "https://api.openai.com/v1", "model": "gpt-5.4"}),
     ("openrouter", "OpenRouter", "native_oai", {"apibase": "https://openrouter.ai/api/v1", "model": "anthropic/claude-opus-4-7"}),
+    (
+        "commonstack",
+        "CommonStack 统一网关",
+        "native_oai",
+        {
+            "apibase": "https://api.commonstack.ai/v1",
+            "model": "anthropic/claude-opus-4-7",
+            "api_mode": "chat_completions",
+            "max_retries": 3,
+            "connect_timeout": 10,
+            "read_timeout": 120,
+        },
+    ),
     ("minimax-oai", "MiniMax (OAI 路径)", "native_oai", {"apibase": "https://api.minimaxi.com/v1", "model": "MiniMax-M2.7", "context_win": 50000}),
     ("kimi", "Kimi / Moonshot", "native_oai", {"apibase": "https://api.moonshot.cn/v1", "model": "kimi-k2-turbo-preview"}),
     ("mixin", "Mixin 故障转移", "mixin", {"llm_nos": [], "max_retries": 10, "base_delay": 0.5}),
@@ -404,6 +647,7 @@ SIMPLE_FORMAT_LABEL = {
     "claude_native": "Claude 原生",
     "oai_chat": "Chat Completions",
     "oai_responses": "Responses",
+    "mixin": "Mixin 故障转移",
 }
 
 SIMPLE_FORMAT_RULES = {
@@ -418,7 +662,7 @@ SIMPLE_FORMAT_RULES = {
         "kind": "native_oai",
         "api_mode": "chat_completions",
         "default_template": "openai",
-        "templates": ["openai", "oai-generic", "openrouter", "minimax-oai", "kimi", "custom-oai"],
+        "templates": ["openai", "oai-generic", "openrouter", "commonstack", "minimax-oai", "kimi", "custom-oai"],
         "hint": "走 OpenAI Chat Completions 协议。",
     },
     "oai_responses": {
@@ -427,6 +671,13 @@ SIMPLE_FORMAT_RULES = {
         "default_template": "openai",
         "templates": ["openai", "oai-generic", "openrouter", "minimax-oai", "kimi", "custom-oai"],
         "hint": "走 OpenAI Responses 协议。",
+    },
+    "mixin": {
+        "kind": "mixin",
+        "api_mode": None,
+        "default_template": "mixin",
+        "templates": ["mixin"],
+        "hint": "按 llm_nos 顺序引用已有非 mixin API 卡片，启动时按顺序故障转移。",
     },
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import io
 import json
 import os
@@ -16,8 +17,9 @@ import ctypes
 from ctypes import byref, c_int
 from datetime import datetime
 
-from PySide6.QtCore import QByteArray, QEvent, QMetaObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, qInstallMessageHandler
-from PySide6.QtGui import QColor, QCursor, QIcon, QKeyEvent, QPainter, QPainterPath, QPixmap, QRegion, QTextCursor
+from PySide6.QtCore import QByteArray, QEvent, QLockFile, QMetaObject, QPoint, QRect, QRectF, QSize, Qt, QTimer, qInstallMessageHandler
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QIcon, QKeyEvent, QPainter, QPainterPath, QPixmap, QRegion, QTextCursor
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpacerItem,
     QSpinBox,
     QSizePolicy,
     QSplitter,
@@ -51,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from launcher_app import core as lz
+from launcher_app.app_icon import launcher_icon
 from launcher_app.theme import C, F, FLUENT_QSS, apply_fluent_shadow, apply_mica
 
 SCROLLBAR_STYLE = """
@@ -72,6 +76,7 @@ from qt_chat_parts.common import (
     _SVG_BOT,
     _SVG_CHEVRON_DOWN,
     _SVG_INFO,
+    _SVG_REFRESH,
     _SVG_SEND,
     _SVG_STOP,
     InputTextEdit,
@@ -82,6 +87,7 @@ from qt_chat_parts.common import (
     _session_copy,
     _session_source_label,
     _svg_icon,
+    build_message_row,
 )
 from qt_chat_parts.chat_view import ChatViewMixin
 from qt_chat_parts.channel_runtime import ChannelRuntimeMixin
@@ -110,7 +116,320 @@ def _qt_message_handler(mode, context, message):
     sys.stderr.write(text + "\n")
 
 
+def _rotated_svg_icon(cache_key: str, svg: str, *, color: str, size: int, angle: float) -> QIcon:
+    base_icon = _svg_icon(cache_key, svg, color=color, size=size)
+    base_pixmap = base_icon.pixmap(size, size)
+    if base_pixmap.isNull():
+        return base_icon
+    canvas = QPixmap(size, size)
+    canvas.fill(Qt.transparent)
+    painter = QPainter(canvas)
+    try:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.translate(size / 2.0, size / 2.0)
+        painter.rotate(float(angle or 0.0))
+        painter.translate(-size / 2.0, -size / 2.0)
+        painter.drawPixmap(0, 0, base_pixmap)
+    finally:
+        painter.end()
+    return QIcon(canvas)
+
+
 qInstallMessageHandler(_qt_message_handler)
+
+
+_LAUNCHER_INSTANCE_ACTIVATE_PAYLOAD = b"activate\n"
+_LAUNCHER_INSTANCE_ACK_PAYLOAD = b"ok\n"
+_LAUNCHER_INSTANCE_SIGNAL_WAIT_MS = 220
+_LAUNCHER_INSTANCE_RETRY_TIMEOUT_MS = 2400
+_LAUNCHER_INSTANCE_RETRY_POLL_MS = 80
+
+
+def _launcher_single_instance_server_name() -> str:
+    seed = os.path.normcase(os.path.normpath(str(getattr(lz, "DATA_ROOT", "") or "")))
+    if not seed:
+        seed = str(getattr(lz, "APP_NAME", "GenericAgentLauncher") or "GenericAgentLauncher")
+    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"ga-launcher-{digest}"
+
+
+def _launcher_single_instance_lock_path() -> str:
+    state_dir = str(getattr(lz, "STATE_DIR", "") or "").strip()
+    if not state_dir:
+        state_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "GenericAgentLauncher", "state")
+    return os.path.join(state_dir, "launcher-single-instance.lock")
+
+
+class _LauncherSingleInstanceGuard:
+    def __init__(self, app: QApplication):
+        self._app = app
+        self.server_name = _launcher_single_instance_server_name()
+        self.lock_path = _launcher_single_instance_lock_path()
+        self._lock = QLockFile(self.lock_path)
+        try:
+            self._lock.setStaleLockTime(0)
+        except Exception:
+            pass
+        self._lock_acquired = False
+        self._server = None
+        self._connections = set()
+        self._activation_handler = None
+        self._activation_pending = False
+        self._activation_dispatch_scheduled = False
+
+    def request_existing_activation(self, wait_ms: int = _LAUNCHER_INSTANCE_SIGNAL_WAIT_MS) -> bool:
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)
+            except Exception:
+                pass
+        socket = QLocalSocket(self._app)
+        try:
+            socket.connectToServer(self.server_name)
+            if not socket.waitForConnected(max(50, int(wait_ms or 0))):
+                return False
+            socket.write(_LAUNCHER_INSTANCE_ACTIVATE_PAYLOAD)
+            try:
+                socket.flush()
+            except Exception:
+                pass
+            try:
+                socket.waitForBytesWritten(max(50, int(wait_ms or 0)))
+            except Exception:
+                pass
+            try:
+                socket.waitForReadyRead(max(25, int(wait_ms or 0)))
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                socket.disconnectFromServer()
+            except Exception:
+                pass
+            try:
+                socket.deleteLater()
+            except Exception:
+                pass
+
+    def wait_for_existing_activation(
+        self,
+        timeout_ms: int = _LAUNCHER_INSTANCE_RETRY_TIMEOUT_MS,
+        *,
+        poll_ms: int = _LAUNCHER_INSTANCE_RETRY_POLL_MS,
+    ) -> bool:
+        deadline = time.monotonic() + (max(0, int(timeout_ms or 0)) / 1000.0)
+        while time.monotonic() < deadline:
+            if self.request_existing_activation(wait_ms=max(50, int(poll_ms or 0))):
+                return True
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            try:
+                self._app.processEvents()
+            except Exception:
+                pass
+            time.sleep(min(max(20, int(poll_ms or 0)), remaining_ms) / 1000.0)
+        return False
+
+    def try_claim_primary(self) -> bool:
+        state_dir = os.path.dirname(self.lock_path)
+        try:
+            if callable(getattr(lz, "_ensure_launcher_data_dirs", None)):
+                lz._ensure_launcher_data_dirs()
+        except Exception:
+            pass
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+        except Exception:
+            pass
+        if not self._lock.tryLock(0):
+            return False
+        self._lock_acquired = True
+        try:
+            self._start_server()
+        except Exception:
+            self.close()
+            raise
+        return True
+
+    def set_activation_handler(self, handler) -> None:
+        self._activation_handler = handler if callable(handler) else None
+        if self._activation_pending and self._activation_handler is not None:
+            self._dispatch_activation_request()
+
+    def close(self) -> None:
+        server = self._server
+        self._server = None
+        owns_endpoint = server is not None or self._lock_acquired
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+            try:
+                server.deleteLater()
+            except Exception:
+                pass
+        if owns_endpoint:
+            try:
+                QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+        if self._lock_acquired:
+            try:
+                self._lock.unlock()
+            except Exception:
+                pass
+            self._lock_acquired = False
+        self._connections.clear()
+        self._activation_pending = False
+        self._activation_dispatch_scheduled = False
+
+    def _start_server(self) -> None:
+        server = QLocalServer(self._app)
+        try:
+            server.newConnection.connect(self._handle_new_connections)
+        except Exception:
+            pass
+        for _attempt in range(2):
+            try:
+                if _attempt == 0:
+                    QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+            if server.listen(self.server_name):
+                self._server = server
+                return
+            try:
+                server.close()
+            except Exception:
+                pass
+            try:
+                QLocalServer.removeServer(self.server_name)
+            except Exception:
+                pass
+        detail = ""
+        try:
+            detail = str(server.errorString() or "").strip()
+        except Exception:
+            detail = ""
+        raise RuntimeError(detail or "无法建立启动器单实例通信通道。")
+
+    def _handle_new_connections(self) -> None:
+        server = self._server
+        if server is None:
+            return
+        while True:
+            try:
+                conn = server.nextPendingConnection()
+            except Exception:
+                conn = None
+            if conn is None:
+                break
+            self._connections.add(conn)
+            try:
+                conn.readyRead.connect(lambda c=conn: self._consume_connection(c))
+            except Exception:
+                pass
+            try:
+                conn.disconnected.connect(lambda c=conn: self._forget_connection(c))
+            except Exception:
+                pass
+            self._consume_connection(conn)
+
+    def _consume_connection(self, conn) -> None:
+        if conn is None:
+            return
+        try:
+            consumed = bool(conn.property("_ga_launcher_instance_consumed"))
+        except Exception:
+            consumed = bool(getattr(conn, "_ga_launcher_instance_consumed", False))
+        if consumed:
+            return
+        payload = b""
+        try:
+            payload = bytes(conn.readAll() or b"")
+        except Exception:
+            payload = b""
+        message = payload.decode("utf-8", errors="ignore").strip().lower()
+        if not message:
+            return
+        try:
+            conn.setProperty("_ga_launcher_instance_consumed", True)
+        except Exception:
+            try:
+                setattr(conn, "_ga_launcher_instance_consumed", True)
+            except Exception:
+                pass
+        if message.startswith("activate"):
+            self._queue_activation_request()
+        try:
+            conn.write(_LAUNCHER_INSTANCE_ACK_PAYLOAD)
+            try:
+                conn.flush()
+            except Exception:
+                pass
+            try:
+                conn.waitForBytesWritten(50)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            conn.disconnectFromServer()
+        except Exception:
+            pass
+
+    def _forget_connection(self, conn) -> None:
+        if conn is None:
+            return
+        self._connections.discard(conn)
+        try:
+            conn.deleteLater()
+        except Exception:
+            pass
+
+    def _queue_activation_request(self) -> None:
+        self._activation_pending = True
+        handler = self._activation_handler
+        if handler is None or self._activation_dispatch_scheduled:
+            return
+        self._activation_dispatch_scheduled = True
+        try:
+            QTimer.singleShot(0, self._dispatch_activation_request)
+        except Exception:
+            self._dispatch_activation_request()
+
+    def _dispatch_activation_request(self) -> None:
+        self._activation_dispatch_scheduled = False
+        if not self._activation_pending:
+            return
+        handler = self._activation_handler
+        if handler is None:
+            return
+        self._activation_pending = False
+        try:
+            handler()
+        except Exception:
+            pass
+
+
+def _ensure_single_launcher_instance(app: QApplication):
+    guard = _LauncherSingleInstanceGuard(app)
+    if guard.request_existing_activation():
+        guard.close()
+        return None
+    if guard.try_claim_primary():
+        return guard
+    if guard.wait_for_existing_activation():
+        guard.close()
+        return None
+    guard.close()
+    return None
 
 
 class FloatingOrbWindow(QWidget):
@@ -131,12 +450,16 @@ class FloatingOrbWindow(QWidget):
         self._expanded_size = QSize(480, 760)
         self._collapsed_size = QSize(56, 56)
         self._ignore_llm_change = False
+        self._ignore_reasoning_effort_change = False
         self._rendered_rows = []
+        self._stream_row = None
+        self._last_bubble_signature = None
         self._focus_latest_user_after_refresh = False
         self._orb_hover = False
         self._orb_pressed = False
 
         self.setWindowTitle("GenericAgent 悬浮对话")
+        self.setWindowIcon(host.windowIcon() if host is not None else launcher_icon())
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.resize(self._collapsed_size)
@@ -171,7 +494,7 @@ class FloatingOrbWindow(QWidget):
         self.restore_btn = QPushButton("完整界面")
         self.restore_btn.clicked.connect(self._restore_main_window)
         head_row.addWidget(self.restore_btn, 0)
-        self.tray_btn = QPushButton("仅托盘")
+        self.tray_btn = QPushButton("")
         self.tray_btn.clicked.connect(self._hide_to_tray_only)
         head_row.addWidget(self.tray_btn, 0)
         panel_layout.addWidget(self.panel_head)
@@ -217,7 +540,8 @@ class FloatingOrbWindow(QWidget):
         self.msg_layout = QVBoxLayout(self.msg_root)
         self.msg_layout.setContentsMargins(0, 12, 0, 12)
         self.msg_layout.setSpacing(4)
-        self.msg_layout.addStretch(1)
+        self.msg_layout.setAlignment(Qt.AlignTop)
+        self.msg_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed))
         self.scroll.setWidget(self.msg_root)
         panel_layout.addWidget(self.scroll, 1)
 
@@ -240,6 +564,11 @@ class FloatingOrbWindow(QWidget):
         self.llm_combo.setMaximumWidth(280)
         self.llm_combo.currentIndexChanged.connect(self._on_llm_changed)
         tool_row.addWidget(self.llm_combo, 0)
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.setMinimumWidth(126)
+        self.reasoning_effort_combo.setMaximumWidth(170)
+        self.reasoning_effort_combo.currentIndexChanged.connect(self._on_reasoning_effort_changed)
+        tool_row.addWidget(self.reasoning_effort_combo, 0)
         self.info_btn = QPushButton()
         self.info_btn.setObjectName("infoBtn")
         self.info_btn.setFixedSize(26, 26)
@@ -252,6 +581,9 @@ class FloatingOrbWindow(QWidget):
         self.input_box = InputTextEdit(self._handle_send, image_cb=host._handle_input_image_attachments)
         self.input_box.setMinimumHeight(30)
         self.input_box.setMaximumHeight(75)
+        setup_input = getattr(host, "_configure_chat_input_editor", None)
+        if callable(setup_input):
+            setup_input(self.input_box)
         composer_layout.addWidget(self.input_box)
         self.input_attachment_host = QFrame()
         self.input_attachment_host.setObjectName("cardInset")
@@ -308,6 +640,7 @@ class FloatingOrbWindow(QWidget):
         self.ball_badge.hide()
 
         self.collapse_panel()
+        self.refresh_action_texts()
 
     def _apply_native_window_style(self):
         if sys.platform != "win32":
@@ -337,6 +670,15 @@ class FloatingOrbWindow(QWidget):
         if callable(hide_only):
             hide_only()
 
+    def refresh_action_texts(self):
+        host = self._host
+        text_getter = getattr(host, "_floating_hide_action_text", None)
+        tooltip_getter = getattr(host, "_floating_hide_action_tooltip", None)
+        text = text_getter() if callable(text_getter) else "仅托盘"
+        tooltip = tooltip_getter() if callable(tooltip_getter) else ""
+        self.tray_btn.setText(str(text or "仅托盘"))
+        self.tray_btn.setToolTip(str(tooltip or ""))
+
     def _handle_send(self):
         sender = getattr(self._host, "_handle_floating_send", None)
         if callable(sender):
@@ -351,6 +693,13 @@ class FloatingOrbWindow(QWidget):
         if self._ignore_llm_change or index < 0:
             return
         syncer = getattr(self._host, "_on_floating_llm_changed", None)
+        if callable(syncer):
+            syncer(index)
+
+    def _on_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False) or index < 0:
+            return
+        syncer = getattr(self._host, "_on_floating_reasoning_effort_changed", None)
         if callable(syncer):
             syncer(index)
 
@@ -393,14 +742,53 @@ class FloatingOrbWindow(QWidget):
             opener(self.session_menu_btn)
 
     def _available_geometry(self):
-        app = QApplication.instance()
+        screen = self._best_screen_for_window()
+        return screen.availableGeometry() if screen is not None else self.geometry()
+
+    def _best_screen_for_window(self):
         screen = None
-        if app is not None:
-            screen = app.primaryScreen()
+        try:
+            screen = self.screen()
+        except Exception:
+            screen = None
+        if screen is not None:
+            return screen
+        host = getattr(self, "_host", None)
+        if host is not None:
+            try:
+                screen = host.screen()
+            except Exception:
+                screen = None
+            if screen is not None:
+                return screen
+        try:
+            screen = QGuiApplication.screenAt(QCursor.pos())
+        except Exception:
+            screen = None
+        if screen is not None:
+            return screen
+        app = QApplication.instance()
+        return app.primaryScreen() if app is not None else None
+
+    def _available_geometry_for_target(self, pos: QPoint | None = None, size: QSize | None = None):
+        screen = None
+        if isinstance(pos, QPoint):
+            probe = QPoint(int(pos.x()), int(pos.y()))
+            if isinstance(size, QSize):
+                probe = QPoint(
+                    int(pos.x() + max(1, int(size.width() or 0)) // 2),
+                    int(pos.y() + max(1, int(size.height() or 0)) // 2),
+                )
+            try:
+                screen = QGuiApplication.screenAt(probe)
+            except Exception:
+                screen = None
+        if screen is None:
+            screen = self._best_screen_for_window()
         return screen.availableGeometry() if screen is not None else self.geometry()
 
     def _clamp_pos(self, pos: QPoint, size: QSize) -> QPoint:
-        rect = self._available_geometry()
+        rect = self._available_geometry_for_target(pos, size)
         margin = 12
         x = min(max(rect.left() + margin, pos.x()), rect.right() - size.width() - margin + 1)
         y = min(max(rect.top() + margin, pos.y()), rect.bottom() - size.height() - margin + 1)
@@ -460,6 +848,9 @@ class FloatingOrbWindow(QWidget):
         self._apply_native_window_style()
         self.raise_()
         self.activateWindow()
+        editor = getattr(self, "input_box", None)
+        if editor is not None and (not bool(getattr(editor, "isReadOnly", lambda: False)())):
+            QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
         QTimer.singleShot(0, self._scroll_to_bottom)
         self.update()
 
@@ -543,9 +934,18 @@ class FloatingOrbWindow(QWidget):
         self.input_box.setStyleSheet(
             f"QTextEdit {{ background: transparent; border: none; color: {C['text']}; font-size: {body_fs}px; padding: 2px; }}"
         )
-        self.llm_combo.setStyleSheet(host._api_combo_style())
-        self.session_combo.setStyleSheet(host._api_combo_style())
+        combo_style = ""
+        combo_styler = getattr(host, "_api_combo_style", None)
+        if callable(combo_styler):
+            try:
+                combo_style = str(combo_styler() or "")
+            except Exception:
+                combo_style = ""
+        chat_common.refresh_theme_aware_popup_surfaces(self, combo_style=combo_style)
         self.info_btn.setIcon(_svg_icon("floating_info", _SVG_INFO, color=C["muted"], size=14))
+        self.abort_btn.setIcon(_svg_icon("floating_stop", _SVG_STOP, color=C["danger_text"], size=14))
+        self.send_btn.setIcon(_svg_icon("floating_send", _SVG_SEND, color="#ffffff", size=14))
+        self.ball_btn.setIcon(_svg_icon("floating_ball", _SVG_BOT, color="#ffffff", size=24))
         self.restore_btn.setStyleSheet(host._action_button_style())
         self.tray_btn.setStyleSheet(host._action_button_style(kind="subtle"))
         self.new_session_btn.setStyleSheet(host._action_button_style())
@@ -555,6 +955,7 @@ class FloatingOrbWindow(QWidget):
         self.send_btn.setStyleSheet(host._action_button_style(primary=True))
         self.session_menu_btn.setStyleSheet(host._action_button_style(kind="subtle"))
         self.msg_root.setStyleSheet(f"background: {chat_bg};")
+        chat_common.refresh_message_row_avatars(self)
         if self.panel.graphicsEffect() is not None:
             self.panel.setGraphicsEffect(None)
 
@@ -599,12 +1000,74 @@ class FloatingOrbWindow(QWidget):
         self.setMask(region)
 
     def _clear_rows(self):
+        self._stream_row = None
+        self._last_bubble_signature = None
         self._rendered_rows = []
         while self.msg_layout.count() > 1:
             item = self.msg_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self._sync_message_layout_alignment()
+
+    def _sync_message_layout_alignment(self):
+        layout = getattr(self, "msg_layout", None)
+        if layout is None:
+            return
+        rows = getattr(self, "_rendered_rows", None) or []
+        layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)
+
+    def _clear_stream_row(self):
+        row = getattr(self, "_stream_row", None)
+        if row is None:
+            return
+        try:
+            self._rendered_rows.remove(row)
+        except ValueError:
+            pass
+        idx = -1
+        try:
+            idx = self.msg_layout.indexOf(row)
+        except Exception:
+            idx = -1
+        if idx >= 0:
+            item = self.msg_layout.takeAt(idx)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        else:
+            try:
+                row.deleteLater()
+            except Exception:
+                pass
+        self._stream_row = None
+
+    def _sync_stream_row(self, stream_text: str, busy: bool):
+        if not busy:
+            self._clear_stream_row()
+            self._sync_message_layout_alignment()
+            return
+        text = str(stream_text or "")
+        row = getattr(self, "_stream_row", None)
+        try:
+            row_ok = row is not None and row.parent() is not None
+        except Exception:
+            row_ok = row is not None
+        if not row_ok:
+            row = build_message_row(
+                text,
+                "assistant",
+                self.msg_root,
+                avatar_cfg=getattr(self._host, "cfg", None),
+                row_cls=MessageRow,
+            )
+            row.update_content(text, finished=False)
+            self.msg_layout.insertWidget(self.msg_layout.count() - 1, row)
+            self._rendered_rows.append(row)
+            self._stream_row = row
+            self._sync_message_layout_alignment()
+            return
+        row.update_content(text, finished=False)
 
     def _scroll_to_bottom(self):
         bar = self.scroll.verticalScrollBar()
@@ -672,40 +1135,91 @@ class FloatingOrbWindow(QWidget):
         self._handle_send()
 
     def _render_rows(self, bubbles, stream_text: str):
+        bubble_signature = tuple((str(item.get("role") or ""), str(item.get("text") or "")) for item in (bubbles or []))
+        busy = bool(getattr(self._host, "_busy", False))
+        session = getattr(self._host, "current_session", None) or {}
+        session_id = str(session.get("id") or "").strip()
+        session_changed = session_id != str(getattr(self, "_last_session_id", "") or "").strip()
+        had_signature = self._last_signature is not None
         signature = (
-            tuple((str(item.get("role") or ""), str(item.get("text") or "")) for item in (bubbles or [])),
+            session_id,
+            bubble_signature,
             str(stream_text or ""),
-            bool(getattr(self._host, "_busy", False)),
+            busy,
         )
         if signature == self._last_signature:
+            return
+        host_follow_latest = bool(getattr(self._host, "_follow_latest_user_message", False))
+        turn_auto_jump_getter = getattr(self._host, "_turn_auto_jump_latest_enabled", None)
+        if callable(turn_auto_jump_getter):
+            try:
+                host_turn_auto_jump = bool(turn_auto_jump_getter())
+            except Exception:
+                host_turn_auto_jump = False
+        else:
+            host_turn_auto_jump = bool(getattr(self._host, "_busy", False)) and chat_common.chat_auto_jump_latest_enabled(
+                getattr(self._host, "cfg", None)
+            )
+        keep_latest_user = self._focus_latest_user_after_refresh or host_follow_latest
+        if bubble_signature == self._last_bubble_signature:
+            self._last_signature = signature
+            self._last_session_id = session_id
+            self._sync_stream_row(str(stream_text or ""), busy)
+            if keep_latest_user:
+                self._focus_latest_user_after_refresh = False
+                if host_follow_latest:
+                    follower = getattr(self._host, "_set_follow_latest_user", None)
+                    if callable(follower):
+                        follower(False)
+                QTimer.singleShot(0, self._scroll_to_latest_dialogue)
+            elif host_turn_auto_jump:
+                QTimer.singleShot(0, self._scroll_to_bottom)
             return
         self._last_signature = signature
         self._clear_rows()
         rows = list(bubbles or [])
-        if not rows and not stream_text and not getattr(self._host, "_busy", False):
+        if not rows and not stream_text and not busy:
             empty = QLabel("点击悬浮球即可快速发送消息，当前会话内容会在这里同步显示。")
             empty.setWordWrap(True)
             empty.setAlignment(Qt.AlignCenter)
             empty.setObjectName("mutedText")
             empty.setStyleSheet(f"color: {C['muted']}; padding: 24px 18px;")
             self.msg_layout.insertWidget(0, empty)
+            self._last_bubble_signature = bubble_signature
+            self._sync_message_layout_alignment()
             return
         insert_index = self.msg_layout.count() - 1
         for bubble in rows:
             role = str(bubble.get("role") or "assistant").strip().lower()
             on_resend = self._regenerate_from_row if role == "assistant" else None
-            row = MessageRow(str(bubble.get("text") or ""), role, self.msg_root, on_resend=on_resend)
+            row = build_message_row(
+                str(bubble.get("text") or ""),
+                role,
+                self.msg_root,
+                on_resend=on_resend,
+                avatar_cfg=getattr(self._host, "cfg", None),
+                row_cls=MessageRow,
+            )
             row.set_finished(True)
             self.msg_layout.insertWidget(insert_index, row)
             self._rendered_rows.append(row)
+            self._sync_message_layout_alignment()
             insert_index += 1
-        if getattr(self._host, "_busy", False):
-            row = MessageRow(str(stream_text or ""), "assistant", self.msg_root)
+        if busy:
+            row = build_message_row(
+                str(stream_text or ""),
+                "assistant",
+                self.msg_root,
+                avatar_cfg=getattr(self._host, "cfg", None),
+                row_cls=MessageRow,
+            )
             row.update_content(str(stream_text or ""), finished=False)
             self.msg_layout.insertWidget(insert_index, row)
             self._rendered_rows.append(row)
-        host_follow_latest = bool(getattr(self._host, "_follow_latest_user_message", False))
-        keep_latest_user = self._focus_latest_user_after_refresh or host_follow_latest
+            self._stream_row = row
+            self._sync_message_layout_alignment()
+        self._last_bubble_signature = bubble_signature
+        self._last_session_id = session_id
         if keep_latest_user:
             self._focus_latest_user_after_refresh = False
             if host_follow_latest:
@@ -713,7 +1227,7 @@ class FloatingOrbWindow(QWidget):
                 if callable(follower):
                     follower(False)
             QTimer.singleShot(0, self._scroll_to_latest_dialogue)
-        else:
+        elif host_turn_auto_jump or session_changed or not had_signature:
             QTimer.singleShot(0, self._scroll_to_bottom)
 
     def sync_view(self, *, title, subtitle, bubbles, stream_text, status, meta, can_send, can_abort, read_only):
@@ -758,6 +1272,19 @@ class FloatingOrbWindow(QWidget):
         self.llm_combo.setEnabled(bool(enabled) and bool(llms))
         self._ignore_llm_change = False
 
+    def sync_reasoning_effort_items(self, rows, *, enabled: bool, current_index: int):
+        self._ignore_reasoning_effort_change = True
+        self.reasoning_effort_combo.clear()
+        for idx, row in enumerate(rows or []):
+            self.reasoning_effort_combo.addItem(str(row.get("label") or ""), row.get("value"))
+        if self.reasoning_effort_combo.count() == 0:
+            self.reasoning_effort_combo.addItem("跟随配置", "")
+            enabled = False
+        target = current_index if 0 <= int(current_index or -1) < self.reasoning_effort_combo.count() else 0
+        self.reasoning_effort_combo.setCurrentIndex(target)
+        self.reasoning_effort_combo.setEnabled(bool(enabled))
+        self._ignore_reasoning_effort_change = False
+
     def sync_session_items(self, rows, *, current_session_id: str, enabled: bool):
         self.session_combo.blockSignals(True)
         self.session_combo.clear()
@@ -798,12 +1325,7 @@ class FloatingOrbWindow(QWidget):
                 return True
             if et == QEvent.MouseButtonRelease and self._drag_active and event.button() == Qt.LeftButton:
                 self._drag_active = False
-                self._snap_to_edge()
-                saver = getattr(self._host, "_save_floating_orb_position", None)
-                if callable(saver):
-                    saver(self.pos())
-                if watched is self.ball_btn and not self._drag_moved:
-                    self.toggle_panel()
+                self._complete_orb_drag_release(toggle_on_click=(watched is self.ball_btn))
                 return True
         return super().eventFilter(watched, event)
 
@@ -860,21 +1382,27 @@ class FloatingOrbWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if not self._expanded and self._drag_active and event.button() == Qt.LeftButton:
             self._drag_active = False
-            was_click = not self._drag_moved
-            self._orb_pressed = False
-            self._snap_to_edge()
-            saver = getattr(self._host, "_save_floating_orb_position", None)
-            if callable(saver):
-                saver(self.pos())
-            self.update()
-            if was_click:
-                self.toggle_panel()
+            self._complete_orb_drag_release(toggle_on_click=True, refresh_orb=True)
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
+
+    def _complete_orb_drag_release(self, *, toggle_on_click: bool = False, refresh_orb: bool = False):
+        was_click = not self._drag_moved
+        self._orb_pressed = False
+        if self._drag_moved:
+            self._snap_to_edge()
+            saver = getattr(self._host, "_save_floating_orb_position", None)
+            if callable(saver):
+                saver(self.pos())
+        if refresh_orb:
+            self.update()
+        if toggle_on_click and was_click:
+            self.toggle_panel()
+        return was_click
 
     def _snap_to_edge(self):
         rect = self._available_geometry()
@@ -908,6 +1436,7 @@ class FloatingChatWindow(QWidget):
         self._host = host
         self._last_transcript = None
         self.setWindowTitle("GenericAgent 悬浮对话")
+        self.setWindowIcon(host.windowIcon() if host is not None else launcher_icon())
         self.resize(440, 680)
         self.setMinimumSize(360, 460)
 
@@ -934,7 +1463,7 @@ class FloatingChatWindow(QWidget):
         self.restore_btn = QPushButton("完整界面")
         self.restore_btn.clicked.connect(self._restore_main_window)
         head_row.addWidget(self.restore_btn, 0)
-        self.hide_btn = QPushButton("仅托盘")
+        self.hide_btn = QPushButton("")
         self.hide_btn.clicked.connect(self._hide_to_tray_only)
         head_row.addWidget(self.hide_btn, 0)
         root.addWidget(head)
@@ -957,6 +1486,9 @@ class FloatingChatWindow(QWidget):
         self.input_box = InputTextEdit(self._handle_send)
         self.input_box.setMinimumHeight(82)
         self.input_box.setMaximumHeight(180)
+        setup_input = getattr(host, "_configure_chat_input_editor", None)
+        if callable(setup_input):
+            setup_input(self.input_box)
         composer_layout.addWidget(self.input_box)
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
@@ -973,6 +1505,7 @@ class FloatingChatWindow(QWidget):
         action_row.addWidget(self.send_btn, 0)
         composer_layout.addLayout(action_row)
         root.addWidget(composer)
+        self.refresh_action_texts()
 
     def _restore_main_window(self):
         restore = getattr(self._host, "_restore_from_tray_mode", None)
@@ -983,6 +1516,15 @@ class FloatingChatWindow(QWidget):
         hide_only = getattr(self._host, "_hide_floating_chat_window", None)
         if callable(hide_only):
             hide_only()
+
+    def refresh_action_texts(self):
+        host = self._host
+        text_getter = getattr(host, "_floating_hide_action_text", None)
+        tooltip_getter = getattr(host, "_floating_hide_action_tooltip", None)
+        text = text_getter() if callable(text_getter) else "仅托盘"
+        tooltip = tooltip_getter() if callable(tooltip_getter) else ""
+        self.hide_btn.setText(str(text or "仅托盘"))
+        self.hide_btn.setToolTip(str(tooltip or ""))
 
     def _handle_send(self):
         sender = getattr(self._host, "_handle_floating_send", None)
@@ -1065,12 +1607,12 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain_events)
         self._drain_timer.start(40)
-        self._channel_snapshot_timer = QTimer(self)
-        self._channel_snapshot_timer.timeout.connect(self._sync_all_channel_process_sessions)
-        self._channel_snapshot_timer.start(2000)
+        self._drain_events_rescheduled = False
         self._server_status_timer = QTimer(self)
         self._server_status_timer.timeout.connect(self._request_server_connection_probe)
-        self._server_status_timer.start(15000)
+        self._subagent_status_timer = QTimer(self)
+        self._subagent_status_timer.timeout.connect(self._tick_subagent_status)
+        self._subagent_status_timer.start(250)
 
         self._stream_flush_timer = QTimer(self)
         self._stream_flush_timer.setSingleShot(True)
@@ -1087,16 +1629,27 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._bridge_ready = False
         self._ignore_session_select = False
         self._ignore_llm_change = False
+        self._ignore_reasoning_effort_change = False
+        self._bridge_reasoning_effort = ""
+        self._pending_reasoning_effort_override = None
         self._user_scrolled_up = False
         self._follow_latest_user_message = False
+        self._current_turn_user_row = None
+        self._reply_done_popups = []
         self._state_request_seq = 0
         self._active_token_event_ts = None
+        self._subagent_runtime_count = 0
+        self._subagent_runtime_scan_ts = 0.0
+        self._subagent_spinner_phase = 0
+        self._subagent_runtime_bound_key = ""
+        self._subagent_runtime_refresh_inflight_key = ""
         self._current_stream_text = ""
         self._pending_stream_text = None
         self._stream_row = None
         self._rendered_message_rows = []
         self._pending_input_attachments_data = []
         self._active_turn_attachments_data = []
+        self._transient_chat_feedback = []
         self.pages = None
         self._welcome_page = None
         self._locate_page = None
@@ -1130,8 +1683,10 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._tray_mode_active = False
         self._tray_mode_hint_shown = False
         self._tray_restore_to_fullscreen = False
+        self._tray_restore_to_maximized = False
         self._force_exit_requested = False
         self._closing_in_progress = False
+        self._runtime_context_generation = 0
         self._scheduler_proc = None
         self._scheduler_log_handle = None
         self._scheduler_last_exit_code = None
@@ -1149,11 +1704,17 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._shutdown_cleanup_started = False
         self._app_quit_requested = False
 
+        app_icon = launcher_icon()
+        self.setWindowIcon(app_icon)
         self.setWindowTitle("GenericAgent 启动器")
         self.resize(1440, 920)
         self.setMinimumSize(1100, 700)
         app = QApplication.instance()
         if app is not None:
+            try:
+                app.setWindowIcon(app_icon)
+            except Exception:
+                pass
             try:
                 app.installEventFilter(self)
             except Exception:
@@ -1172,6 +1733,12 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 startup_channel_starter()
             except Exception:
                 pass
+        startup_scheduler_starter = getattr(self, "_start_autostart_scheduler", None)
+        if callable(startup_scheduler_starter):
+            try:
+                startup_scheduler_starter()
+            except Exception:
+                pass
         startup_lan_starter = getattr(self, "_schedule_lan_interface_autostart", None)
         if callable(startup_lan_starter):
             try:
@@ -1184,16 +1751,12 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 startup_update_checker()
             except Exception:
                 pass
-        QTimer.singleShot(1800, self, self._startup_server_connection_probe)
-
-    def _startup_server_connection_probe(self):
-        if bool(getattr(self, "_closing_in_progress", False)):
-            return
-        try:
-            self._request_server_connection_probe(force=True)
-        except Exception:
-            pass
-
+        startup_install_hinter = getattr(self, "_schedule_startup_install_hint", None)
+        if callable(startup_install_hinter):
+            try:
+                startup_install_hinter()
+            except Exception:
+                pass
     def _begin_window_trace(self, context: str, *, duration_ms: int = 2600, suppress_blank_dialogs: bool = False):
         duration = max(200, int(duration_ms or 2600))
         self._window_trace_context = str(context or "").strip()
@@ -1265,7 +1828,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._start_shutdown_cleanup()
 
     def _stop_background_activity_for_shutdown(self):
-        for attr in ("_drain_timer", "_channel_snapshot_timer", "_server_status_timer", "_stream_flush_timer"):
+        for attr in ("_drain_timer", "_channel_snapshot_timer", "_server_status_timer", "_subagent_status_timer", "_stream_flush_timer"):
             timer = getattr(self, attr, None)
             if timer is None:
                 continue
@@ -1275,12 +1838,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 pass
         self._server_status_probe_running = False
         self._server_status_probe_pending = False
-        self._qt_api_remote_loading = False
-        self._qt_channel_remote_loading = False
-        self._settings_personal_remote_sync_running = False
-        self._settings_usage_remote_sync_running = False
-        self._remote_channel_sync_running = False
-        self._remote_launcher_sync_running = False
+        chat_common.invalidate_runtime_bound_state(self, clear_remote_sync_queues=True)
         disconnect_terminal = getattr(self, "_disconnect_vps_terminal", None)
         if callable(disconnect_terminal):
             try:
@@ -1536,18 +2094,20 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self.server_status_btn.clicked.connect(self._on_server_status_clicked)
         head_layout.addWidget(self.server_status_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         self._refresh_server_status_indicator()
-        self.theme_btn = QPushButton("☀")
+        self.theme_btn = QPushButton()
         self.theme_btn.setCursor(Qt.PointingHandCursor)
         self.theme_btn.setFixedSize(36, 32)
         self.theme_btn.setStyleSheet(self._sidebar_button_style())
         self.theme_btn.clicked.connect(self._toggle_appearance_mode)
         head_layout.addWidget(self.theme_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         self._refresh_theme_button()
-        self.gear_btn = QPushButton("⚙")
+        self.gear_btn = QPushButton()
         self.gear_btn.setCursor(Qt.PointingHandCursor)
         self.gear_btn.setFixedSize(36, 32)
         self.gear_btn.setStyleSheet(self._sidebar_button_style())
         self.gear_btn.clicked.connect(self._open_functions_menu)
+        self.gear_btn.setToolTip("更多操作")
+        chat_common.set_button_svg_icon(self.gear_btn, "launcher_menu", chat_common._SVG_SETTINGS, color="text_soft", size=16)
         head_layout.addWidget(self.gear_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
         self.mode_label.hide()
 
@@ -1571,7 +2131,8 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self.msg_layout = QVBoxLayout(self.msg_root)
         self.msg_layout.setContentsMargins(0, 12, 0, 12)
         self.msg_layout.setSpacing(4)
-        self.msg_layout.addStretch(1)
+        self.msg_layout.setAlignment(Qt.AlignTop)
+        self.msg_layout.addSpacerItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Fixed))
         self.scroll.setWidget(self.msg_root)
         main_layout.addWidget(self.scroll, 1)
 
@@ -1624,6 +2185,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         )
         self.input_box.setMinimumHeight(44)
         self.input_box.setMaximumHeight(110)
+        self._configure_chat_input_editor(self.input_box)
         composer_layout.addWidget(self.input_box)
 
         self.input_attachment_host = QFrame()
@@ -1653,6 +2215,11 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self.llm_combo.setMaximumWidth(320)
         self.llm_combo.currentIndexChanged.connect(self._on_llm_changed)
         tool_row.addWidget(self.llm_combo)
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.setMinimumWidth(126)
+        self.reasoning_effort_combo.setMaximumWidth(170)
+        self.reasoning_effort_combo.currentIndexChanged.connect(self._on_reasoning_effort_changed)
+        tool_row.addWidget(self.reasoning_effort_combo)
         tool_row.addStretch(1)
 
         self.info_btn = QPushButton()
@@ -1667,15 +2234,16 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 
         self._info_popup = QLabel(self, Qt.ToolTip | Qt.FramelessWindowHint)
         self._info_popup.setObjectName("infoPopup")
-        self._info_popup.setStyleSheet(
-            f"QLabel#infoPopup {{ background: {C['panel']}; color: {C['text']};"
-            f" border: 1px solid {C['border']}; padding: 8px 10px;"
-            f" border-radius: 6px; font-size: 12px; }}"
-        )
         self._info_popup.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self._info_popup.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._info_popup.setWordWrap(True)
         self._info_popup.hide()
+        styler = getattr(self, "_refresh_info_popup_style", None)
+        if callable(styler):
+            try:
+                styler()
+            except Exception:
+                pass
 
         self.stop_btn = QPushButton("  中断")
         self.stop_btn.setObjectName("stopBtn")
@@ -1703,6 +2271,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 
         self.token_label = self.session_token_tree_label
         self._refresh_info_tooltip()
+        self._refresh_subagent_runtime_state()
         footer_layout.addWidget(composer)
         main_layout.addWidget(footer)
 
@@ -1728,8 +2297,105 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             live=bool(live and summary.get("live_output_tokens", 0)),
         )
 
+    def _refresh_info_button_icon(self):
+        btn = getattr(self, "info_btn", None)
+        if btn is None:
+            return
+        active_count = int(getattr(self, "_subagent_runtime_count", 0) or 0)
+        if active_count > 0:
+            angle = (int(getattr(self, "_subagent_spinner_phase", 0) or 0) % 8) * 45.0
+            icon = _rotated_svg_icon(
+                "info_btn_spinner_base",
+                _SVG_REFRESH,
+                color=C["accent"],
+                size=14,
+                angle=angle,
+            )
+        else:
+            icon = _svg_icon("info_btn", _SVG_INFO, color=C["muted"], size=14)
+        btn.setIcon(icon)
+        btn.setIconSize(QSize(14, 14))
+
+    def _tick_subagent_status(self):
+        now = float(time.time())
+        current_key = ""
+        target_getter = getattr(self, "_subagent_runtime_target_key", None)
+        if callable(target_getter):
+            try:
+                current_key = str(target_getter() or "").strip()
+            except Exception:
+                current_key = ""
+        if current_key and current_key != str(getattr(self, "_subagent_runtime_bound_key", "") or "").strip():
+            self._refresh_subagent_runtime_state()
+        active_count = int(getattr(self, "_subagent_runtime_count", 0) or 0)
+        interval = 0.8 if active_count > 0 else 2.5
+        last_scan = float(getattr(self, "_subagent_runtime_scan_ts", 0.0) or 0.0)
+        if (now - last_scan) >= interval:
+            self._refresh_subagent_runtime_state()
+            active_count = int(getattr(self, "_subagent_runtime_count", 0) or 0)
+        if active_count > 0:
+            self._subagent_spinner_phase = (int(getattr(self, "_subagent_spinner_phase", 0) or 0) + 1) % 8
+            self._refresh_info_button_icon()
+        elif int(getattr(self, "_subagent_spinner_phase", 0) or 0) != 0:
+            self._subagent_spinner_phase = 0
+            self._refresh_info_button_icon()
+
+    def _close_reply_done_popups(self):
+        popups = list(getattr(self, "_reply_done_popups", None) or [])
+        self._reply_done_popups = []
+        for box in popups:
+            if box is None:
+                continue
+            try:
+                box.hide()
+            except Exception:
+                pass
+            try:
+                box.close()
+            except Exception:
+                pass
+            try:
+                box.deleteLater()
+            except Exception:
+                pass
+
+    def _show_reply_done_popup(self, text: str, *, title: str = "GenericAgent 启动器"):
+        message = str(text or "").strip()
+        if not message or bool(getattr(self, "_closing_in_progress", False)):
+            return None
+        self._close_reply_done_popups()
+        box = QMessageBox(QMessageBox.Information, str(title or "GenericAgent 启动器"), message, QMessageBox.Ok, None)
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.setWindowModality(Qt.NonModal)
+        icon = self.windowIcon()
+        if icon is not None and (not icon.isNull()):
+            try:
+                box.setWindowIcon(icon)
+            except Exception:
+                pass
+        self._reply_done_popups.append(box)
+
+        def _drop_popup(*_args):
+            current = getattr(self, "_reply_done_popups", None)
+            if not isinstance(current, list):
+                return
+            try:
+                current.remove(box)
+            except ValueError:
+                pass
+
+        try:
+            box.destroyed.connect(_drop_popup)
+        except Exception:
+            pass
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        return box
+
     def _ensure_launcher_tray_icon(self):
         tray = self._launcher_tray_icon or getattr(self, "_reply_notify_tray", None)
+        created = False
         if tray is None:
             if not QSystemTrayIcon.isSystemTrayAvailable():
                 return None
@@ -1741,10 +2407,18 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             if icon is None or icon.isNull():
                 icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
             tray = QSystemTrayIcon(icon, self)
-            tray.setToolTip("GenericAgent 启动器")
-            tray.activated.connect(self._on_launcher_tray_activated)
+            created = True
+        tray.setToolTip("GenericAgent 启动器")
+        signal_owner = getattr(self, "_launcher_tray_signal_owner", None)
+        if signal_owner is not tray:
+            try:
+                tray.activated.connect(self._on_launcher_tray_activated)
+            except Exception:
+                pass
+            self._launcher_tray_signal_owner = tray
         if self._launcher_tray_menu is None:
             menu = QMenu(self)
+            chat_common.apply_menu_popup_theme(menu)
             restore_action = menu.addAction("恢复完整界面")
             restore_action.triggered.connect(self._restore_from_tray_mode)
             show_floating_action = menu.addAction("显示悬浮窗")
@@ -1761,13 +2435,20 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             self._tray_hide_floating_action = hide_floating_action
             self._tray_exit_action = exit_action
         tray.show()
+        if created:
+            marker = getattr(self, "_set_tray_message_ready", None)
+            if callable(marker):
+                try:
+                    marker(tray, False)
+                except Exception:
+                    pass
         self._launcher_tray_icon = tray
         self._reply_notify_tray = tray
         self._refresh_launcher_tray_menu()
         return tray
 
     def _refresh_launcher_tray_menu(self):
-        visible = bool(getattr(self._floating_chat_window, "isVisible", lambda: False)())
+        visible = self._floating_window_visible()
         hidden_main = not self.isVisible()
         if self._tray_restore_main_action is not None:
             self._tray_restore_main_action.setVisible(hidden_main or self._tray_mode_active)
@@ -1782,11 +2463,83 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             win = FloatingOrbWindow(self)
             self._floating_chat_window = win
             win.apply_theme()
+            refresher = getattr(win, "refresh_action_texts", None)
+            if callable(refresher):
+                refresher()
             self._refresh_input_attachment_bar()
             self._sync_floating_llm_combo()
             self._sync_floating_session_list()
             self._sync_draft_to_floating()
         return win
+
+    def _system_tray_available(self) -> bool:
+        try:
+            return bool(QSystemTrayIcon.isSystemTrayAvailable())
+        except Exception:
+            return False
+
+    def _floating_window_visible(self) -> bool:
+        return bool(getattr(self._floating_chat_window, "isVisible", lambda: False)())
+
+    def _floating_hide_action_text(self) -> str:
+        if (not self.isVisible()) and self._system_tray_available():
+            return "仅托盘"
+        return "隐藏悬浮窗"
+
+    def _floating_hide_action_tooltip(self) -> str:
+        if self.isVisible():
+            return "隐藏当前悬浮窗，主窗口会继续保留。"
+        if self._system_tray_available():
+            return "隐藏完整界面，仅保留托盘或悬浮窗入口。"
+        if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            return "当前系统没有托盘图标；这里会只隐藏悬浮窗，主窗口会继续保留。"
+        return "隐藏当前悬浮窗。"
+
+    def _floating_default_status_text(self) -> str:
+        if self.isVisible():
+            return "主窗口仍在显示，可继续使用悬浮窗对话。"
+        if bool(getattr(self, "_tray_mode_active", False)):
+            return "已隐藏主窗口，悬浮窗可继续对话。"
+        return "悬浮窗可继续对话。"
+
+    def _functions_menu_floating_action_text(self) -> str:
+        if self._system_tray_available():
+            return "缩小到托盘，仅保留悬浮窗"
+        visible = self._floating_window_visible()
+        if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+            return "聚焦悬浮窗，主窗口继续保留" if visible else "打开悬浮窗，主窗口继续保留"
+        return "聚焦悬浮窗" if visible else "打开悬浮窗"
+
+    def _focus_visible_floating_chat_window(self, *, update_status: bool = True) -> bool:
+        win = getattr(self, "_floating_chat_window", None)
+        if win is None or (not self._floating_window_visible()):
+            return False
+        try:
+            win.raise_()
+        except Exception:
+            pass
+        try:
+            win.activateWindow()
+        except Exception:
+            pass
+        self._focus_floating_input_if_possible()
+        self._refresh_launcher_tray_menu()
+        if update_status:
+            self._set_status("已聚焦悬浮窗。")
+        return True
+
+    def _handle_functions_menu_floating_action(self) -> None:
+        if self._system_tray_available():
+            self._enter_tray_floating_mode()
+            return
+        focuser = getattr(self, "_focus_visible_floating_chat_window", None)
+        if callable(focuser):
+            try:
+                if focuser():
+                    return
+            except Exception:
+                pass
+        self._show_floating_chat_window()
 
     def _save_floating_orb_position(self, pos: QPoint):
         if not isinstance(pos, QPoint):
@@ -1824,6 +2577,32 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             current_index=current_idx,
         )
 
+    def _sync_floating_reasoning_effort_combo(self):
+        floating = getattr(self, "_floating_chat_window", None)
+        if floating is None or not hasattr(floating, "sync_reasoning_effort_items"):
+            return
+        disabled = self._is_channel_process_session()
+        current_value = self._current_reasoning_effort_selection()
+        rows = [
+            {"value": "", "label": "跟随配置"},
+            {"value": "none", "label": "none"},
+            {"value": "minimal", "label": "minimal"},
+            {"value": "low", "label": "low"},
+            {"value": "medium", "label": "medium"},
+            {"value": "high", "label": "high"},
+            {"value": "xhigh", "label": "xhigh"},
+        ]
+        current_idx = 0
+        for idx, row in enumerate(rows):
+            if str(row.get("value") or "") == str(current_value or ""):
+                current_idx = idx
+                break
+        floating.sync_reasoning_effort_items(
+            rows,
+            enabled=((not disabled) and bool(self.llms) and (not self._busy)),
+            current_index=current_idx,
+        )
+
     def _on_floating_llm_changed(self, index: int):
         if getattr(self, "_ignore_llm_change", False):
             return
@@ -1836,7 +2615,19 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             self._ignore_llm_change = False
         self._on_llm_changed(index)
 
-    def _sync_draft_to_floating(self):
+    def _on_floating_reasoning_effort_changed(self, index: int):
+        if getattr(self, "_ignore_reasoning_effort_change", False):
+            return
+        if index < 0 or getattr(self, "reasoning_effort_combo", None) is None:
+            return
+        self._ignore_reasoning_effort_change = True
+        try:
+            self.reasoning_effort_combo.setCurrentIndex(index)
+        finally:
+            self._ignore_reasoning_effort_change = False
+        self._on_reasoning_effort_changed(index)
+
+    def _sync_draft_to_floating(self, *, force=False):
         floating = getattr(self, "_floating_chat_window", None)
         if floating is None:
             return
@@ -1846,6 +2637,10 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             return
         main_text = str(source.toPlainText() or "")
         floating_text = str(target.toPlainText() or "")
+        if force:
+            if floating_text != main_text:
+                target.setPlainText(main_text)
+            return
         if main_text and not floating_text:
             target.setPlainText(main_text)
 
@@ -1859,8 +2654,21 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             return
         floating_text = str(source.toPlainText() or "")
         main_text = str(target.toPlainText() or "")
-        if floating_text and floating_text != main_text:
+        if floating_text != main_text:
             target.setPlainText(floating_text)
+
+    def _configure_chat_input_editor(self, editor):
+        if editor is None:
+            return
+        if bool(getattr(editor, "_launcher_slash_ready", False)):
+            return
+        try:
+            editor._launcher_slash_ready = True
+        except Exception:
+            pass
+        setter = getattr(editor, "set_slash_command_provider", None)
+        if callable(setter):
+            setter(self._local_slash_command_suggestions)
 
     def _floating_recent_session_rows(self):
         if not lz.is_valid_agent_dir(self.agent_dir):
@@ -1925,6 +2733,19 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             enabled=(not self._busy),
         )
 
+    def _focus_floating_input_if_possible(self):
+        floating = getattr(self, "_floating_chat_window", None)
+        if floating is None or (not bool(getattr(floating, "_expanded", False))):
+            return
+        editor = getattr(floating, "input_box", None)
+        if editor is None:
+            return
+        if bool(getattr(editor, "isReadOnly", lambda: False)()):
+            return
+        if self._is_channel_process_session():
+            return
+        QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
+
     def _on_floating_session_changed(self, index: int):
         if self._busy:
             QMessageBox.information(self, "忙碌中", "当前还在生成，请先等待结束或手动中断。")
@@ -1943,13 +2764,16 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._last_session_list_signature = None
         self._refresh_sessions()
         self._refresh_floating_chat_window()
+        self._focus_floating_input_if_possible()
 
     def _new_session_from_floating(self):
         self._new_session()
         self._refresh_floating_chat_window()
+        self._focus_floating_input_if_possible()
 
     def _open_floating_session_menu(self, anchor):
         menu = QMenu(self)
+        chat_common.apply_menu_popup_theme(menu)
         current = self.current_session or {}
         current_sid = str(current.get("id") or "").strip()
         pinned = bool(current.get("pinned", False))
@@ -2041,8 +2865,17 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 
     def _floating_chat_transcript(self):
         session = self.current_session or {}
-        bubbles = list(session.get("bubbles") or [])
+        bubbles = self._display_session_bubbles(session)
         if not bubbles and not self._busy:
+            feedback = self._transient_chat_feedback_rows(session if session else None)
+            if feedback:
+                rows = []
+                for bubble in feedback:
+                    role = str(bubble.get("role") or "assistant").strip().lower()
+                    label = "我" if role == "user" else "启动器"
+                    text = str(bubble.get("text") or "").strip() or "…"
+                    rows.append(f"{label}\n{text}")
+                return "\n\n".join(rows)
             if self._is_channel_process_session(session):
                 return "当前是渠道进程快照，会话只读。"
             return "当前还没有消息。\n\n直接在这里输入内容，发送后会自动创建新会话。"
@@ -2061,15 +2894,27 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         win = getattr(self, "_floating_chat_window", None)
         if win is None:
             return
+        refresher = getattr(win, "refresh_action_texts", None)
+        if callable(refresher):
+            refresher()
+        visible_getter = getattr(win, "isVisible", None)
+        visible = True if not callable(visible_getter) else bool(visible_getter())
+        if not visible:
+            self._refresh_launcher_tray_menu()
+            return
         disabled = self._is_channel_process_session()
         status = str(getattr(self, "status_label", None).text() if getattr(self, "status_label", None) is not None else "").strip()
         if not status:
-            status = "已隐藏主窗口，悬浮窗可继续对话。"
+            status = self._floating_default_status_text()
         can_send = (not disabled) and (not self._busy)
         can_abort = (not disabled) and self._busy and (not self._abort_requested)
         if isinstance(win, FloatingOrbWindow):
             session = self.current_session or {}
-            bubbles = list(session.get("bubbles") or [])
+            bubbles_getter = getattr(self, "_display_session_bubbles", None)
+            if callable(bubbles_getter):
+                bubbles = bubbles_getter(session)
+            else:
+                bubbles = list(session.get("bubbles") or [])
             stream_text = str(self._pending_stream_text or self._current_stream_text or "")
             win.sync_view(
                 title=self._floating_chat_title(),
@@ -2083,8 +2928,9 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 read_only=disabled,
             )
             self._sync_floating_llm_combo()
-            self._sync_floating_session_list()
-            self._sync_draft_to_floating()
+            if not self._busy:
+                self._sync_floating_session_list()
+                self._sync_draft_to_floating()
         else:
             win.sync_view(
                 title=self._floating_chat_title(),
@@ -2101,50 +2947,80 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
     def _show_floating_chat_window(self):
         tray = self._ensure_launcher_tray_icon()
         if tray is None:
+            if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+                self._ensure_floating_default_session()
+                win = self._ensure_floating_chat_window()
+                self._sync_draft_to_floating(force=True)
+                self._tray_mode_active = False
+                self._refresh_floating_chat_window()
+                win.show()
+                win.raise_()
+                win.activateWindow()
+                self._focus_floating_input_if_possible()
+                self._refresh_launcher_tray_menu()
+                self._set_status("当前系统未提供托盘图标，已直接打开悬浮窗。")
+                return
             QMessageBox.warning(self, "无法缩小到托盘", "当前系统不支持托盘图标。")
             return
         self._ensure_floating_default_session()
         win = self._ensure_floating_chat_window()
-        self._tray_mode_active = True
+        self._sync_draft_to_floating(force=True)
+        self._tray_mode_active = not self.isVisible()
         self._refresh_floating_chat_window()
         win.show()
         win.raise_()
         win.activateWindow()
+        self._focus_floating_input_if_possible()
         tray.show()
         self._refresh_launcher_tray_menu()
 
     def _show_floating_chat_window_only(self):
         self._tray_restore_to_fullscreen = bool(self.isFullScreen())
+        self._tray_restore_to_maximized = (not self._tray_restore_to_fullscreen) and bool(self.isMaximized())
         self._show_floating_chat_window()
         self.hide()
         self._tray_mode_active = True
-        self._refresh_launcher_tray_menu()
+        self._refresh_floating_chat_window()
 
     def _enter_tray_floating_mode(self):
         tray = self._ensure_launcher_tray_icon()
         if tray is None:
+            if bool(getattr(lz, "IS_MACOS", sys.platform == "darwin")):
+                self._show_floating_chat_window()
+                QMessageBox.information(
+                    self,
+                    "托盘不可用",
+                    "当前系统未提供托盘图标，已改为直接打开悬浮窗，主窗口会继续保留。",
+                )
+                return
             QMessageBox.warning(self, "无法缩小到托盘", "当前系统不支持托盘图标。")
             return
         self._show_floating_chat_window_only()
         if not self._tray_mode_hint_shown:
-            try:
-                tray.showMessage("GenericAgent 启动器", "主窗口已缩小到托盘，继续使用右下角悬浮对话窗即可。", QSystemTrayIcon.Information, 1500)
-            except Exception:
-                pass
+            notifier = getattr(self, "_show_tray_message", None)
+            if callable(notifier):
+                notifier(tray, "GenericAgent 启动器", "主窗口已隐藏，可继续使用悬浮对话窗。", timeout_ms=1500)
+            else:
+                try:
+                    tray.showMessage("GenericAgent 启动器", "主窗口已隐藏，可继续使用悬浮对话窗。", QSystemTrayIcon.Information, 1500)
+                except Exception:
+                    pass
             self._tray_mode_hint_shown = True
 
     def _hide_floating_chat_window(self):
         win = getattr(self, "_floating_chat_window", None)
         if win is not None:
             win.hide()
-        self._tray_mode_active = True
+        self._tray_mode_active = not self.isVisible()
         self._refresh_launcher_tray_menu()
 
     def _restore_from_tray_mode(self):
         if (not self._tray_mode_active) and self.isVisible():
             return
         restore_fullscreen = bool(self._tray_restore_to_fullscreen)
+        restore_maximized = bool(getattr(self, "_tray_restore_to_maximized", False))
         self._tray_restore_to_fullscreen = False
+        self._tray_restore_to_maximized = False
         self._tray_mode_active = False
         self._sync_draft_from_floating()
         win = getattr(self, "_floating_chat_window", None)
@@ -2152,6 +3028,8 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
             win.hide()
         if restore_fullscreen:
             self.showFullScreen()
+        elif restore_maximized:
+            self.showMaximized()
         else:
             self.showNormal()
         self.raise_()
@@ -2159,6 +3037,52 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._show_chat_page()
         self._refresh_floating_chat_window()
         self._refresh_launcher_tray_menu()
+        editor = getattr(self, "input_box", None)
+        if editor is not None and (not self._is_channel_process_session()):
+            QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
+
+    def _activate_from_secondary_launch(self):
+        if bool(getattr(self, "_tray_mode_active", False)) or (not self.isVisible()):
+            restorer = getattr(self, "_restore_from_tray_mode", None)
+            if callable(restorer):
+                restorer()
+            return
+        try:
+            state = self.windowState()
+            if state & Qt.WindowMinimized:
+                self.setWindowState((state & ~Qt.WindowMinimized) | Qt.WindowActive)
+        except Exception:
+            try:
+                self.showNormal()
+            except Exception:
+                pass
+        try:
+            self.show()
+        except Exception:
+            pass
+        try:
+            self.raise_()
+        except Exception:
+            pass
+        try:
+            self.activateWindow()
+        except Exception:
+            pass
+        try:
+            self._show_chat_page()
+        except Exception:
+            pass
+        if os.name == "nt":
+            try:
+                hwnd = int(self.winId())
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        editor = getattr(self, "input_box", None)
+        if editor is not None and (not self._is_channel_process_session()):
+            QTimer.singleShot(0, lambda e=editor: e.setFocus(Qt.OtherFocusReason))
 
     def _handle_floating_send(self):
         win = getattr(self, "_floating_chat_window", None)
@@ -2175,29 +3099,42 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             if self.isVisible() and not self._tray_mode_active:
                 self._show_floating_chat_window_only()
-            elif getattr(self._floating_chat_window, "isVisible", lambda: False)():
+            elif self._floating_window_visible():
                 self._restore_from_tray_mode()
             else:
                 self._show_floating_chat_window()
 
     def _close_tray_helpers(self):
+        self._close_reply_done_popups()
         win = getattr(self, "_floating_chat_window", None)
         if win is not None:
             win.hide()
             win.deleteLater()
             self._floating_chat_window = None
         tray = getattr(self, "_launcher_tray_icon", None)
-        if tray is not None:
+        reply_tray = getattr(self, "_reply_notify_tray", None)
+        seen = set()
+        for candidate in (tray, reply_tray):
+            if candidate is None:
+                continue
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
             try:
-                tray.hide()
+                candidate.hide()
             except Exception:
                 pass
         self._launcher_tray_icon = None
+        self._reply_notify_tray = None
         self._launcher_tray_menu = None
         self._tray_restore_main_action = None
         self._tray_show_floating_action = None
         self._tray_hide_floating_action = None
         self._tray_exit_action = None
+        self._launcher_tray_signal_owner = None
+        self._tray_restore_to_fullscreen = False
+        self._tray_restore_to_maximized = False
 
     def _quit_from_tray(self):
         if bool(getattr(self, "_closing_in_progress", False)):
@@ -2229,24 +3166,63 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
 def main(agent_dir: str | None = None) -> int:
     from launcher_app import theme as qt_theme
 
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GenericAgentLauncher")
+        except Exception:
+            pass
     target = agent_dir if agent_dir is not None else (sys.argv[1] if len(sys.argv) > 1 else None)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("GenericAgent Launcher")
+    setter = getattr(app, "setApplicationDisplayName", None)
+    if callable(setter):
+        try:
+            setter("GenericAgent Launcher")
+        except Exception:
+            pass
+    try:
+        app.setOrganizationName("GenericAgent")
+    except Exception:
+        pass
+    try:
+        app.setWindowIcon(launcher_icon())
+    except Exception:
+        pass
+    try:
+        instance_guard = _ensure_single_launcher_instance(app)
+    except Exception as e:
+        QMessageBox.critical(None, "启动失败", str(e))
+        return 1
+    if instance_guard is None:
+        return 0
     loaded_cfg = lz.load_config()
     cfg = loaded_cfg if isinstance(loaded_cfg, dict) else {}
     mode = "light" if str(cfg.get("appearance_mode", "light") or "").strip().lower() == "light" else "dark"
     qt_theme.set_theme(mode)
     qt_theme.configure_visual_preferences(cfg)
     chat_common.set_md_css(chat_common._build_md_css())
+    qt_theme.apply_tooltip_palette(app)
     app.setStyleSheet(qt_theme.build_qss())
     try:
         win = QtChatWindow(target)
     except Exception as e:
+        instance_guard.close()
         QMessageBox.critical(None, "启动失败", str(e))
         return 1
+    instance_guard.set_activation_handler(getattr(win, "_activate_from_secondary_launch", None))
     win.show()
     apply_mica(win, dark=(mode == "dark"))
-    return app.exec()
+    smoke_exit_ms = str(os.environ.get("GA_LAUNCHER_SMOKE_EXIT_MS") or "").strip()
+    if smoke_exit_ms:
+        try:
+            delay_ms = max(0, int(smoke_exit_ms))
+        except Exception:
+            delay_ms = 0
+        QTimer.singleShot(delay_ms, app.quit)
+    try:
+        return app.exec()
+    finally:
+        instance_guard.close()
 
 
 if __name__ == "__main__":

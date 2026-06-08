@@ -6,8 +6,10 @@ __pycache__/
 build/
 dist/
 temp/
-release/
+release/*
+!release/VERSION
 update_public_key.pem
+local_keys/
 temp_patch_extract/
 tools/InnoSetup/
 tmp_*.png
@@ -18,3 +20,18 @@ launcher_config.json
 .idea/
 .vscode/
 .claude/
+.agents/
+.codex/
+.trellis/
+AGENTS.md
+
+# Project-local AI/Trellis runtime state and private task memory
+.trellis/.developer
+.trellis/.current-task
+.trellis/.runtime/
+.trellis/workspace/
+.trellis/tasks/
+
+# Local packaging probes / generated installer mirrors
+installer/release/
+tmp_icon_probe/

@@ -22,6 +22,11 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest().lower()
 
 
+def _write_text_lf(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
 def _bool_from_any(value, default=False):
     if isinstance(value, bool):
         return value
@@ -159,7 +164,7 @@ def main() -> int:
         "commit": str(args.commit or "").strip(),
         "build_time": datetime.now(timezone.utc).isoformat(),
     }
-    with open(os.path.join(app_version_root, "version.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(app_version_root, "version.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(version_meta, f, ensure_ascii=False, indent=2)
 
     package_name = f"GenericAgentLauncher-app-{version}.zip"
@@ -196,20 +201,20 @@ def main() -> int:
         raise SystemExit("update signing key is missing (set GA_LAUNCHER_UPDATE_PRIVATE_KEY_PEM or *_FILE)")
 
     if signature.strip():
-        with open(manifest_sig_path, "w", encoding="utf-8") as f:
-            f.write(signature.strip())
+        _write_text_lf(manifest_sig_path, signature.strip())
     else:
         _remove_file_if_exists(manifest_sig_path)
 
     if public_key_pem:
-        with open(os.path.join(install_root, "update_public_key.pem"), "w", encoding="utf-8") as f:
-            f.write(public_key_pem.strip() + "\n")
+        _write_text_lf(os.path.join(install_root, "update_public_key.pem"), public_key_pem.strip() + "\n")
 
-    with open(os.path.join(update_root, "sha256sums.txt"), "w", encoding="utf-8") as f:
-        f.write(f"{package_sha256}  {package_name}\n")
-        f.write(f"{_sha256_file(manifest_path)}  manifest.json\n")
-        if os.path.isfile(manifest_sig_path):
-            f.write(f"{_sha256_file(manifest_sig_path)}  manifest.sig\n")
+    sha256_lines = [
+        f"{package_sha256}  {package_name}",
+        f"{_sha256_file(manifest_path)}  manifest.json",
+    ]
+    if os.path.isfile(manifest_sig_path):
+        sha256_lines.append(f"{_sha256_file(manifest_sig_path)}  manifest.sig")
+    _write_text_lf(os.path.join(update_root, "sha256sums.txt"), "\n".join(sha256_lines) + "\n")
 
     print(f"Release bundle ready: {release_root}")
     print(f"- install: {install_root}")

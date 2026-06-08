@@ -1,28 +1,126 @@
 from __future__ import annotations
 
+import os
+import re
+import shlex
+import threading
 import time
 
 from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QMessageBox
 
 from launcher_app import core as lz
+from launcher_app.theme import C, F
+from .common import (
+    process_cmdline_matches_agent_script,
+    remote_device_agent_dir,
+    remote_device_agent_mode,
+    remote_device_container_name,
+)
 
 
 class SessionShellMixin:
-    def _bind_session_to_current_bridge(self, session):
+    def _refresh_info_popup_style(self):
+        popup = getattr(self, "_info_popup", None)
+        if popup is None:
+            return
+        radius = max(6, int(F.get("radius_sm", 8) or 8))
+        popup.setStyleSheet(
+            f"QLabel#infoPopup {{ background: {C['panel']}; color: {C['text']};"
+            f" border: 1px solid {C['border']}; padding: 8px 10px;"
+            f" border-radius: {radius}px; font-size: 12px; }}"
+        )
+        refresher = getattr(self, "_refresh_info_tooltip", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception:
+                pass
+
+    def _apply_composer_widget_state(self, widget, enabled, *, enabled_tooltip="", disabled_tooltip=""):
+        if widget is None:
+            return
+        widget.setEnabled(bool(enabled))
+        tooltip = enabled_tooltip if bool(enabled) else disabled_tooltip
+        try:
+            widget.setToolTip(str(tooltip or ""))
+        except Exception:
+            pass
+
+    def _composer_send_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅用于回顾日志与快照，不能在这里继续发送消息。"
+        if bool(getattr(self, "_busy", False)):
+            return "当前正在等待模型回复，请稍候或先停止当前任务。"
+        return ""
+
+    def _composer_stop_disabled_reason(self, *, disabled=False, remote=False):
+        if bool(disabled):
+            return "渠道进程会话仅用于回顾日志与快照，不能在这里停止任务。"
+        if bool(remote):
+            return "当前会话在远程设备执行，这里不支持直接停止远端任务。"
+        if not bool(getattr(self, "_busy", False)):
+            return "当前没有正在执行的本地回复任务。"
+        if bool(getattr(self, "_abort_requested", False)):
+            return "停止请求已发送，请等待当前任务退出。"
+        return ""
+
+    def _composer_llm_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅支持查看日志，不能切换模型。"
+        if not bool(getattr(self, "llms", None)):
+            return "当前还没有可用的 LLM 配置。"
+        return ""
+
+    def _composer_reasoning_effort_disabled_reason(self, *, disabled=False):
+        if bool(disabled):
+            return "渠道进程会话仅支持查看日志，不能切换思考强度。"
+        if not bool(getattr(self, "llms", None)):
+            return "当前还没有可用的 LLM 配置。"
+        return ""
+
+    def _bind_session_to_current_bridge(self, session, *, preserve_session_state=False):
         if not isinstance(session, dict):
             return
-        session["process_pid"] = getattr(self.bridge_proc, "pid", None)
-        session["llm_idx"] = int(self._current_llm_index() or 0)
         snapshot = dict(session.get("snapshot") or {})
+        current_llm_idx = int(self._current_llm_index() or 0)
+        session["process_pid"] = getattr(self.bridge_proc, "pid", None)
+        if preserve_session_state:
+            try:
+                session_llm_idx = int(session.get("llm_idx", snapshot.get("llm_idx", current_llm_idx)) or 0)
+            except Exception:
+                session_llm_idx = current_llm_idx
+        else:
+            session_llm_idx = current_llm_idx
+            session["llm_idx"] = session_llm_idx
         snapshot["version"] = int(snapshot.get("version", 1) or 1)
         snapshot["kind"] = str(snapshot.get("kind") or "turn_complete").strip() or "turn_complete"
         snapshot["captured_at"] = float(snapshot.get("captured_at", session.get("updated_at", time.time())) or time.time())
         snapshot["turns"] = int(snapshot.get("turns", ((session.get("token_usage") or {}).get("turns", 0) or 0)) or 0)
-        snapshot["llm_idx"] = int(session.get("llm_idx", 0) or 0)
+        snapshot["llm_idx"] = int(session_llm_idx or 0)
         snapshot["process_pid"] = int(session.get("process_pid", 0) or 0)
         snapshot["has_backend_history"] = bool(session.get("backend_history"))
         snapshot["has_agent_history"] = bool(session.get("agent_history"))
+        if "reasoning_effort" in session:
+            reasoning_effort = str(session.get("reasoning_effort") or "").strip().lower()
+            if reasoning_effort:
+                snapshot["reasoning_effort"] = reasoning_effort
+                snapshot["reasoning_effort_source"] = "override"
+            else:
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+        elif preserve_session_state or str(snapshot.get("reasoning_effort_source") or "").strip().lower() in {"override", "runtime"}:
+            preserved_reasoning = str(snapshot.get("reasoning_effort") or "").strip().lower()
+            if preserved_reasoning:
+                snapshot["reasoning_effort"] = preserved_reasoning
+                source = str(snapshot.get("reasoning_effort_source") or "").strip().lower()
+                snapshot["reasoning_effort_source"] = source if source in {"override", "runtime"} else "runtime"
+            else:
+                snapshot.pop("reasoning_effort", None)
+                snapshot.pop("reasoning_effort_source", None)
+        else:
+            snapshot.pop("reasoning_effort", None)
+            snapshot.pop("reasoning_effort_source", None)
         session["snapshot"] = snapshot
 
     def _ensure_session_usage_metadata(self, session):
@@ -69,6 +167,19 @@ class SessionShellMixin:
             snapshot["process_pid"] = int(session.get("process_pid", 0) or 0)
             snapshot["has_backend_history"] = bool(session.get("backend_history"))
             snapshot["has_agent_history"] = bool(session.get("agent_history"))
+            if "reasoning_effort" in session:
+                reasoning_effort = str(session.get("reasoning_effort") or "").strip().lower()
+                if reasoning_effort:
+                    snapshot["reasoning_effort"] = reasoning_effort
+                    snapshot["reasoning_effort_source"] = "override"
+                else:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
+            else:
+                source = str(snapshot.get("reasoning_effort_source") or "").strip().lower()
+                if source not in {"override", "runtime"}:
+                    snapshot.pop("reasoning_effort", None)
+                    snapshot.pop("reasoning_effort_source", None)
             session["snapshot"] = snapshot
         self._ensure_session_usage_metadata(session)
         lz.save_session(self.agent_dir, session)
@@ -176,7 +287,243 @@ class SessionShellMixin:
             text = (lbl.text() or "").strip()
             if text:
                 parts.append(text)
+        parts.append(self._subagent_runtime_summary_text())
         return "\n\n".join(parts) or "尚无状态信息"
+
+    def _iter_local_subagent_processes(self):
+        getter = getattr(self, "_iter_local_channel_processes", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter() or [])
+        except Exception:
+            return []
+
+    def _subagent_runtime_target_key(self):
+        current_session = getattr(self, "current_session", None)
+        session = current_session if isinstance(current_session, dict) else {}
+        resolver = getattr(self, "_session_device_scope_id", None)
+        if callable(resolver):
+            try:
+                scope, did = resolver(session)
+            except Exception:
+                scope, did = "local", "local"
+            scope = str(scope or "local").strip().lower()
+            did = str(did or ("local" if scope != "remote" else "")).strip()
+            if scope == "remote" and did:
+                return f"remote:{did}"
+        context_getter = getattr(self, "_current_device_context", None)
+        if callable(context_getter):
+            try:
+                scope, did = context_getter()
+            except Exception:
+                scope, did = "local", "local"
+            scope = str(scope or "local").strip().lower()
+            did = str(did or ("local" if scope != "remote" else "")).strip()
+            if scope == "remote" and did:
+                return f"remote:{did}"
+        return "local:local"
+
+    def _subagent_runtime_target_scope(self):
+        key = str(self._subagent_runtime_target_key() or "").strip().lower()
+        return "remote" if key.startswith("remote:") else "local"
+
+    def _count_running_subagents(self) -> int:
+        agent_dir = str(getattr(self, "agent_dir", "") or "").strip()
+        if not agent_dir:
+            return 0
+        if self._subagent_runtime_target_scope() == "remote":
+            return self._count_remote_running_subagents()
+        try:
+            agent_dir_real = os.path.realpath(agent_dir)
+        except Exception:
+            agent_dir_real = ""
+        current_pid = int(os.getpid() or 0)
+        count = 0
+        for proc_info in self._iter_local_subagent_processes():
+            pid = int(proc_info.get("pid") or 0)
+            if pid <= 0 or pid == current_pid:
+                continue
+            cmdline = str(proc_info.get("cmdline") or "").strip()
+            if not cmdline or not re.search(r"(^|\s)--task(?:\s|=|$)", cmdline):
+                continue
+            if process_cmdline_matches_agent_script(
+                cmdline,
+                agent_dir=agent_dir,
+                script_rel="agentmain.py",
+                cwd=proc_info.get("cwd") or "",
+                agent_dir_real=agent_dir_real,
+                cwd_real=proc_info.get("cwd_real") or "",
+            ):
+                count += 1
+        return count
+
+    def _parse_subagent_process_rows(self, raw_text):
+        rows = []
+        for line in str(raw_text or "").splitlines():
+            text = str(line or "").strip()
+            if not text:
+                continue
+            parts = text.split("\t", 2)
+            pid_text = str(parts[0] if parts else "").strip()
+            if not re.fullmatch(r"\d+", pid_text):
+                continue
+            rows.append(
+                {
+                    "pid": int(pid_text),
+                    "cwd": str(parts[1] if len(parts) > 1 else "").strip(),
+                    "cwd_real": str(parts[1] if len(parts) > 1 else "").strip(),
+                    "cmdline": str(parts[2] if len(parts) > 2 else "").strip(),
+                }
+            )
+        return rows
+
+    def _count_remote_running_subagents(self, session=None) -> int:
+        payload_getter = getattr(self, "_remote_device_payload", None)
+        opener = getattr(self, "_open_vps_ssh_client", None)
+        executor = getattr(self, "_vps_exec_remote", None)
+        if not callable(payload_getter) or not callable(opener) or not callable(executor):
+            return 0
+        data = session if isinstance(session, dict) else (self.current_session or {})
+        try:
+            dev, payload = payload_getter(data)
+        except Exception:
+            return 0
+        client, _err_msg, _detail, _missing = opener(payload, timeout=8)
+        if client is None:
+            return 0
+        try:
+            agent_dir = remote_device_agent_dir(dev, username=(dev or {}).get("username"))
+            if not agent_dir:
+                return 0
+            shell_script = (
+                "ps -eo pid=,args= | while IFS= read -r line; do "
+                "[ -n \"$line\" ] || continue; "
+                "pid=${line%% *}; "
+                "case \"$pid\" in ''|*[!0-9]*) continue ;; esac; "
+                "cmd=${line#\"$pid\"}; cmd=${cmd# }; "
+                "cwd=$(readlink -f \"/proc/$pid/cwd\" 2>/dev/null || true); "
+                "printf '%s\\t%s\\t%s\\n' \"$pid\" \"$cwd\" \"$cmd\"; "
+                "done"
+            )
+            cmd = f"sh -lc {shlex.quote(shell_script)}"
+            if remote_device_agent_mode(dev) == "docker":
+                container = remote_device_container_name(dev)
+                if not container:
+                    return 0
+                cmd = f"docker exec {shlex.quote(container)} sh -lc {shlex.quote(shell_script)}"
+            rc, out, _err = executor(client, cmd, timeout=20)
+            if int(rc or 0) != 0:
+                return 0
+            count = 0
+            for proc_info in self._parse_subagent_process_rows(out):
+                cmdline = str(proc_info.get("cmdline") or "").strip()
+                if not cmdline or not re.search(r"(^|\s)--task(?:\s|=|$)", cmdline):
+                    continue
+                if process_cmdline_matches_agent_script(
+                    cmdline,
+                    agent_dir=agent_dir,
+                    script_rel="agentmain.py",
+                    cwd=proc_info.get("cwd") or "",
+                    agent_dir_real=agent_dir,
+                    cwd_real=proc_info.get("cwd_real") or "",
+                ):
+                    count += 1
+            return count
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _apply_subagent_runtime_count(self, count, *, target_key="", scanned_at=None):
+        current_key = str(self._subagent_runtime_target_key() or "").strip()
+        event_key = str(target_key or "").strip()
+        if event_key and current_key and event_key != current_key:
+            return
+        previous = int(getattr(self, "_subagent_runtime_count", 0) or 0)
+        next_count = max(0, int(count or 0))
+        self._subagent_runtime_bound_key = current_key or event_key or "local:local"
+        self._subagent_runtime_count = next_count
+        self._subagent_runtime_scan_ts = float(scanned_at or time.time())
+        if previous != next_count:
+            self._refresh_info_tooltip()
+        refresher = getattr(self, "_refresh_info_button_icon", None)
+        if callable(refresher):
+            refresher()
+
+    def _start_remote_subagent_runtime_refresh(self, target_key, session):
+        event_queue = getattr(self, "_event_queue", None)
+        if event_queue is None:
+            count = self._count_remote_running_subagents(session=session)
+            self._apply_subagent_runtime_count(count, target_key=target_key, scanned_at=time.time())
+            return
+
+        def worker():
+            try:
+                count = self._count_remote_running_subagents(session=session)
+            except Exception:
+                count = 0
+            event_queue.put(
+                {
+                    "event": "subagent_runtime_count",
+                    "target_key": str(target_key or "").strip(),
+                    "count": int(count or 0),
+                    "scanned_at": float(time.time()),
+                }
+            )
+
+        threading.Thread(target=worker, name="subagent-runtime-scan", daemon=True).start()
+
+    def _start_local_subagent_runtime_refresh(self, target_key):
+        event_queue = getattr(self, "_event_queue", None)
+        if event_queue is None:
+            count = self._count_running_subagents()
+            self._apply_subagent_runtime_count(count, target_key=target_key, scanned_at=time.time())
+            return
+
+        def worker():
+            try:
+                count = self._count_running_subagents()
+            except Exception:
+                count = 0
+            event_queue.put(
+                {
+                    "event": "subagent_runtime_count",
+                    "target_key": str(target_key or "").strip(),
+                    "count": int(count or 0),
+                    "scanned_at": float(time.time()),
+                }
+            )
+
+        threading.Thread(target=worker, name="subagent-runtime-scan-local", daemon=True).start()
+
+    def _refresh_subagent_runtime_state(self):
+        target_key = str(self._subagent_runtime_target_key() or "").strip() or "local:local"
+        previous_key = str(getattr(self, "_subagent_runtime_bound_key", "") or "").strip()
+        if previous_key != target_key:
+            self._subagent_runtime_bound_key = target_key
+            self._subagent_runtime_count = 0
+            self._subagent_runtime_scan_ts = 0.0
+            self._subagent_runtime_refresh_inflight_key = ""
+            self._refresh_info_tooltip()
+            refresher = getattr(self, "_refresh_info_button_icon", None)
+            if callable(refresher):
+                refresher()
+        inflight_key = str(getattr(self, "_subagent_runtime_refresh_inflight_key", "") or "").strip()
+        if inflight_key == target_key:
+            return
+        self._subagent_runtime_refresh_inflight_key = target_key
+        if self._subagent_runtime_target_scope() == "remote":
+            current_session = getattr(self, "current_session", None)
+            session = dict(current_session or {}) if isinstance(current_session, dict) else {}
+            self._start_remote_subagent_runtime_refresh(target_key, session)
+            return
+        self._start_local_subagent_runtime_refresh(target_key)
+
+    def _subagent_runtime_summary_text(self) -> str:
+        count = int(getattr(self, "_subagent_runtime_count", 0) or 0)
+        return f"后台子代理：{count}"
 
     def _show_info_tooltip(self):
         btn = getattr(self, "info_btn", None)
@@ -257,6 +604,11 @@ class SessionShellMixin:
         send_btn = getattr(self, "send_btn", None)
         stop_btn = getattr(self, "stop_btn", None)
         llm_combo = getattr(self, "llm_combo", None)
+        reasoning_effort_combo = getattr(self, "reasoning_effort_combo", None)
+        send_disabled_reason = self._composer_send_disabled_reason(disabled=disabled)
+        stop_disabled_reason = self._composer_stop_disabled_reason(disabled=disabled, remote=remote)
+        llm_disabled_reason = self._composer_llm_disabled_reason(disabled=disabled)
+        reasoning_disabled_reason = self._composer_reasoning_effort_disabled_reason(disabled=disabled)
         if input_box is not None:
             input_box.setReadOnly(disabled)
             input_box.setPlaceholderText(
@@ -264,15 +616,48 @@ class SessionShellMixin:
                 if disabled
                 else ("当前会话在远程设备执行，使用 SSH 发送。Enter 发送，Shift+Enter 换行" if remote else "输入消息，Enter 发送，Shift+Enter 换行")
             )
+            try:
+                input_box.setToolTip(
+                    "渠道进程会话仅用于查看日志与快照。"
+                    if disabled
+                    else ("当前会话通过 SSH 在远程设备执行。" if remote else "当前会话在本机执行。")
+                )
+            except Exception:
+                pass
         if send_btn is not None:
-            send_btn.setEnabled((not disabled) and (not self._busy))
+            self._apply_composer_widget_state(
+                send_btn,
+                not bool(send_disabled_reason),
+                enabled_tooltip="发送当前输入内容。",
+                disabled_tooltip=send_disabled_reason,
+            )
         if stop_btn is not None:
-            stop_btn.setEnabled((not disabled) and (not remote) and self._busy and (not self._abort_requested))
+            self._apply_composer_widget_state(
+                stop_btn,
+                not bool(stop_disabled_reason),
+                enabled_tooltip="停止当前本地回复任务。",
+                disabled_tooltip=stop_disabled_reason,
+            )
         if llm_combo is not None:
-            llm_combo.setEnabled((not disabled) and bool(self.llms))
+            self._apply_composer_widget_state(
+                llm_combo,
+                not bool(llm_disabled_reason),
+                enabled_tooltip="切换当前会话使用的模型。",
+                disabled_tooltip=llm_disabled_reason,
+            )
+        if reasoning_effort_combo is not None:
+            self._apply_composer_widget_state(
+                reasoning_effort_combo,
+                not bool(reasoning_disabled_reason),
+                enabled_tooltip="切换当前会话使用的思考强度。",
+                disabled_tooltip=reasoning_disabled_reason,
+            )
         floating_sync = getattr(self, "_sync_floating_llm_combo", None)
         if callable(floating_sync):
             floating_sync()
+        floating_reasoning_sync = getattr(self, "_sync_floating_reasoning_effort_combo", None)
+        if callable(floating_reasoning_sync):
+            floating_reasoning_sync()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
             refresher()

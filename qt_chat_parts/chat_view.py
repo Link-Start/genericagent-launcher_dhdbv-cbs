@@ -5,10 +5,60 @@ from PySide6.QtWidgets import QLabel
 
 from launcher_app import core as lz
 
-from .common import MessageRow, _session_source_label
+from .common import MessageRow, _session_source_label, build_message_row
 
 
 class ChatViewMixin:
+    def _transient_chat_feedback_key(self, session=None):
+        data = session if isinstance(session, dict) else None
+        if data is None and isinstance(getattr(self, "current_session", None), dict):
+            data = self.current_session
+        sid = str((data or {}).get("id") or "").strip()
+        if sid:
+            return f"session:{sid}"
+        scope, did = "local", "local"
+        resolver = getattr(self, "_current_device_context", None)
+        if callable(resolver):
+            try:
+                scope, did = resolver()
+            except Exception:
+                scope, did = "local", "local"
+        return f"draft:{str(scope or 'local').strip().lower()}:{str(did or 'local').strip() or 'local'}"
+
+    def _transient_chat_feedback_rows(self, session=None):
+        items = list(getattr(self, "_transient_chat_feedback", None) or [])
+        if not items:
+            return []
+        target_key = self._transient_chat_feedback_key(session)
+        rows = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key") or "").strip() != target_key:
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            rows.append(
+                {
+                    "role": str(item.get("role") or "assistant").strip().lower() or "assistant",
+                    "text": text,
+                }
+            )
+        return rows
+
+    def _display_session_bubbles(self, session=None):
+        data = session if isinstance(session, dict) else {}
+        bubbles = list(data.get("bubbles") or [])
+        return bubbles + self._transient_chat_feedback_rows(session)
+
+    def _sync_message_layout_alignment(self):
+        layout = getattr(self, "msg_layout", None)
+        if layout is None:
+            return
+        rows = getattr(self, "_rendered_message_rows", None) or []
+        layout.setAlignment(Qt.AlignBottom if rows else Qt.AlignTop)
+
     def _message_row_insert_index(self) -> int:
         return max(0, self.msg_layout.count() - 1)
 
@@ -16,12 +66,14 @@ class ChatViewMixin:
         self._stream_row = None
         self._current_stream_text = ""
         self._pending_stream_text = None
+        self._current_turn_user_row = None
         self._rendered_message_rows = []
         while self.msg_layout.count() > 1:
             item = self.msg_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self._sync_message_layout_alignment()
         self._refresh_jump_latest_button()
         refresher = getattr(self, "_refresh_floating_chat_window", None)
         if callable(refresher):
@@ -44,13 +96,58 @@ class ChatViewMixin:
 
     def _add_message_row(self, role: str, text: str, finished: bool = True, *, auto_scroll: bool = True):
         on_resend = self._regenerate_from_row if role == "assistant" else None
-        row = MessageRow(text, role, self.msg_root, on_resend=on_resend)
+        row = build_message_row(
+            text,
+            role,
+            self.msg_root,
+            on_resend=on_resend,
+            avatar_cfg=getattr(self, "cfg", None),
+            row_cls=MessageRow,
+        )
         row.set_finished(finished)
         self.msg_layout.insertWidget(self._message_row_insert_index(), row)
         self._rendered_message_rows.append(row)
+        self._sync_message_layout_alignment()
         if auto_scroll:
             self._scroll_to_bottom()
         return row
+
+    def _discard_stream_row(self, row=None):
+        target = row if row is not None else getattr(self, "_stream_row", None)
+        if target is None:
+            return
+        rows = getattr(self, "_rendered_message_rows", None)
+        if isinstance(rows, list):
+            try:
+                rows.remove(target)
+            except ValueError:
+                pass
+        layout = getattr(self, "msg_layout", None)
+        if layout is not None:
+            idx = -1
+            try:
+                idx = layout.indexOf(target)
+            except Exception:
+                idx = -1
+            if idx >= 0:
+                item = layout.takeAt(idx)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            else:
+                try:
+                    target.deleteLater()
+                except Exception:
+                    pass
+        else:
+            try:
+                target.deleteLater()
+            except Exception:
+                pass
+        if getattr(self, "_stream_row", None) is target:
+            self._stream_row = None
+        self._sync_message_layout_alignment()
+        self._refresh_jump_latest_button()
 
     def _regenerate_from_row(self, row):
         if getattr(self, "_busy", False):
@@ -73,9 +170,24 @@ class ChatViewMixin:
     def _render_session(self, session):
         self._clear_messages()
         if not session:
+            feedback = self._transient_chat_feedback_rows(None)
+            if feedback:
+                for bubble in feedback:
+                    role = bubble.get("role", "assistant")
+                    self._add_message_row(role, bubble.get("text", ""), finished=True, auto_scroll=False)
+                self._update_header_labels()
+                self._refresh_token_label()
+                syncer = getattr(self, "_sync_current_turn_view", None)
+                if callable(syncer):
+                    syncer(force=True)
+                self._refresh_jump_latest_button()
+                refresher = getattr(self, "_refresh_floating_chat_window", None)
+                if callable(refresher):
+                    refresher()
+                return
             self._reset_chat_area("选择一个会话，或新建会话开始聊天。")
             return
-        bubbles = list(session.get("bubbles") or [])
+        bubbles = self._display_session_bubbles(session)
         if not bubbles:
             self._reset_chat_area("当前会话还没有消息。")
             return
@@ -260,15 +372,34 @@ class ChatViewMixin:
         self._user_scrolled_up = value < bar.maximum() - 40
         self._refresh_jump_latest_button()
 
-    def _scroll_row_to_top(self, row, *, top_margin: int = 18):
+    def _scroll_row_to_top(self, row, *, top_margin: int = 18, preserve_scroll_state: bool = False):
         if row is None:
             return
 
-        def apply():
+        def apply(retry: bool = False):
             try:
+                layout = getattr(self, "msg_layout", None)
+                if layout is not None:
+                    try:
+                        layout.activate()
+                    except Exception:
+                        pass
+                root = getattr(self, "msg_root", None)
+                if root is not None:
+                    try:
+                        root.updateGeometry()
+                    except Exception:
+                        pass
                 bar = self.scroll.verticalScrollBar()
                 target_y = max(0, row.y() - int(top_margin or 0))
+                rows = getattr(self, "_rendered_message_rows", None) or []
+                is_first_row = bool(rows) and rows[0] is row
+                if not retry and target_y == 0 and not is_first_row and bar.maximum() > 0:
+                    QTimer.singleShot(30, lambda: apply(retry=True))
+                    return
                 bar.setValue(min(target_y, bar.maximum()))
+                if preserve_scroll_state:
+                    self._user_scrolled_up = False
             finally:
                 self._refresh_jump_latest_button()
 
@@ -280,14 +411,33 @@ class ChatViewMixin:
                 return row
         return None
 
+    def _set_current_turn_user_row(self, row):
+        self._current_turn_user_row = row
+
+    def _clear_current_turn_user_row(self, row=None):
+        current = getattr(self, "_current_turn_user_row", None)
+        if row is None or current is row:
+            self._current_turn_user_row = None
+
+    def _tracked_current_turn_user_row(self):
+        row = getattr(self, "_current_turn_user_row", None)
+        if row is None:
+            return None
+        if row in (getattr(self, "_rendered_message_rows", None) or []):
+            return row
+        self._current_turn_user_row = None
+        return None
+
     def _set_follow_latest_user(self, enabled: bool):
         self._follow_latest_user_message = bool(enabled)
 
     def _sync_current_turn_view(self, *, force: bool = False):
         if getattr(self, "_follow_latest_user_message", False):
-            latest_user_row = self._latest_user_row()
-            if latest_user_row is not None:
-                self._scroll_row_to_top(latest_user_row)
+            target_user_row = self._tracked_current_turn_user_row()
+            if target_user_row is None:
+                target_user_row = self._latest_user_row()
+            if target_user_row is not None:
+                self._scroll_row_to_top(target_user_row, preserve_scroll_state=True)
                 self._set_follow_latest_user(False)
                 return
             self._set_follow_latest_user(False)
