@@ -896,7 +896,7 @@ def _build_background_override_qss() -> str:
         "QScrollArea#chatScroll, QScrollArea#floatingChatScroll {\n"
         "    background: transparent;\n"
         "}\n"
-        "QFrame#chatSidebar, QFrame#settingsNav {\n"
+        "QFrame#mainNavRail, QFrame#chatSidebar, QFrame#settingsNav {\n"
         f"    background: {overlay_nav};\n"
         "}\n"
         "QFrame#chatHead, QFrame#chatComposer, QFrame#settingsTopbar, QFrame#setupTopbar,\n"
@@ -1159,6 +1159,11 @@ def build_qss() -> str:
     QSplitter::handle:vertical {{ height: 1px; }}
 
     /* ====== App-specific roles via objectName ====== */
+    QFrame#mainNavRail {{
+        background: {sidebar_bg};
+        border: none;
+        border-right: 1px solid {stroke_divider};
+    }}
     QFrame#chatSidebar {{
         background: {sidebar_bg};
         border: none;
@@ -1371,6 +1376,26 @@ def build_qss() -> str:
     }}
     QWidget#botMsgRow {{
         background: transparent;
+    }}
+    QWidget#chatErrorRow {{
+        background: {error_soft};
+        border: 1px solid {danger_soft_border};
+        border-radius: {max(6, int(F.get('radius_sm') or 6))}px;
+        margin: 2px 12px;
+    }}
+    QLabel#chatErrorMark {{
+        background: transparent;
+        color: {error};
+        font-size: {fs_caption}px;
+        font-weight: 700;
+        padding: 0 2px 0 8px;
+    }}
+    QLabel#chatErrorText {{
+        background: transparent;
+        color: {error};
+        font-size: {fs_small}px;
+        font-weight: 600;
+        padding: 2px 10px 2px 0;
     }}
     QLabel#msgAvatar {{
         background: {C['avatar_bg']};

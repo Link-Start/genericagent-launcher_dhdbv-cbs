@@ -91,6 +91,7 @@ from qt_chat_parts.common import (
 )
 from qt_chat_parts.chat_view import ChatViewMixin
 from qt_chat_parts.channel_runtime import ChannelRuntimeMixin
+from qt_chat_parts.conductor_page import ConductorPageMixin
 from qt_chat_parts.dependency_runtime import DependencyRuntimeMixin
 from qt_chat_parts.downloads import DownloadMixin
 from qt_chat_parts.navigation import NavigationMixin
@@ -1200,7 +1201,9 @@ class FloatingOrbWindow(QWidget):
                 avatar_cfg=getattr(self._host, "cfg", None),
                 row_cls=MessageRow,
             )
-            row.set_finished(True)
+            setter = getattr(row, "set_finished", None)
+            if callable(setter):
+                setter(True)
             self.msg_layout.insertWidget(insert_index, row)
             self._rendered_rows.append(row)
             self._sync_message_layout_alignment()
@@ -1582,7 +1585,7 @@ class FloatingChatWindow(QWidget):
         event.ignore()
         self._restore_main_window()
 
-class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, ScheduleRuntimeMixin, PersonalUsageMixin, WindowShellMixin, BridgeRuntimeMixin, SessionShellMixin, NavigationMixin, ChatViewMixin, SetupPagesMixin, SettingsPanelMixin, DownloadMixin, SidebarSessionsMixin, QMainWindow):
+class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, ConductorPageMixin, DependencyRuntimeMixin, ScheduleRuntimeMixin, PersonalUsageMixin, WindowShellMixin, BridgeRuntimeMixin, SessionShellMixin, NavigationMixin, ChatViewMixin, SetupPagesMixin, SettingsPanelMixin, DownloadMixin, SidebarSessionsMixin, QMainWindow):
     def __init__(self, agent_dir: str | None = None):
         super().__init__()
         loaded_cfg = lz.load_config()
@@ -1590,7 +1593,10 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         initial_dir = str(agent_dir or self.cfg.get("agent_dir") or "").strip()
         self.agent_dir = os.path.abspath(initial_dir) if initial_dir else ""
         self.install_parent = str(self.cfg.get("install_parent") or os.path.expanduser("~")).strip() or os.path.expanduser("~")
-        self.sidebar_collapsed = bool(self.cfg.get("sidebar_collapsed", False))
+        # Session list sidebar is always expanded (no collapse control).
+        self.sidebar_collapsed = False
+        if "sidebar_collapsed" in self.cfg:
+            self.cfg["sidebar_collapsed"] = False
         self._session_filter_keyword = ""
         self._sidebar_view_mode = "roots"
         self._sidebar_device_scope = "local"
@@ -1655,10 +1661,12 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._locate_page = None
         self._download_page = None
         self._chat_page = None
+        self._conductor_page = None
         self._settings_page = None
         self._settings_top_back_btn = None
         self._settings_top_home_btn = None
         self._current_settings_category = "api"
+        self._conductor_page_built = False
         self._channel_procs = {}
         self._qt_api_hidden_configs = []
         self._qt_api_state = []
@@ -1828,7 +1836,14 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         self._start_shutdown_cleanup()
 
     def _stop_background_activity_for_shutdown(self):
-        for attr in ("_drain_timer", "_channel_snapshot_timer", "_server_status_timer", "_subagent_status_timer", "_stream_flush_timer"):
+        for attr in (
+            "_drain_timer",
+            "_channel_snapshot_timer",
+            "_server_status_timer",
+            "_subagent_status_timer",
+            "_stream_flush_timer",
+            "_conductor_status_timer",
+        ):
             timer = getattr(self, attr, None)
             if timer is None:
                 continue
@@ -1838,6 +1853,16 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
                 pass
         self._server_status_probe_running = False
         self._server_status_probe_pending = False
+        # Prevent background Conductor threads from posting QTimer after quit.
+        self._conductor_poll_inflight = False
+        self._conductor_start_inflight = False
+        self._conductor_ready_callbacks = []
+        pauser = getattr(self, "_pause_conductor_status_timer", None)
+        if callable(pauser):
+            try:
+                pauser()
+            except Exception:
+                pass
         chat_common.invalidate_runtime_bound_state(self, clear_remote_sync_queues=True)
         disconnect_terminal = getattr(self, "_disconnect_vps_terminal", None)
         if callable(disconnect_terminal):
@@ -2279,7 +2304,7 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         root.addWidget(main)
         root.setStretchFactor(0, 0)
         root.setStretchFactor(1, 1)
-        root.setSizes([84 if self.sidebar_collapsed else 280, 1160])
+        root.setSizes([280, 1160])
         return root
 
     def _update_stream_row_tokens(self, *, live: bool):
@@ -2882,7 +2907,12 @@ class QtChatWindow(ApiEditorMixin, ChannelRuntimeMixin, DependencyRuntimeMixin, 
         rows = []
         for bubble in bubbles:
             role = str(bubble.get("role") or "assistant").strip().lower()
-            label = "我" if role == "user" else "AI"
+            if role == "error":
+                label = "错误"
+            elif role == "user":
+                label = "我"
+            else:
+                label = "AI"
             text = str(bubble.get("text") or "").strip() or "…"
             rows.append(f"{label}\n{text}")
         if self._busy:

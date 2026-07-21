@@ -615,13 +615,8 @@ class SettingsPanelMixin:
         top = QHBoxLayout(top_wrap)
         top.setContentsMargins(24, 14, 24, 14)
         top.setSpacing(10)
-        back_btn = QPushButton("返回聊天")
-        back_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
-        back_btn.setCursor(Qt.PointingHandCursor)
-        back_btn.clicked.connect(self._show_chat_page)
-        chat_common.set_button_svg_icon(back_btn, "settings_back", chat_common._SVG_CHEVRON_LEFT, color="text_soft", size=16)
-        self._settings_top_back_btn = back_btn
-        top.addWidget(back_btn, 0)
+        # Left rail owns chat/settings switching; keep a light title bar only.
+        self._settings_top_back_btn = None
         title = QLabel("设置")
         title.setObjectName("cardTitle")
         top.addWidget(title, 0)

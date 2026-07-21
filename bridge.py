@@ -78,7 +78,7 @@ def _llm_backend(llmclient):
     return None
 
 
-_REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
 def _normalize_reasoning_effort(value):
@@ -917,11 +917,35 @@ def _patch_agent_launcher_multimodal(agent, agentmain_mod):
                 self.task_queue.task_done()
                 continue
             self.is_running = True
+            script_dir = os.path.dirname(os.path.abspath(agentmain_mod.__file__))
+            # Align with upstream agentmain: externalize very long user prompts.
+            if isinstance(raw_query, str) and len(raw_query) > 2000:
+                temp_dir = os.path.join(script_dir, "temp")
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                    task_file = os.path.join(temp_dir, f"user_prompt_{os.getpid()}_{time.time_ns()}.md")
+                    with open(task_file, "w", encoding="utf-8") as f:
+                        f.write(raw_query)
+                    raw_query = f"Long user prompt saved to {task_file}. Read and execute."
+                    if not str(task.get("history_text") or "").strip():
+                        history_text = raw_query
+                except Exception:
+                    pass
             rquery = agentmain_mod.smart_format(history_text.replace("\n", " "), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
 
-            sys_prompt = agentmain_mod.get_system_prompt() + getattr(self.llmclient.backend, "extra_sys_prompt", "")
-            script_dir = os.path.dirname(os.path.abspath(agentmain_mod.__file__))
+            extra_sys_parts = []
+            for part in list(getattr(self, "extra_sys_prompts", None) or []):
+                text = str(part or "").strip()
+                if text:
+                    extra_sys_parts.append(text)
+            sys_prompt = (
+                agentmain_mod.get_system_prompt()
+                + ("\n".join(extra_sys_parts) if extra_sys_parts else "")
+                + getattr(self.llmclient.backend, "extra_sys_prompt", "")
+            )
+            if getattr(self, "peer_hint", False):
+                sys_prompt += "\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = agentmain_mod.GenericAgentHandler(self, self.history, os.path.join(script_dir, "temp"))
             if self.handler and "key_info" in self.handler.working:
                 ki = re.sub(r"\n\[SYSTEM\] 此为.*?工作记忆[。\n]*", "", self.handler.working["key_info"])
@@ -940,6 +964,17 @@ def _patch_agent_launcher_multimodal(agent, agentmain_mod):
                 self.llmclient.log_path = self.log_path
             except Exception:
                 pass
+            if getattr(self, "force_non_stream", False):
+                try:
+                    backend = getattr(self.llmclient, "backend", None)
+                    if backend is not None:
+                        backend.stream = False
+                        try:
+                            backend.read_timeout = max(float(getattr(backend, "read_timeout", 0) or 0), 1200.0)
+                        except Exception:
+                            backend.read_timeout = 1200
+                except Exception:
+                    pass
             loop_kwargs = {
                 "max_turns": 70,
                 "verbose": self.verbose,
@@ -950,7 +985,7 @@ def _patch_agent_launcher_multimodal(agent, agentmain_mod):
             except Exception:
                 loop_params = {}
             if "yield_info" in loop_params:
-                loop_kwargs["max_turns"] = 80
+                loop_kwargs["max_turns"] = 180
                 loop_kwargs["yield_info"] = True
             gen = agentmain_mod.agent_runner_loop(
                 self.llmclient,
@@ -1026,10 +1061,12 @@ def _patch_agent_launcher_multimodal(agent, agentmain_mod):
                     scrub_user_content,
                     start_len=history_start_len,
                 )
-                print(f"Backend Error: {agentmain_mod.format_error(e)}")
+                err_text = str(agentmain_mod.format_error(e) or e).strip() or str(e)
+                print(f"Backend Error: {err_text}")
                 display_queue.put(
                     {
-                        "done": full_resp + f"\n```\n{agentmain_mod.format_error(e)}\n```",
+                        "done": full_resp,
+                        "error": err_text,
                         "source": source,
                         "turn": curr_turn,
                         "outputs": turn_resps.copy(),
@@ -1259,6 +1296,74 @@ def _dispatch_session_rename(agent, query, display_queue, session_names_mod):
     return None
 
 
+def _dispatch_slash_cmds_bundle(agent, query, display_queue, slash_mod):
+    """Map upstream slash_cmds prompt injections + text-mode /scheduler."""
+    if slash_mod is None:
+        return query
+    s = str(query or "").strip()
+    if not s.startswith("/"):
+        return query
+    parts = s.split(None, 1)
+    cmd = str(parts[0] or "").strip().lower()
+    args_text = str(parts[1] or "").strip() if len(parts) > 1 else ""
+
+    if cmd == "/scheduler":
+        try:
+            if args_text.lower().startswith("start "):
+                names = [n.strip() for n in args_text[6:].split(",") if n.strip()]
+                if not names:
+                    display_queue.put({"done": "用法: /scheduler start <service>[,service2...]", "source": "system"})
+                    return None
+                lines = []
+                for name in names:
+                    ok, msg = getattr(slash_mod, "start_service")(name)
+                    lines.append(("✅ " if ok else "❌ ") + str(msg or name))
+                display_queue.put({"done": "\n".join(lines), "source": "system"})
+                return None
+            if args_text.lower().startswith("stop "):
+                names = [n.strip() for n in args_text[5:].split(",") if n.strip()]
+                if not names:
+                    display_queue.put({"done": "用法: /scheduler stop <service>[,service2...]", "source": "system"})
+                    return None
+                lines = []
+                for name in names:
+                    ok, msg = getattr(slash_mod, "stop_service")(name)
+                    lines.append(("✅ " if ok else "❌ ") + str(msg or name))
+                display_queue.put({"done": "\n".join(lines), "source": "system"})
+                return None
+            services = list(getattr(slash_mod, "list_launchable_services")() or [])
+            running = dict(getattr(slash_mod, "running_services")() or {})
+            if not services:
+                display_queue.put({"done": "当前没有可启动的 reflect / frontend 服务。", "source": "system"})
+                return None
+            lines = ["可用服务（/scheduler start <name> 或 /scheduler stop <name>）："]
+            for svc in services:
+                name = str((svc or {}).get("name") or "").strip()
+                if not name:
+                    continue
+                mark = "●" if name in running else "○"
+                doc = str((svc or {}).get("doc") or "").strip()
+                pid = running.get(name)
+                suffix = f" pid={pid}" if pid else ""
+                lines.append(f"{mark} {name}{suffix}" + (f" — {doc}" if doc else ""))
+            display_queue.put({"done": "\n".join(lines), "source": "system"})
+            return None
+        except Exception as e:
+            display_queue.put({"done": f"❌ /scheduler 失败: {type(e).__name__}: {e}", "source": "system"})
+            return None
+
+    prompt_for = getattr(slash_mod, "prompt_for", None)
+    if not callable(prompt_for):
+        return query
+    try:
+        injected = prompt_for(cmd, args_text)
+    except Exception:
+        return query
+    if injected is None:
+        return query
+    return str(injected)
+
+
 def _install_launcher_frontend_bridge_commands(agent_cls, loaded_modules):
     orig = getattr(agent_cls, "_handle_slash_cmd", None)
     if not callable(orig) or getattr(agent_cls, "_ga_launcher_frontend_bridge_cmds_patched", False):
@@ -1266,6 +1371,7 @@ def _install_launcher_frontend_bridge_commands(agent_cls, loaded_modules):
     continue_mod = loaded_modules.get("continue_cmd.py")
     export_mod = loaded_modules.get("export_cmd.py")
     session_names_mod = loaded_modules.get("session_names.py")
+    slash_mod = loaded_modules.get("slash_cmds.py")
 
     def patched(self, raw_query, display_queue):
         s = str(raw_query or "").strip()
@@ -1281,6 +1387,13 @@ def _install_launcher_frontend_bridge_commands(agent_cls, loaded_modules):
             result = _dispatch_continue_with_names(self, raw_query, display_queue, continue_mod, session_names_mod)
             if result is None:
                 return None
+        if slash_mod is not None and s.startswith("/"):
+            result = _dispatch_slash_cmds_bundle(self, raw_query, display_queue, slash_mod)
+            if result is None:
+                return None
+            if result is not raw_query and result is not s:
+                raw_query = result
+                s = str(raw_query or "").strip()
         return orig(self, raw_query, display_queue)
 
     patched._ga_launcher_frontend_bridge_cmds_patched = True
@@ -1294,12 +1407,16 @@ def _install_optional_upstream_frontend_slash_patches(agent_dir, agent_cls):
         return
     if frontends_dir not in sys.path:
         sys.path.insert(0, frontends_dir)
+    agent_root = str(agent_dir or "").strip()
+    if agent_root and agent_root not in sys.path:
+        sys.path.insert(0, agent_root)
     patch_specs = (
         ("continue_cmd.py", "_ga_launcher_continue_cmd", True),
         ("btw_cmd.py", "_ga_launcher_btw_cmd", True),
         ("review_cmd.py", "_ga_launcher_review_cmd", True),
         ("export_cmd.py", "_ga_launcher_export_cmd", False),
         ("session_names.py", "_ga_launcher_session_names", False),
+        ("slash_cmds.py", "_ga_launcher_slash_cmds", False),
     )
     loaded_modules = {}
     for filename, module_name, install_patch in patch_specs:
@@ -1394,13 +1511,31 @@ def main():
                             usage = dict(raw_usage)
                     except Exception:
                         usage = None
-                    payload = {"event": "done", "text": item["done"]}
+                    done_text = item.get("done")
+                    err_text = str(item.get("error") or "").strip()
+                    # llmcore yields API failures as body text (e.g. !!!Error: HTTP 401: ...).
+                    try:
+                        from launcher_core_parts.markup import _extract_llm_stream_error
+                    except Exception:
+                        _extract_llm_stream_error = None
+                    if callable(_extract_llm_stream_error):
+                        try:
+                            body_only, stream_err = _extract_llm_stream_error(done_text)
+                        except Exception:
+                            body_only, stream_err = done_text, ""
+                        if stream_err:
+                            done_text = body_only
+                            if not err_text:
+                                err_text = stream_err
+                    payload = {"event": "done", "text": done_text}
                     if "turn" in item:
                         payload["turn"] = item.get("turn")
                     if "outputs" in item:
                         payload["outputs"] = item.get("outputs")
                     if usage:
                         payload["usage"] = usage
+                    if err_text:
+                        payload["error"] = err_text
                     send(payload)
                     try:
                         deadline = time.time() + 1.5
@@ -1426,7 +1561,8 @@ def main():
                     )
                     break
         except Exception as e:
-            send({"event": "done", "text": f"[错误] {e}"})
+            err_text = str(e).strip() or "未知错误"
+            send({"event": "error", "msg": err_text, "inline": True})
 
     for line in sys.stdin:
         line = line.strip()

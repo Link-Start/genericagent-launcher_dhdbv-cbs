@@ -4408,6 +4408,8 @@ class ChannelRuntimeMixin:
                 self._set_status(f"渠道对话记录准备失败，本次仍会继续启动渠道：{capture_err}")
             if str(channel_id or "").strip().lower() == "conductor":
                 py_env["GA_LAUNCHER_AGENT_DIR"] = str(self.agent_dir or "").strip()
+                # Native launcher Conductor page is the primary UI; don't auto-open browser.
+                py_env["GA_LAUNCHER_CONDUCTOR_NO_BROWSER"] = "1"
             proc = lz._popen_external_subprocess(
                 [py, "-u", script_path],
                 cwd=self.agent_dir,

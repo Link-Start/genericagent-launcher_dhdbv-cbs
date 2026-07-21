@@ -515,6 +515,9 @@ def invalidate_runtime_bound_state(
 def _build_md_css() -> str:
     body_font = str(F.get("font_family") or "sans-serif")
     mono_font = str(F.get("font_family_mono") or "monospace")
+    code_bg = str(C.get("code_bg") or C.get("field_alt") or C.get("layer2") or "#f5f2ed")
+    code_fg = str(C.get("code_text") or C.get("text") or "#2d3440")
+    stroke = str(C.get("stroke_default") or C.get("border") or "rgba(0,0,0,0.08)")
     return f"""
 body {{ color: {C['text']} !important; background: transparent !important; font-family: {body_font}; font-size: 13px; line-height: 1.6; font-weight: 400; }}
 div, p, li, span, strong, em, b, i {{ color: {C['text']} !important; background: transparent !important; }}
@@ -522,9 +525,9 @@ h1 {{ color: {C['text']}; font-size: 20px; font-weight: 700; border-bottom: 1px 
 h2 {{ color: {C['text']}; font-size: 17px; font-weight: 700; border-bottom: 1px solid {C['border']}; padding-bottom: 3px; margin-top: 14px; }}
 h3 {{ color: {C['text']}; font-size: 15px; font-weight: 600; margin-top: 12px; }}
 h4, h5, h6 {{ color: {C['text_soft']}; font-size: 13px; font-weight: 600; margin-top: 10px; }}
-code {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 1px 4px; border-radius: 3px; font-family: {mono_font}; font-size: 12px; }}
-pre {{ background: {C['field_alt']} !important; color: {C['code_text']} !important; padding: 12px; border-radius: 8px; overflow-x: auto; border: 1px solid {C['stroke_default']} !important; margin: 8px 0; white-space: pre; font-family: {mono_font}; font-size: 12px; line-height: 1.45; }}
-pre code {{ background: transparent; padding: 0; border-radius: 0; white-space: pre; }}
+code {{ background-color: {code_bg}; color: {code_fg}; padding: 1px 5px; border-radius: 4px; font-family: {mono_font}; font-size: 12px; }}
+pre {{ background-color: {code_bg}; color: {code_fg}; padding: 12px 14px; border-radius: 10px; overflow-x: auto; border: 1px solid {stroke}; margin: 10px 0; white-space: pre; font-family: {mono_font}; font-size: 12px; line-height: 1.5; }}
+pre code {{ background-color: transparent; color: {code_fg}; padding: 0; border-radius: 0; white-space: pre; font-family: {mono_font}; }}
 blockquote {{ border-left: 3px solid {C['accent']}; margin: 8px 0; padding: 6px 10px; color: {C['text_soft']} !important; background: {C['layer1']} !important; }}
 a {{ color: {C['accent']}; text-decoration: none; }}
 ul, ol {{ margin: 6px 0 8px 18px; }}
@@ -615,6 +618,37 @@ def _probe_download_requirements():
             out["requests_text"] = "无法检查 requests（未找到可用 Python）"
     except Exception:
         out["requests_text"] = "无法检查 requests（按本机 Python 扫描；首次启动时会尝试自动补最新版 requests / simplejson）"
+    return out
+
+
+_FENCED_CODE_RE = re.compile(
+    r"(?P<fence>^`{3,})[ \t]*(?P<lang>[^\n`]*)\n(?P<code>.*?)(?:\n(?P=fence)[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _split_markdown_fenced_blocks(text: str):
+    raw = str(text or "")
+    if not raw:
+        return [{"type": "text", "content": ""}]
+    out = []
+    pos = 0
+    for match in _FENCED_CODE_RE.finditer(raw):
+        start, end = match.span()
+        if start > pos:
+            out.append({"type": "text", "content": raw[pos:start]})
+        lang = str(match.group("lang") or "").strip()
+        if lang:
+            lang = lang.split()[0].strip().strip("{}").lstrip(".")
+        code = str(match.group("code") or "")
+        if code.endswith("\n"):
+            code = code[:-1]
+        out.append({"type": "code", "lang": lang, "content": code})
+        pos = end
+    if pos < len(raw):
+        out.append({"type": "text", "content": raw[pos:]})
+    if not out:
+        out.append({"type": "text", "content": raw})
     return out
 
 
@@ -1446,6 +1480,123 @@ class InputTextEdit(QTextEdit):
         super().dropEvent(event)
 
 
+class MarkdownCodeBlock(QFrame):
+    def __init__(self, code: str, lang: str = "", parent=None):
+        super().__init__(parent)
+        self._code = str(code or "")
+        self._lang = str(lang or "").strip()
+        self.setObjectName("mdCodeBlock")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self.setFrameShape(QFrame.NoFrame)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        header = QWidget()
+        header.setObjectName("mdCodeHeader")
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(10, 6, 8, 6)
+        header_row.setSpacing(8)
+        lang_label = QLabel(self._lang or "code")
+        lang_label.setObjectName("mdCodeLang")
+        header_row.addWidget(lang_label, 0)
+        header_row.addStretch(1)
+        copy_btn = QPushButton("复制")
+        copy_btn.setObjectName("mdCodeCopyBtn")
+        copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        copy_btn.setFixedHeight(22)
+        copy_btn.clicked.connect(self._copy_code)
+        header_row.addWidget(copy_btn, 0)
+        self._copy_btn = copy_btn
+        layout.addWidget(header)
+
+        body = QTextEdit()
+        body.setObjectName("mdCodeBody")
+        body.setReadOnly(True)
+        body.setFrameShape(QFrame.NoFrame)
+        body.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        body.setLineWrapMode(QTextEdit.NoWrap)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        body.document().setDocumentMargin(0)
+        body.setPlainText(self._code)
+        self._body = body
+        layout.addWidget(body)
+        self.apply_theme()
+        self._fit_body_height()
+
+    def code_text(self) -> str:
+        return self._code
+
+    def language(self) -> str:
+        return self._lang
+
+    def _copy_code(self):
+        try:
+            QApplication.clipboard().setText(self._code)
+        except Exception:
+            return
+        btn = getattr(self, "_copy_btn", None)
+        if btn is None:
+            return
+        btn.setText("已复制")
+        QTimer.singleShot(1200, lambda: btn.setText("复制") if btn is not None else None)
+
+    def _fit_body_height(self):
+        body = getattr(self, "_body", None)
+        if body is None:
+            return
+        doc = body.document()
+        viewport_w = body.viewport().width()
+        width = viewport_w if viewport_w > 40 else max(240, self.width() - 24)
+        # Account for stylesheet padding so the first/last code lines are not clipped.
+        margins = body.contentsMargins()
+        pad_x = max(0, int(margins.left()) + int(margins.right()))
+        pad_y = max(0, int(margins.top()) + int(margins.bottom()))
+        if pad_y <= 0:
+            pad_y = 22
+        content_width = max(40, width - pad_x)
+        doc.setTextWidth(content_width)
+        height = max(28, int(math.ceil(doc.size().height())) + pad_y + 6)
+        body.setFixedHeight(height)
+
+    def apply_theme(self):
+        code_bg = str(C.get("code_bg") or C.get("field_alt") or C.get("layer2") or "#f5f2ed")
+        code_fg = str(C.get("code_text") or C.get("text") or "#2d3440")
+        stroke = str(C.get("stroke_default") or C.get("border") or "rgba(0,0,0,0.08)")
+        header_bg = str(C.get("layer2") or code_bg)
+        soft = str(C.get("text_soft") or code_fg)
+        mono = str(F.get("font_family_mono") or "monospace")
+        radius = max(8, int(F.get("radius_md") or 8))
+        self.setStyleSheet(
+            f"QFrame#mdCodeBlock {{ background: {code_bg}; border: 1px solid {stroke}; border-radius: {radius}px; }}"
+            f"QWidget#mdCodeHeader {{ background: {header_bg}; border-top-left-radius: {radius}px; "
+            f"border-top-right-radius: {radius}px; border-bottom: 1px solid {stroke}; }}"
+            f"QLabel#mdCodeLang {{ color: {soft}; background: transparent; font-size: 11px; font-weight: 600; }}"
+            f"QPushButton#mdCodeCopyBtn {{ background: transparent; color: {soft}; border: 1px solid {stroke}; "
+            f"border-radius: 6px; padding: 0 8px; font-size: 11px; }}"
+            f"QPushButton#mdCodeCopyBtn:hover {{ color: {C.get('text') or code_fg}; border-color: {C.get('accent') or stroke}; }}"
+            f"QTextEdit#mdCodeBody {{ background: {code_bg}; color: {code_fg}; border: none; "
+            f"border-bottom-left-radius: {radius}px; border-bottom-right-radius: {radius}px; "
+            f"padding: 10px 12px 12px 12px; font-family: {mono}; font-size: 12px; }}"
+        )
+        body = getattr(self, "_body", None)
+        if body is not None:
+            body.setStyleSheet(
+                f"QTextEdit#mdCodeBody {{ background: {code_bg}; color: {code_fg}; border: none; "
+                f"padding: 10px 12px 12px 12px; font-family: {mono}; font-size: 12px; }}"
+            )
+            try:
+                body.viewport().setStyleSheet(f"background: {code_bg};")
+            except Exception:
+                pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_body_height()
+
+
 class TurnFold(QFrame):
     def __init__(self, title: str, text: str, parent=None):
         super().__init__(parent)
@@ -1649,6 +1800,15 @@ class MessageRow(QWidget):
                     selected = str(cursor.selectedText() or "").replace("\u2029", "\n").strip()
                     if selected:
                         break
+            if not selected:
+                for edit in self.findChildren(QTextEdit):
+                    if str(getattr(edit, "objectName", lambda: "")() or "") != "mdCodeBody":
+                        continue
+                    cursor = edit.textCursor()
+                    if cursor is not None and cursor.hasSelection():
+                        selected = str(cursor.selectedText() or "").replace("\u2029", "\n").strip()
+                        if selected:
+                            break
             QApplication.clipboard().setText(selected or (self._text or ""))
         except Exception:
             pass
@@ -1721,6 +1881,10 @@ class MessageRow(QWidget):
             for browser in self.findChildren(QTextBrowser):
                 browser.setProperty("_fitForce", True)
                 _fit_browser_height(browser)
+            for block in self.findChildren(MarkdownCodeBlock):
+                fitter = getattr(block, "_fit_body_height", None)
+                if callable(fitter):
+                    fitter()
 
     def _clear_assistant_widgets(self):
         if self._content_layout is None:
@@ -1752,6 +1916,14 @@ class MessageRow(QWidget):
             return
         for browser in self._iter_active_assistant_browsers():
             _refit_browser_for_state(browser, streaming=False)
+        if self._content_layout is not None:
+            for idx in range(self._content_layout.count()):
+                item = self._content_layout.itemAt(idx)
+                widget = item.widget() if item is not None else None
+                if isinstance(widget, MarkdownCodeBlock):
+                    fitter = getattr(widget, "_fit_body_height", None)
+                    if callable(fitter):
+                        fitter()
         host = getattr(self, "_assistant_host", None)
         if host is not None:
             host.adjustSize()
@@ -1768,6 +1940,38 @@ class MessageRow(QWidget):
         if self._role == "user" or self._content_layout is None or not self._finished:
             return
         QTimer.singleShot(0, self._refit_finished_assistant_browsers)
+
+    def _make_code_block(self, code: str, lang: str = "") -> MarkdownCodeBlock:
+        return MarkdownCodeBlock(code, lang=lang, parent=self)
+
+    def _append_markdown_content(self, markdown_text: str, *, streaming: bool = False):
+        if self._content_layout is None:
+            return None
+        text = str(markdown_text or "")
+        if streaming:
+            browser = self._make_browser(text, streaming=True)
+            self._content_layout.addWidget(browser)
+            return browser
+        parts = _split_markdown_fenced_blocks(text)
+        has_code = any(str(part.get("type") or "") == "code" for part in parts)
+        if not has_code:
+            browser = self._make_browser(text, streaming=False)
+            self._content_layout.addWidget(browser)
+            return browser
+        last_browser = None
+        for part in parts:
+            kind = str(part.get("type") or "text")
+            content = str(part.get("content") or "")
+            if kind == "code":
+                block = self._make_code_block(content, str(part.get("lang") or ""))
+                self._content_layout.addWidget(block)
+                continue
+            if not content.strip():
+                continue
+            browser = self._make_browser(content, streaming=False)
+            self._content_layout.addWidget(browser)
+            last_browser = browser
+        return last_browser
 
     def _make_browser(self, markdown_text: str, *, streaming: bool = False) -> QTextBrowser:
         browser = QTextBrowser()
@@ -1835,12 +2039,21 @@ class MessageRow(QWidget):
         segments = lz.fold_turns(self._text)
         if not segments:
             segments = [{"type": "text", "content": self._text or "…"}]
+        strip_markers = getattr(lz, "_strip_protocol_info_markers", None)
+        if not callable(strip_markers):
+            strip_markers = lambda value: str(value or "")
+
+        def seg_content(seg, *, strip_protocol: bool = True):
+            raw = str((seg or {}).get("content") or "")
+            if not strip_protocol:
+                return raw
+            return strip_markers(raw)
 
         def seg_sig(seg):
             return (
                 str(seg.get("type") or "text"),
                 str(seg.get("title") or ""),
-                str(seg.get("content") or ""),
+                seg_content(seg, strip_protocol=True),
             )
 
         if not self._finished:
@@ -1848,7 +2061,7 @@ class MessageRow(QWidget):
             last_type = str(last.get("type") or "text")
             if last_type == "text":
                 prefix_segments = segments[:-1]
-                live_content = last.get("content") or ""
+                live_content = seg_content(last, strip_protocol=True)
             else:
                 prefix_segments = segments
                 live_content = ""
@@ -1877,16 +2090,14 @@ class MessageRow(QWidget):
                     browser.deleteLater()
                 self._stream_live_browser = None
                 for seg in prefix_segments[len(old_sig):]:
-                    content = seg.get("content") or ""
+                    content = seg_content(seg, strip_protocol=True)
                     if seg.get("type") == "fold":
                         fold = TurnFold(seg.get("title") or "处理中", content, self)
                         self._content_layout.addWidget(fold)
                     else:
-                        br = self._make_browser(content)
-                        self._content_layout.addWidget(br)
+                        self._append_markdown_content(content, streaming=False)
                 shown = (live_content.rstrip() + " ▌") if live_content.strip() else "…"
-                new_live = self._make_browser(shown, streaming=True)
-                self._content_layout.addWidget(new_live)
+                new_live = self._append_markdown_content(shown, streaming=True)
                 self._stream_live_browser = new_live
                 self._stream_prefix_signature = prefix_signature
                 return
@@ -1894,18 +2105,18 @@ class MessageRow(QWidget):
         self._clear_assistant_widgets()
 
         for idx, seg in enumerate(segments):
-            content = seg.get("content") or ""
+            content = seg_content(seg, strip_protocol=True)
             is_last = idx == len(segments) - 1
             if seg.get("type") == "fold":
                 fold = TurnFold(seg.get("title") or "处理中", content, self)
                 self._content_layout.addWidget(fold)
                 continue
             shown = content
-            if not self._finished and is_last:
+            streaming = (not self._finished) and is_last
+            if streaming:
                 shown = (shown.rstrip() + " ▌") if shown.strip() else "…"
-            browser = self._make_browser(shown, streaming=(not self._finished and is_last))
-            self._content_layout.addWidget(browser)
-            if not self._finished and is_last:
+            browser = self._append_markdown_content(shown, streaming=streaming)
+            if streaming:
                 self._stream_live_browser = browser
 
         if not self._finished:
@@ -1936,7 +2147,59 @@ def refresh_message_row_avatars(root: QWidget | None) -> None:
             pass
 
 
+class ChatErrorRow(QWidget):
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self._text = str(text or "").strip()
+        self._detail = self._text
+        self._role = "error"
+        self._finished = True
+        self.setObjectName("chatErrorRow")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(20, 6, 20, 6)
+        outer.setSpacing(8)
+        mark = QLabel("错误")
+        mark.setObjectName("chatErrorMark")
+        mark.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        outer.addWidget(mark, 0)
+        label = QLabel(self._text)
+        label.setObjectName("chatErrorText")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        label.setToolTip(self._detail)
+        self._label = label
+        outer.addWidget(label, 1)
+
+    def set_text(self, text: str):
+        self._text = str(text or "").strip()
+        if not self._detail:
+            self._detail = self._text
+        if self._label is not None:
+            self._label.setText(self._text)
+            self._label.setToolTip(self._detail or self._text)
+
+    def set_detail(self, detail: str):
+        self._detail = str(detail or "").strip() or self._text
+        if self._label is not None:
+            self._label.setToolTip(self._detail)
+
+    def set_finished(self, finished: bool = True):
+        self._finished = bool(finished)
+
+    def update_content(self, text: str, finished: bool = True):
+        self.set_text(text)
+        self.set_finished(finished)
+
+    def refresh_avatar(self):
+        return None
+
+
 def build_message_row(text: str, role: str, parent=None, *, on_resend=None, avatar_cfg: dict | None = None, row_cls=None):
+    role_key = str(role or "").strip().lower()
+    if role_key == "error":
+        return ChatErrorRow(text, parent)
     cls = row_cls or MessageRow
     try:
         return cls(text, role, parent, on_resend=on_resend, avatar_cfg=avatar_cfg)

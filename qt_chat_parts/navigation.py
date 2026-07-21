@@ -452,7 +452,20 @@ class NavigationMixin:
             self.cfg["agent_dir"] = self.agent_dir
             lz.save_config(self.cfg)
         self._refresh_welcome_state()
-        in_settings = bool(getattr(self, "pages", None) is not None and self.pages.currentWidget() is getattr(self, "_settings_page", None))
+        in_settings = False
+        try:
+            stack = getattr(self, "app_content_stack", None)
+            pages = getattr(self, "pages", None)
+            settings_page = getattr(self, "_settings_page", None)
+            workspace = getattr(self, "_app_workspace", None)
+            if stack is not None and settings_page is not None and stack.currentWidget() is settings_page:
+                in_settings = True
+            elif pages is not None and settings_page is not None and pages.currentWidget() is settings_page:
+                in_settings = True
+            elif pages is not None and workspace is not None and pages.currentWidget() is workspace:
+                in_settings = str(getattr(self, "_main_nav_mode", "") or "") == "settings"
+        except Exception:
+            in_settings = False
         if in_settings:
             self._settings_reload(categories=[getattr(self, "_current_settings_category", "api")], force=True)
         else:
@@ -592,10 +605,34 @@ class NavigationMixin:
 
     def _show_settings(self):
         self.setWindowTitle("GenericAgent 启动器")
+        first_build = not bool(getattr(self, "_settings_page_built", False))
         ensure = getattr(self, "_ensure_settings_page_built", None)
         if callable(ensure):
             ensure()
-        self.pages.setCurrentWidget(self._settings_page)
+        workspace = getattr(self, "_app_workspace", None)
+        stack = getattr(self, "app_content_stack", None)
+        if workspace is not None and self.pages is not None:
+            try:
+                if self.pages.currentWidget() is not workspace:
+                    self.pages.setCurrentWidget(workspace)
+            except Exception:
+                self.pages.setCurrentWidget(workspace)
+        setter = getattr(self, "_set_main_nav", None)
+        if callable(setter):
+            try:
+                # switch_stack=True once here; avoid double stack swaps.
+                setter("settings", switch_stack=True)
+            except TypeError:
+                try:
+                    setter("settings")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        elif stack is not None and getattr(self, "_settings_page", None) is not None:
+            stack.setCurrentWidget(self._settings_page)
+        elif self.pages is not None and getattr(self, "_settings_page", None) is not None:
+            self.pages.setCurrentWidget(self._settings_page)
         valid = lz.is_valid_agent_dir(self.agent_dir)
         if self._settings_top_back_btn is not None:
             self._settings_top_back_btn.setText("返回聊天" if valid else "返回首页")
@@ -604,22 +641,55 @@ class NavigationMixin:
             except Exception:
                 pass
             self._settings_top_back_btn.clicked.connect(self._show_chat_page if valid else self._show_welcome)
-        self._refresh_welcome_state()
+
+        loaded = set(getattr(self, "_settings_loaded_categories", set()) or set())
+        category = str(getattr(self, "_current_settings_category", "api") or "api").strip() or "api"
+        need_reload = first_build or (category not in loaded)
 
         def _reload_after_switch():
-            self._settings_reload(categories=[getattr(self, "_current_settings_category", "api")], force=True)
+            # Prefer paint-first: only force rebuild when page is new / category uncached.
+            self._settings_reload(categories=[category], force=bool(first_build))
 
-        try:
-            QTimer.singleShot(0, self, _reload_after_switch)
-        except Exception:
+        if need_reload:
             try:
-                QTimer.singleShot(0, _reload_after_switch)
+                QTimer.singleShot(0, self, _reload_after_switch)
             except Exception:
-                _reload_after_switch()
+                try:
+                    QTimer.singleShot(0, _reload_after_switch)
+                except Exception:
+                    _reload_after_switch()
 
     def _show_chat_page(self):
         self.setWindowTitle("GenericAgent 启动器")
-        self.pages.setCurrentWidget(self._chat_page)
+        workspace = getattr(self, "_app_workspace", None)
+        stack = getattr(self, "app_content_stack", None)
+        if workspace is not None and self.pages is not None:
+            try:
+                if self.pages.currentWidget() is not workspace:
+                    self.pages.setCurrentWidget(workspace)
+            except Exception:
+                self.pages.setCurrentWidget(workspace)
+        setter = getattr(self, "_set_main_nav", None)
+        if callable(setter):
+            try:
+                setter("chat", switch_stack=True)
+            except TypeError:
+                try:
+                    setter("chat")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        elif stack is not None and getattr(self, "_chat_page", None) is not None:
+            stack.setCurrentWidget(self._chat_page)
+        elif self.pages is not None and getattr(self, "_chat_page", None) is not None:
+            self.pages.setCurrentWidget(self._chat_page)
+        pauser = getattr(self, "_pause_conductor_status_timer", None)
+        if callable(pauser):
+            try:
+                pauser()
+            except Exception:
+                pass
 
     def _save_settings_and_enter_chat(self):
         self._enter_chat()

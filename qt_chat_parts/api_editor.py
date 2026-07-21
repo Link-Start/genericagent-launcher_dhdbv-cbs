@@ -42,7 +42,7 @@ _API_ADVANCED_FIELD_META = {
     "reasoning_effort": {
         "label": "reasoning_effort",
         "kind": "choice",
-        "choices": ["minimal", "low", "medium", "high", "xhigh"],
+        "choices": ["minimal", "low", "medium", "high", "xhigh", "max"],
     },
     "temperature": {
         "label": "temperature",
@@ -145,6 +145,24 @@ class ApiEditorMixin:
         callback = fn if callable(fn) else (lambda: None)
         owner = self
         app = QApplication.instance()
+        # After quit, the event dispatcher may already be gone; posting timers then logs:
+        # "QObject::startTimer: current thread's event dispatcher has already been destroyed"
+        if app is None:
+            return
+        try:
+            if bool(getattr(app, "closingDown", lambda: False)()):
+                return
+        except Exception:
+            pass
+        try:
+            from PySide6.QtCore import QAbstractEventDispatcher
+
+            if QAbstractEventDispatcher.instance(app.thread()) is None:
+                return
+        except Exception:
+            pass
+        if self._launcher_is_closing():
+            return
 
         def run():
             if not self._qt_object_alive(owner):
@@ -162,9 +180,10 @@ class ApiEditorMixin:
         try:
             if self._qt_object_alive(app):
                 QTimer.singleShot(0, app, run)
-            else:
-                QTimer.singleShot(0, run)
+            # Do not fall back to QTimer.singleShot(0, run) from worker threads after quit.
         except RuntimeError:
+            pass
+        except Exception:
             pass
 
     def _api_combo_style(self):

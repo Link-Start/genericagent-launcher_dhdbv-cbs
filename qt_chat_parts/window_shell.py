@@ -264,16 +264,160 @@ class WindowShellMixin:
         self._download_page = self._build_lazy_page_placeholder("下载页准备中…")
         self._official_gui_page = self._build_official_gui_page()
         self._chat_page = self._build_ui()
+        self._conductor_page = self._build_lazy_page_placeholder("Conductor 页准备中…")
         self._settings_page = self._build_lazy_page_placeholder("设置页准备中…")
+        self._app_workspace = self._build_app_workspace()
         self.pages.addWidget(self._welcome_page)
         self.pages.addWidget(self._locate_page)
         self.pages.addWidget(self._download_page)
         self.pages.addWidget(self._official_gui_page)
-        self.pages.addWidget(self._chat_page)
-        self.pages.addWidget(self._settings_page)
+        self.pages.addWidget(self._app_workspace)
         if lz.is_valid_agent_dir(self.agent_dir):
             self._refresh_sessions()
         self._reset_chat_area("选择一个会话，或新建会话开始聊天。")
+        self._set_main_nav("chat")
+
+    def _build_app_workspace(self) -> QWidget:
+        root = QWidget()
+        root.setObjectName("appWorkspace")
+        row = QHBoxLayout(root)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+
+        rail = QFrame()
+        rail.setObjectName("mainNavRail")
+        rail.setFixedWidth(64)
+        rail_col = QVBoxLayout(rail)
+        rail_col.setContentsMargins(8, 14, 8, 14)
+        rail_col.setSpacing(10)
+
+        # Primary destinations: chat sessions / conductor / settings.
+        self._main_nav_buttons = {}
+        self._main_nav_icon_state = {}
+        self._main_nav_svg_map = {
+            "chat": chat_common._SVG_MESSAGE,
+            "conductor": chat_common._SVG_PUZZLE,
+            "settings": chat_common._SVG_SETTINGS,
+        }
+        for key, tip in (
+            ("chat", "会话"),
+            ("conductor", "Conductor"),
+            ("settings", "设置"),
+        ):
+            btn = QPushButton()
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedSize(48, 48)
+            btn.setToolTip(tip)
+            btn.setProperty("navKey", key)
+            btn.clicked.connect(lambda _=False, k=key: self._on_main_nav_clicked(k))
+            chat_common.set_button_svg_icon(
+                btn, f"main_nav_{key}", self._main_nav_svg_map[key], color="text_soft", size=18
+            )
+            rail_col.addWidget(btn, 0, Qt.AlignHCenter)
+            self._main_nav_buttons[key] = btn
+            self._main_nav_icon_state[key] = ("text_soft", False)
+
+        rail_col.addStretch(1)
+        self.main_nav_rail = rail
+        row.addWidget(rail, 0)
+
+        self.app_content_stack = QStackedWidget()
+        self.app_content_stack.setObjectName("appContentStack")
+        self.app_content_stack.addWidget(self._chat_page)
+        self.app_content_stack.addWidget(self._conductor_page)
+        self.app_content_stack.addWidget(self._settings_page)
+        row.addWidget(self.app_content_stack, 1)
+        self._main_nav_mode = "chat"
+        return root
+
+    def _on_main_nav_clicked(self, key: str):
+        mode = str(key or "").strip().lower()
+        if mode == str(getattr(self, "_main_nav_mode", "") or "").strip().lower():
+            # Already on this surface; avoid rebuild / forced reload jank.
+            workspace = getattr(self, "_app_workspace", None)
+            if workspace is not None and getattr(self, "pages", None) is not None:
+                try:
+                    if self.pages.currentWidget() is not workspace:
+                        self.pages.setCurrentWidget(workspace)
+                except Exception:
+                    pass
+            return
+        if mode == "settings":
+            self._show_settings()
+            return
+        if mode == "conductor":
+            shower = getattr(self, "_show_conductor_page", None)
+            if callable(shower):
+                shower()
+            return
+        self._show_chat_page()
+
+    def _main_nav_page_for(self, key: str):
+        mode = str(key or "chat").strip().lower()
+        if mode == "settings":
+            return getattr(self, "_settings_page", None)
+        if mode == "conductor":
+            return getattr(self, "_conductor_page", None)
+        return getattr(self, "_chat_page", None)
+
+    def _set_main_nav(self, mode: str, *, switch_stack: bool = True):
+        key = str(mode or "chat").strip().lower()
+        if key not in ("chat", "conductor", "settings"):
+            key = "chat"
+        prev = str(getattr(self, "_main_nav_mode", "") or "")
+        self._main_nav_mode = key
+        if key != "conductor":
+            pauser = getattr(self, "_pause_conductor_status_timer", None)
+            if callable(pauser):
+                try:
+                    pauser()
+                except Exception:
+                    pass
+        buttons = getattr(self, "_main_nav_buttons", None) or {}
+        icon_state = getattr(self, "_main_nav_icon_state", None)
+        if not isinstance(icon_state, dict):
+            icon_state = {}
+            self._main_nav_icon_state = icon_state
+        svg_map = getattr(self, "_main_nav_svg_map", None) or {
+            "chat": chat_common._SVG_MESSAGE,
+            "conductor": chat_common._SVG_PUZZLE,
+            "settings": chat_common._SVG_SETTINGS,
+        }
+        for nav_key, btn in buttons.items():
+            selected = str(nav_key) == key
+            try:
+                btn.setStyleSheet(self._sidebar_button_style(selected=selected))
+            except Exception:
+                pass
+            svg = svg_map.get(nav_key) or chat_common._SVG_MESSAGE
+            color = "text" if selected else "text_soft"
+            prev_color, prev_selected = icon_state.get(nav_key, (None, None))
+            if prev_color != color or prev_selected != selected:
+                try:
+                    chat_common.set_button_svg_icon(btn, f"main_nav_{nav_key}", svg, color=color, size=18)
+                except Exception:
+                    pass
+                icon_state[nav_key] = (color, selected)
+        if not switch_stack:
+            return
+        stack = getattr(self, "app_content_stack", None)
+        if stack is None:
+            return
+        target = self._main_nav_page_for(key)
+        if target is None:
+            return
+        try:
+            if stack.currentWidget() is target:
+                return
+        except Exception:
+            pass
+        stack.setCurrentWidget(target)
+        if prev != key:
+            # Let Qt paint the stack swap before any heavy follow-up work.
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
 
     def _build_lazy_page_placeholder(self, text: str) -> QWidget:
         page = QWidget()
@@ -313,13 +457,60 @@ class WindowShellMixin:
             self._download_page_built = True
         return page
 
-    def _ensure_settings_page_built(self):
-        if getattr(self, "_settings_page_built", False):
-            return getattr(self, "_settings_page", None)
-        page = self._replace_lazy_page("_settings_page", self._build_settings_page)
+    def _materialize_app_stack_page(self, attr_name: str, builder, *, built_flag: str, nav_key: str = ""):
+        if bool(getattr(self, built_flag, False)):
+            return getattr(self, attr_name, None)
+        stack = getattr(self, "app_content_stack", None)
+        if stack is None:
+            page = self._replace_lazy_page(attr_name, builder)
+        else:
+            current = getattr(self, attr_name, None)
+            index = stack.indexOf(current) if current is not None else -1
+            page = builder()
+            if index >= 0:
+                stack.removeWidget(current)
+                stack.insertWidget(index, page)
+                try:
+                    current.deleteLater()
+                except Exception:
+                    pass
+            else:
+                stack.addWidget(page)
+            setattr(self, attr_name, page)
         if page is not None:
-            self._settings_page_built = True
+            setattr(self, built_flag, True)
+            if nav_key and str(getattr(self, "_main_nav_mode", "") or "") == nav_key:
+                setter = getattr(self, "_set_main_nav", None)
+                if callable(setter):
+                    try:
+                        setter(nav_key, switch_stack=True)
+                    except TypeError:
+                        try:
+                            setter(nav_key)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         return page
+
+    def _ensure_settings_page_built(self):
+        return self._materialize_app_stack_page(
+            "_settings_page",
+            self._build_settings_page,
+            built_flag="_settings_page_built",
+            nav_key="settings",
+        )
+
+    def _ensure_conductor_page_built(self):
+        builder = getattr(self, "_build_conductor_page", None)
+        if not callable(builder):
+            return getattr(self, "_conductor_page", None)
+        return self._materialize_app_stack_page(
+            "_conductor_page",
+            builder,
+            built_flag="_conductor_page_built",
+            nav_key="conductor",
+        )
 
     def _panel_card(self) -> QFrame:
         card = QFrame()
@@ -587,6 +778,18 @@ class WindowShellMixin:
                         fit(browser)
             except Exception:
                 pass
+        code_block_cls = getattr(chat_common, "MarkdownCodeBlock", None)
+        if code_block_cls is not None:
+            for block in self.findChildren(code_block_cls):
+                try:
+                    applier = getattr(block, "apply_theme", None)
+                    if callable(applier):
+                        applier()
+                    fitter = getattr(block, "_fit_body_height", None)
+                    if callable(fitter):
+                        fitter()
+                except Exception:
+                    pass
 
     def _restyle_download_page_widgets(self):
         body_scroll = getattr(self, "download_body_scroll", None)

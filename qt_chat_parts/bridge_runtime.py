@@ -4,6 +4,7 @@ import json
 import os
 import posixpath
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -35,6 +36,7 @@ _RUNTIME_REASONING_EFFORT_CHOICES = [
     ("medium", "medium"),
     ("high", "high"),
     ("xhigh", "xhigh"),
+    ("max", "max"),
 ]
 _RUNTIME_REASONING_EFFORT_VALUES = {value for value, _label in _RUNTIME_REASONING_EFFORT_CHOICES if value}
 
@@ -185,6 +187,59 @@ class BridgeRuntimeMixin:
                     "aliases": ["/review", "/review "],
                 }
             )
+        if os.path.isfile(os.path.join(frontends_dir, "slash_cmds.py")):
+            out.extend(
+                [
+                    {
+                        "command": "/update [note]",
+                        "insert_text": "/update ",
+                        "description": "让主 agent 从官方上游同步 GenericAgent 并报告影响面",
+                        "aliases": ["/update", "/update "],
+                    },
+                    {
+                        "command": "/autorun [seed]",
+                        "insert_text": "/autorun ",
+                        "description": "进入 autonomous 自主探索模式",
+                        "aliases": ["/autorun", "/autorun "],
+                    },
+                    {
+                        "command": "/morphling [target]",
+                        "insert_text": "/morphling ",
+                        "description": "启用 Morphling 蒸馏/吞噬外部技能",
+                        "aliases": ["/morphling", "/morphling "],
+                    },
+                    {
+                        "command": "/goal [goal]",
+                        "insert_text": "/goal ",
+                        "description": "进入 Goal 模式（需 condition 约束）",
+                        "aliases": ["/goal", "/goal "],
+                    },
+                    {
+                        "command": "/hive [target]",
+                        "insert_text": "/hive ",
+                        "description": "进入 Hive 多 worker 协作模式",
+                        "aliases": ["/hive", "/hive "],
+                    },
+                    {
+                        "command": "/conductor [task]",
+                        "insert_text": "/conductor ",
+                        "description": "调用 frontends/conductor.py 做多 subagent 编排",
+                        "aliases": ["/conductor", "/conductor "],
+                    },
+                    {
+                        "command": "/scheduler",
+                        "insert_text": "/scheduler",
+                        "description": "列出/启停 reflect 与 frontend 后台服务",
+                        "aliases": ["/scheduler", "/scheduler "],
+                    },
+                    {
+                        "command": "/resume",
+                        "insert_text": "/resume",
+                        "description": "列出最近可恢复会话并请主 agent 帮你挑选",
+                        "aliases": ["/resume"],
+                    },
+                ]
+            )
         return out
 
     def _local_slash_command_items(self):
@@ -295,6 +350,22 @@ class BridgeRuntimeMixin:
             lines.append("/btw <q> - 临时插问主 agent 进展，不打断当前任务")
         if "/review [scope]" in commands:
             lines.append("/review [scope] - 让上游主 agent 在当前会话里直接做代码审查")
+        if "/update [note]" in commands:
+            lines.append("/update [note] - 从官方上游同步 GenericAgent 并报告影响面")
+        if "/autorun [seed]" in commands:
+            lines.append("/autorun [seed] - 进入 autonomous 自主探索模式")
+        if "/morphling [target]" in commands:
+            lines.append("/morphling [target] - 启用 Morphling 蒸馏/吞噬外部技能")
+        if "/goal [goal]" in commands:
+            lines.append("/goal [goal] - 进入 Goal 模式")
+        if "/hive [target]" in commands:
+            lines.append("/hive [target] - 进入 Hive 多 worker 协作模式")
+        if "/conductor [task]" in commands:
+            lines.append("/conductor [task] - 调用 conductor 做多 subagent 编排")
+        if "/scheduler" in commands:
+            lines.append("/scheduler - 列出后台服务；/scheduler start|stop <name> 启停")
+        if "/resume" in commands:
+            lines.append("/resume - 列出最近可恢复会话并请主 agent 帮你挑选")
         lines.append("/session.<attr>=<val> - 透传给上游 agant 执行运行时参数覆盖")
         return "\n".join(lines)
 
@@ -1843,6 +1914,7 @@ class BridgeRuntimeMixin:
                         "event": "remote_done",
                         "text": done_text,
                         "usage": ev.get("usage") if isinstance(ev.get("usage"), dict) else None,
+                        "error": str(ev.get("error") or "").strip(),
                     }
                     self._remote_emit_bridge_event(payload, session_id=session_id)
                     continue
@@ -2199,14 +2271,80 @@ class BridgeRuntimeMixin:
             return "[系统] 已按用户请求中断本轮生成。"
         return text + "\n\n[系统] 已按用户请求中断本轮生成。"
 
-    def _stream_done(self, final_text: str, provider_usage: dict | None = None):
+    def _stream_partial_text(self) -> str:
+        for candidate in (
+            getattr(self, "_pending_stream_text", None),
+            getattr(self, "_current_stream_text", None),
+            getattr(getattr(self, "_stream_row", None), "_text", None),
+        ):
+            text = str(candidate or "")
+            if text.strip():
+                return text
+        return ""
+
+    def _stream_done(self, final_text: str, provider_usage: dict | None = None, *, error_text: str = ""):
         was_aborted = bool(self._abort_requested)
         if self._abort_requested:
             final_text = self._format_interrupted_text(final_text)
+        strip_markers = getattr(lz, "_strip_protocol_info_markers", None)
+        if callable(strip_markers):
+            try:
+                final_text = strip_markers(final_text)
+            except Exception:
+                final_text = str(final_text or "")
+        # Pull llmcore "!!!Error: HTTP 401..." style failures out of body text.
+        extract_err = getattr(lz, "_extract_llm_stream_error", None)
+        stream_err = ""
+        if callable(extract_err):
+            try:
+                body_only, stream_err = extract_err(final_text)
+                final_text = body_only
+            except Exception:
+                stream_err = ""
+        raw_err = str(error_text or stream_err or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if (not raw_err) and stream_err:
+            raw_err = str(stream_err).strip()
+        normalize_err = getattr(self, "_normalize_chat_error_text", None)
+        err_text = normalize_err(raw_err) if callable(normalize_err) else " ".join(raw_err.split()).strip()
+        body_text = str(final_text or "")
+        # Pure turn-marker leftovers after error extraction should not stay as a bubble.
+        if err_text:
+            turn_only = re.sub(
+                r"\*?\*?LLM Running \(Turn \d+\) \.\.\.\*?\*?",
+                "",
+                body_text,
+                flags=re.IGNORECASE,
+            ).strip()
+            if not turn_only:
+                body_text = ""
+                final_text = ""
+        if err_text and (not body_text.strip()):
+            # Keep partial non-error stream if any; otherwise no assistant bubble.
+            partial = self._stream_partial_text()
+            if callable(extract_err):
+                try:
+                    partial, _ = extract_err(partial)
+                except Exception:
+                    pass
+            partial = re.sub(
+                r"\*?\*?LLM Running \(Turn \d+\) \.\.\.\*?\*?",
+                "",
+                str(partial or ""),
+                flags=re.IGNORECASE,
+            ).strip()
+            if partial:
+                body_text = partial
+                final_text = partial
         self._suppress_next_done_after_abort = False
         finished_row = self._stream_row
         if finished_row is not None:
-            finished_row.update_content(final_text or "…", finished=True)
+            if body_text.strip() or (not err_text):
+                finished_row.update_content(body_text or "…", finished=True)
+            else:
+                discard_stream = getattr(self, "_discard_stream_row", None)
+                if callable(discard_stream):
+                    discard_stream(finished_row)
+                finished_row = None
         self._stream_row = None
         self._busy = False
         self._abort_requested = False
@@ -2215,16 +2353,16 @@ class BridgeRuntimeMixin:
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._last_task_complete_status_at = float(time.time())
-        self._set_status("已完成。")
+        self._set_status(f"错误: {err_text}" if err_text else "已完成。")
         self._refresh_composer_enabled()
         self._clear_active_turn_attachments()
         anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
         if callable(anchor_clearer):
             anchor_clearer()
-        if not was_aborted:
+        if (not was_aborted) and (not err_text):
             self._notify_reply_done(final_text)
 
-        if self.current_session is not None:
+        if self.current_session is not None and (body_text.strip() or (not err_text)):
             self.current_session.setdefault("bubbles", []).append({"role": "assistant", "text": final_text})
             usage = self.current_session.get("token_usage") or {}
             events = usage.get("events") or []
@@ -2265,7 +2403,7 @@ class BridgeRuntimeMixin:
             usage["events"] = events
             usage["last_model"] = target.get("model") or ""
             self.current_session["token_usage"] = usage
-            if finished_row is not None:
+            if finished_row is not None and hasattr(finished_row, "set_token_info"):
                 finished_row.set_token_info(
                     int(target.get("input_tokens", 0) or 0),
                     int(target.get("output_tokens", 0) or 0),
@@ -2275,6 +2413,15 @@ class BridgeRuntimeMixin:
             self._persist_session(self.current_session)
             if not self._is_remote_session(self.current_session):
                 self._request_backend_state(self.current_session.get("id"))
+        elif self.current_session is not None:
+            self._active_token_event_ts = None
+            self._persist_session(self.current_session)
+            if not self._is_remote_session(self.current_session):
+                self._request_backend_state(self.current_session.get("id"))
+        if raw_err:
+            adder = getattr(self, "_append_chat_error_line", None)
+            if callable(adder):
+                adder(raw_err, persist=True, auto_scroll=True)
         self._refresh_token_label()
         turn_auto_jump = self._turn_auto_jump_latest_enabled()
         follower = getattr(self, "_set_follow_latest_user", None)
@@ -2384,7 +2531,11 @@ class BridgeRuntimeMixin:
             if target_sid and current_sid and target_sid != current_sid:
                 return
             provider_usage = ev.get("usage") if isinstance(ev.get("usage"), dict) else None
-            self._stream_done(ev.get("text", ""), provider_usage=provider_usage)
+            self._stream_done(
+                ev.get("text", ""),
+                provider_usage=provider_usage,
+                error_text=str(ev.get("error") or "").strip(),
+            )
             return
         if et == "remote_next":
             target_sid = str(ev.get("session_id") or "").strip()
@@ -2423,33 +2574,27 @@ class BridgeRuntimeMixin:
             if target_sid and current_sid and target_sid != current_sid:
                 return
             msg = str(ev.get("msg") or "远程执行失败。").strip() or "远程执行失败。"
-            self._clear_active_turn_attachments()
-            discard_stream = getattr(self, "_discard_stream_row", None)
-            if callable(discard_stream):
-                discard_stream(self._stream_row)
-            else:
-                self._stream_row = None
-            self._busy = False
-            self._abort_requested = False
-            self._current_stream_text = ""
-            self._pending_stream_text = None
-            self._active_token_event_ts = None
-            self._set_turn_auto_jump_latest(False)
-            follower = getattr(self, "_set_follow_latest_user", None)
-            if callable(follower):
-                follower(False)
-            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
-            if callable(anchor_clearer):
-                anchor_clearer()
-            self.send_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self._set_status(msg)
+            inline = bool(ev.get("inline"))
+            if bool(getattr(self, "_busy", False)) or getattr(self, "_stream_row", None) is not None:
+                self._stream_done(self._stream_partial_text(), provider_usage=None, error_text=msg)
+                return
+            adder = getattr(self, "_append_chat_error_line", None)
+            if callable(adder):
+                adder(msg, persist=True, auto_scroll=True)
+            normalize_err = getattr(self, "_normalize_chat_error_text", None)
+            status_msg = normalize_err(msg) if callable(normalize_err) else msg
+            self._set_status(status_msg)
             self._refresh_composer_enabled()
-            self._refresh_token_label()
             refresher = getattr(self, "_refresh_floating_chat_window", None)
             if callable(refresher):
                 refresher()
-            QMessageBox.warning(self, "远程聊天失败", msg)
+            if (not inline) and str(ev.get("trace") or "").strip():
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("远程聊天失败")
+                box.setText(status_msg or msg)
+                box.setDetailedText(str(ev.get("trace") or msg))
+                box.exec()
             return
         if et == "launcher_autonomous_trigger":
             if not self._busy:
@@ -2492,7 +2637,11 @@ class BridgeRuntimeMixin:
             if (not bool(getattr(self, "_busy", False))) and getattr(self, "_stream_row", None) is None:
                 return
             provider_usage = ev.get("usage") if isinstance(ev.get("usage"), dict) else None
-            self._stream_done(ev.get("text", ""), provider_usage=provider_usage)
+            self._stream_done(
+                ev.get("text", ""),
+                provider_usage=provider_usage,
+                error_text=str(ev.get("error") or "").strip(),
+            )
             return
         if et == "aborted":
             if bool(getattr(self, "_busy", False)) and bool(getattr(self, "_abort_requested", False)):
@@ -2565,40 +2714,34 @@ class BridgeRuntimeMixin:
             self._set_status("已启动桌面宠物。")
             return
         if et == "error":
-            msg = ev.get("msg", "")
-            trace = ev.get("trace", "")
-            self._clear_active_turn_attachments()
-            discard_stream = getattr(self, "_discard_stream_row", None)
-            if callable(discard_stream):
-                discard_stream(self._stream_row)
-            else:
-                self._stream_row = None
-            self._busy = False
-            self._abort_requested = False
-            self._current_stream_text = ""
-            self._pending_stream_text = None
-            self._active_token_event_ts = None
-            self._set_turn_auto_jump_latest(False)
-            follower = getattr(self, "_set_follow_latest_user", None)
-            if callable(follower):
-                follower(False)
-            anchor_clearer = getattr(self, "_clear_current_turn_user_row", None)
-            if callable(anchor_clearer):
-                anchor_clearer()
-            self.send_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self._set_status(f"错误: {msg}")
+            msg = str(ev.get("msg") or "").strip() or "未知错误"
+            trace = str(ev.get("trace") or "").strip()
+            inline = bool(ev.get("inline")) or (not trace)
+            if bool(getattr(self, "_busy", False)) or getattr(self, "_stream_row", None) is not None:
+                self._stream_done(self._stream_partial_text(), provider_usage=None, error_text=msg)
+                if trace and (not inline):
+                    box = QMessageBox(self)
+                    box.setIcon(QMessageBox.Warning)
+                    box.setWindowTitle("桥接错误")
+                    box.setText(msg)
+                    box.setDetailedText(trace)
+                    box.exec()
+                return
+            adder = getattr(self, "_append_chat_error_line", None)
+            if callable(adder):
+                adder(msg, persist=True, auto_scroll=True)
+            normalize_err = getattr(self, "_normalize_chat_error_text", None)
+            status_msg = normalize_err(msg) if callable(normalize_err) else msg
+            self._set_status(f"错误: {status_msg}")
             self._refresh_composer_enabled()
             self._refresh_token_label()
             refresher = getattr(self, "_refresh_floating_chat_window", None)
             if callable(refresher):
                 refresher()
-            if trace:
+            if trace and (not inline):
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Warning)
                 box.setWindowTitle("桥接错误")
-                box.setText(msg or "未知错误")
-                box.setDetailedText(str(trace))
+                box.setText(status_msg or msg)
+                box.setDetailedText(trace)
                 box.exec()
-            else:
-                QMessageBox.warning(self, "桥接错误", msg or "未知错误")

@@ -425,6 +425,18 @@ class LauncherCoreBehaviorTests(unittest.TestCase):
         css = common._build_md_css()
         self.assertIn(f"font-family: {launcher_theme.F['font_family']};", css)
         self.assertIn(f"font-family: {launcher_theme.F['font_family_mono']};", css)
+        self.assertIn("pre {", css)
+        self.assertIn("background-color:", css)
+
+    def test_split_markdown_fenced_blocks_extracts_copyable_code_parts(self):
+        fence = chr(96) * 3
+        text = f"intro\n\n{fence}python\nprint(1)\nprint(2)\n{fence}\n\noutro"
+        parts = common._split_markdown_fenced_blocks(text)
+        self.assertEqual([part.get("type") for part in parts], ["text", "code", "text"])
+        self.assertEqual(parts[1].get("lang"), "python")
+        self.assertEqual(parts[1].get("content"), "print(1)\nprint(2)")
+        self.assertIn("intro", parts[0].get("content") or "")
+        self.assertIn("outro", parts[2].get("content") or "")
 
     def test_theme_font_settings_use_platform_preferred_family_helper(self):
         root = os.path.dirname(os.path.dirname(__file__))
@@ -4708,6 +4720,66 @@ tg_bot_token = '123'
         wrapped = "**LLM Running (Turn 3) ...**\nbody"
         self.assertEqual(lz._turn_marker_title(wrapped), "LLM Running (Turn 3) ...")
         self.assertEqual(lz._strip_turn_marker(wrapped), "body")
+
+        fence = chr(96) * 5
+        with_marker = f"answer body\n\n{fence}\n[Info] Final response to user.\n{fence}\n"
+        cleaned = lz._strip_protocol_info_markers(with_marker)
+        self.assertEqual(cleaned, "answer body")
+        self.assertNotIn("Final response to user", cleaned)
+        self.assertNotIn("[Info]", lz._assistant_visible_markup(with_marker))
+
+        code_fence = chr(96) * 3
+        code_text = f"intro\n\n{code_fence}python\nprint(1)\nprint(2)\n{code_fence}\n\noutro"
+        kept = lz._strip_protocol_info_markers(code_text)
+        self.assertIn(f"{code_fence}python", kept)
+        self.assertIn("print(1)", kept)
+        self.assertIn(f"{code_fence}", kept)
+        parts = common._split_markdown_fenced_blocks(kept)
+        self.assertEqual([part.get("type") for part in parts], ["text", "code", "text"])
+        self.assertEqual(parts[1].get("content"), "print(1)\nprint(2)")
+
+        api_err = (
+            "**LLM Running (Turn 1) ...**\n\n"
+            '!!!Error: HTTP 401: {"error":{"code":"invalid_api_key","message":"Invalid API Key"}}'
+        )
+        body, err = lz._extract_llm_stream_error(api_err)
+        self.assertEqual(body, "")
+        self.assertIn("HTTP 401", err)
+        self.assertIn("invalid_api_key", err)
+        body2, err2 = lz._extract_llm_stream_error("正常回复，没有错误")
+        self.assertEqual(body2, "正常回复，没有错误")
+        self.assertEqual(err2, "")
+
+        body3, err3 = lz._extract_llm_stream_error(
+            "**LLM Running (Turn 1) ...**\n\n[!!! 流异常中断，未收到完整响应 !!!]"
+        )
+        self.assertEqual(body3, "")
+        self.assertIn("未收到完整响应", err3)
+
+        body4, err4 = lz._extract_llm_stream_error("部分回答\n\n[Error: Claude refusal]")
+        self.assertIn("部分回答", body4)
+        self.assertIn("Claude refusal", err4)
+
+        body5, err5 = lz._extract_llm_stream_error("读取结果：\nError: File not found: /tmp/a.txt")
+        self.assertEqual(err5, "")
+        self.assertIn("File not found", body5)
+
+        fenced = "```\nTypeError: boom @ llmcore.py:10, foo -> `x`\n```"
+        body6, err6 = lz._extract_llm_stream_error(fenced)
+        self.assertEqual(body6, "")
+        self.assertIn("TypeError", err6)
+
+        body7, err7 = lz._extract_llm_stream_error(
+            "**LLM Running (Turn 1) ...**\n\n!!!Error:ReadTimeout\n\n这是正常正文，请继续。"
+        )
+        self.assertEqual(err7, "ReadTimeout")
+        self.assertIn("这是正常正文，请继续。", body7)
+        self.assertNotIn("!!!Error", body7)
+
+        body8, err8 = lz._extract_llm_stream_error("先有一点输出\n!!!Error:ReadTimeout\n后面还有正文")
+        self.assertEqual(err8, "ReadTimeout")
+        self.assertIn("先有一点输出", body8)
+        self.assertIn("后面还有正文", body8)
 
 
 if __name__ == "__main__":

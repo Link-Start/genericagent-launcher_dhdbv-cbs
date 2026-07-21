@@ -1883,152 +1883,62 @@ class SidebarSessionsMixin:
 
         threading.Thread(target=worker, name="remote-channel-sync", daemon=True).start()
 
-    def _toggle_sidebar(self):
-        self.sidebar_collapsed = not self.sidebar_collapsed
-        self.cfg["sidebar_collapsed"] = self.sidebar_collapsed
-        lz.save_config(self.cfg)
-        self._rebuild_sidebar()
-
     def _rebuild_sidebar(self):
         self._clear_layout(self.sidebar_layout)
-        collapsed = self.sidebar_collapsed
-        self.sidebar_host.setFixedWidth(64 if collapsed else 280)
-        if collapsed:
-            self.sidebar_layout.setContentsMargins(8, 10, 8, 10)
-            self.sidebar_layout.setSpacing(4)
-        else:
-            self.sidebar_layout.setContentsMargins(14, 14, 14, 14)
-            self.sidebar_layout.setSpacing(6)
+        # Session list stays expanded; collapse control removed.
+        self.sidebar_collapsed = False
+        self.sidebar_host.setFixedWidth(280)
+        self.sidebar_layout.setContentsMargins(14, 14, 14, 14)
+        self.sidebar_layout.setSpacing(6)
 
-        if collapsed:
-            toggle = QPushButton()
-            toggle.setCursor(Qt.PointingHandCursor)
-            toggle.setFixedSize(48, 36)
-            toggle.setToolTip("展开侧边栏")
-            toggle.setStyleSheet(self._sidebar_button_style())
-            toggle.clicked.connect(self._toggle_sidebar)
-            chat_common.set_button_svg_icon(toggle, "sidebar_expand", chat_common._SVG_CHEVRON_RIGHT, color="text_soft", size=16)
-            self.sidebar_layout.addWidget(toggle, 0, Qt.AlignHCenter)
+        brand = QFrame()
+        brand.setStyleSheet("background: transparent;")
+        brand_row = QHBoxLayout(brand)
+        brand_row.setContentsMargins(0, 6, 0, 12)
+        brand_row.setSpacing(10)
+        icon = QLabel()
+        icon.setFixedSize(42, 42)
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setObjectName("sidebarLogo")
+        chat_common.set_label_svg_icon(icon, "sidebar_brand", chat_common._SVG_WINDOW, color="accent_text", size=18)
+        brand_row.addWidget(icon, 0)
+        title = QLabel("GenericAgent")
+        title.setObjectName("cardTitle")
+        brand_row.addWidget(title, 1)
+        self.sidebar_layout.addWidget(brand)
 
-            logo = QLabel()
-            logo.setFixedSize(48, 48)
-            logo.setAlignment(Qt.AlignCenter)
-            logo.setObjectName("sidebarLogo")
-            chat_common.set_label_svg_icon(logo, "sidebar_brand_compact", chat_common._SVG_WINDOW, color="accent_text", size=20)
-            self.sidebar_layout.addWidget(logo, 0, Qt.AlignHCenter)
-            self.sidebar_layout.addSpacing(6)
+        new_btn = QPushButton("新会话")
+        new_btn.setCursor(Qt.PointingHandCursor)
+        new_btn.setStyleSheet(self._sidebar_button_style(primary=True))
+        new_btn.clicked.connect(self._new_session)
+        chat_common.set_button_svg_icon(new_btn, "sidebar_new", chat_common._SVG_PLUS, color="accent_text", size=16)
+        self.sidebar_layout.addWidget(new_btn)
 
-            for key, svg, color, handler, tip in (
-                ("sidebar_new_compact", chat_common._SVG_PLUS, "accent_text", self._new_session, "新建会话"),
-                ("sidebar_search_compact", chat_common._SVG_SEARCH, "text_soft", self._open_search_filter, "搜索历史消息"),
-                ("sidebar_refresh_compact", chat_common._SVG_REFRESH, "text_soft", self._refresh_session_list, "刷新会话列表"),
-            ):
-                btn = QPushButton()
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.setFixedSize(48, 40)
-                btn.setToolTip(tip)
-                btn.setStyleSheet(self._sidebar_button_style())
-                btn.clicked.connect(handler)
-                chat_common.set_button_svg_icon(btn, key, svg, color=color, size=16)
-                self.sidebar_layout.addWidget(btn, 0, Qt.AlignHCenter)
-        else:
-            top = QFrame()
-            top.setStyleSheet("background: transparent;")
-            top.setFixedHeight(44)
-            top_row = QHBoxLayout(top)
-            top_row.setContentsMargins(0, 8, 0, 0)
-            top_row.setSpacing(0)
-            toggle = QPushButton()
-            toggle.setCursor(Qt.PointingHandCursor)
-            toggle.setFixedSize(32, 32)
-            toggle.setToolTip("收起侧边栏")
-            toggle.setStyleSheet(self._sidebar_button_style())
-            toggle.clicked.connect(self._toggle_sidebar)
-            chat_common.set_button_svg_icon(toggle, "sidebar_collapse", chat_common._SVG_CHEVRON_LEFT, color="text_soft", size=16)
-            top_row.addWidget(toggle, 0, Qt.AlignLeft)
-            top_row.addStretch(1)
-            self.sidebar_layout.addWidget(top)
+        search_btn = QPushButton("搜索")
+        search_btn.setCursor(Qt.PointingHandCursor)
+        search_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
+        search_btn.clicked.connect(self._open_search_filter)
+        chat_common.set_button_svg_icon(search_btn, "sidebar_search", chat_common._SVG_SEARCH, color="text_soft", size=16)
+        self.sidebar_layout.addWidget(search_btn)
 
-            brand = QFrame()
-            brand.setStyleSheet("background: transparent;")
-            brand_row = QHBoxLayout(brand)
-            brand_row.setContentsMargins(0, 6, 0, 12)
-            brand_row.setSpacing(10)
-            icon = QLabel()
-            icon.setFixedSize(42, 42)
-            icon.setAlignment(Qt.AlignCenter)
-            icon.setObjectName("sidebarLogo")
-            chat_common.set_label_svg_icon(icon, "sidebar_brand", chat_common._SVG_WINDOW, color="accent_text", size=18)
-            brand_row.addWidget(icon, 0)
-            title = QLabel("GenericAgent")
-            title.setObjectName("cardTitle")
-            brand_row.addWidget(title, 1)
-            self.sidebar_layout.addWidget(brand)
+        refresh_btn = QPushButton("刷新会话")
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
+        refresh_btn.clicked.connect(self._refresh_session_list)
+        chat_common.set_button_svg_icon(refresh_btn, "sidebar_refresh", chat_common._SVG_REFRESH, color="text_soft", size=16)
+        self.sidebar_layout.addWidget(refresh_btn)
 
-            new_btn = QPushButton("新会话")
-            new_btn.setCursor(Qt.PointingHandCursor)
-            new_btn.setStyleSheet(self._sidebar_button_style(primary=True))
-            new_btn.clicked.connect(self._new_session)
-            chat_common.set_button_svg_icon(new_btn, "sidebar_new", chat_common._SVG_PLUS, color="accent_text", size=16)
-            self.sidebar_layout.addWidget(new_btn)
-
-            search_btn = QPushButton("搜索")
-            search_btn.setCursor(Qt.PointingHandCursor)
-            search_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
-            search_btn.clicked.connect(self._open_search_filter)
-            chat_common.set_button_svg_icon(search_btn, "sidebar_search", chat_common._SVG_SEARCH, color="text_soft", size=16)
-            self.sidebar_layout.addWidget(search_btn)
-
-            refresh_btn = QPushButton("刷新会话")
-            refresh_btn.setCursor(Qt.PointingHandCursor)
-            refresh_btn.setStyleSheet(self._sidebar_button_style(subtle=True))
-            refresh_btn.clicked.connect(self._refresh_session_list)
-            chat_common.set_button_svg_icon(refresh_btn, "sidebar_refresh", chat_common._SVG_REFRESH, color="text_soft", size=16)
-            self.sidebar_layout.addWidget(refresh_btn)
-
-            group = QLabel("渠道")
-            group.setObjectName("sectionLabel")
-            self.sidebar_group_label = group
-            self.sidebar_layout.addWidget(group)
-        if collapsed:
-            self.sidebar_group_label = None
+        group = QLabel("渠道")
+        group.setObjectName("sectionLabel")
+        self.sidebar_group_label = group
+        self.sidebar_layout.addWidget(group)
 
         self.session_list = QListWidget()
         self.session_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.session_list.currentItemChanged.connect(self._on_session_item_changed)
         self.session_list.customContextMenuRequested.connect(self._open_session_list_context_menu)
-        if collapsed:
-            self.session_list.hide()
         self.sidebar_layout.addWidget(self.session_list, 1)
-        if collapsed:
-            self.sidebar_layout.addStretch(1)
-
-        bottom = QFrame()
-        bottom.setStyleSheet("background: transparent;")
-        bottom.setFixedHeight(52)
-        bottom_row = QHBoxLayout(bottom)
-        bottom_row.setContentsMargins(0, 8, 0, 0)
-        bottom_row.setSpacing(0)
-        settings = QPushButton("" if collapsed else "设置")
-        settings.setCursor(Qt.PointingHandCursor)
-        settings.setToolTip("设置" if collapsed else "")
-        settings.setStyleSheet(self._sidebar_button_style(subtle=not collapsed))
-        settings.clicked.connect(self._show_settings)
-        chat_common.set_button_svg_icon(
-            settings,
-            "sidebar_settings_compact" if collapsed else "sidebar_settings",
-            chat_common._SVG_SETTINGS,
-            color="text_soft",
-            size=16,
-        )
-        if collapsed:
-            settings.setFixedSize(48, 40)
-            bottom_row.setContentsMargins(0, 6, 0, 0)
-            bottom_row.addWidget(settings, 0, Qt.AlignHCenter)
-        else:
-            bottom_row.addWidget(settings, 1)
-        self.sidebar_layout.addWidget(bottom)
 
         self._last_session_list_signature = None
         if lz.is_valid_agent_dir(self.agent_dir):
@@ -2157,20 +2067,16 @@ class SidebarSessionsMixin:
 
     def _sidebar_item_text(self, row):
         if row.get("kind") == "root_local":
-            return "本机\n当前设备会话" if not self.sidebar_collapsed else "本"
+            return "本机\n当前设备会话"
         if row.get("kind") == "root_remote":
-            return "其他设备\nSSH 远程 agant" if not self.sidebar_collapsed else "设"
+            return "其他设备\nSSH 远程 agant"
         if row.get("kind") == "device":
             name = str(row.get("device_name") or "远程设备").strip() or "远程设备"
             host = str(row.get("host") or "").strip()
-            if self.sidebar_collapsed:
-                return (name[:1] or "设").upper()
             subtitle = f"{row.get('username')}@{host}:{int(row.get('port') or 22)}" if host else "远程设备"
             return f"{name}\n{subtitle}"
         if row.get("kind") == "channel":
             label = row.get("channel_label") or row.get("channel_id") or "未知渠道"
-            if self.sidebar_collapsed:
-                return (label[:1] or "•").upper()
             return f"{label}\n会话 {row.get('active_count', 0)}"
         if row.get("kind") == "back":
             return "← 返回渠道"
@@ -2178,8 +2084,6 @@ class SidebarSessionsMixin:
             title = str(row.get("title") or "(未命名)").strip() or "(未命名)"
             title_prefix = "★ " if row.get("pinned") else ""
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("updated_at", 0) or 0))
-            if self.sidebar_collapsed:
-                return (title[:1] or "•").upper()
             return f"{title_prefix}{title}\n{when}"
         return ""
 
@@ -2187,7 +2091,6 @@ class SidebarSessionsMixin:
         return (
             str(mode or "").strip().lower() == "remote_devices"
             and str((row or {}).get("kind") or "").strip().lower() == "device"
-            and not self.sidebar_collapsed
         )
 
     def _make_sidebar_device_row_widget(self, row):
@@ -2283,7 +2186,7 @@ class SidebarSessionsMixin:
                     back_text = "← 返回设备"
                 elif mode == "remote_devices":
                     back_text = "← 返回上层"
-                back_item = QListWidgetItem(back_text if not self.sidebar_collapsed else "←")
+                back_item = QListWidgetItem(back_text)
                 back_item.setData(Qt.UserRole, {"kind": "back"})
                 self.session_list.addItem(back_item)
             for row in rows:
@@ -2300,8 +2203,6 @@ class SidebarSessionsMixin:
                 elif row.get("kind") in ("root_local", "root_remote"):
                     tip = f"{row.get('title')}\n{row.get('subtitle')}"
                 item.setToolTip(tip)
-                if self.sidebar_collapsed:
-                    item.setTextAlignment(Qt.AlignCenter)
                 self.session_list.addItem(item)
                 if uses_row_widget:
                     widget = self._make_sidebar_device_row_widget(row)

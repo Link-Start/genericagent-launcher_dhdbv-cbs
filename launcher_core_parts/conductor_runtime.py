@@ -68,6 +68,8 @@ conductor_agent: Optional[GenericAgent] = None
 conductor_started = False
 conductor_error = ""
 chat_messages: List[dict] = []
+# Live draft of the master agent generation (put_task next chunks).
+conductor_stream: dict = {"active": False, "text": "", "ts": 0.0, "seq": 0}
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -78,7 +80,21 @@ def short_id() -> str:
 _TURN_SPLIT_RE = re.compile(r'\**LLM Running \(Turn \d+\) \.\.\.\**')
 _SUMMARY_RE = re.compile(r'<summary>(.*?)</summary>\s*', re.DOTALL)
 
+def clean_log_text(s: str) -> str:
+    """Upstream detail cleaner for GET /subagent/{id} only — not for list cards."""
+    if not s:
+        return s
+    s = re.sub(r'`{5}\n.*?`{5}\n?', '', s, flags=re.DOTALL)
+    s = re.sub(r'🛠️ Tool: `([^`]+)`\s*📥 args:\n`{4}.*?`{4}\n?', r'🛠️ `\1`\n', s, flags=re.DOTALL)
+    s = re.sub(r'^🛠️ .*\n?', '', s, flags=re.MULTILINE)
+    s = re.sub(r'<thinking>.*?</thinking>\s*', '', s, flags=re.DOTALL)
+    s = re.sub(r'^\s*\[(?:Info|Status)\][^\n]*\n?', '', s, flags=re.MULTILINE)
+    s = re.sub(r'^\s*`{4,5}\s*$\n?', '', s, flags=re.MULTILINE)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
 def extract_last_summary(full: str) -> str:
+    """Upstream: in-progress cards show only the latest <summary>, else empty."""
     matches = _SUMMARY_RE.findall(full or "")
     if not matches:
         return ""
@@ -86,6 +102,7 @@ def extract_last_summary(full: str) -> str:
     return s[-1000:] if len(s) > 1000 else s
 
 def extract_last_text_reply(full: str) -> str:
+    """Upstream: finished cards show last-turn text (no full-log fallback)."""
     parts = _TURN_SPLIT_RE.split(full)
     last = parts[-1] if parts else full
     last = _SUMMARY_RE.sub('', last)
@@ -94,6 +111,8 @@ def extract_last_text_reply(full: str) -> str:
     return last[-3000:] if len(last) > 3000 else last
 
 def subagent_snapshot() -> list[dict]:
+    # Match upstream pool.snapshot() exactly:
+    # running -> <summary> only; stopped -> last-turn text reply.
     with sub_lock:
         return [
             {
@@ -204,22 +223,31 @@ def monitor_display_queue(agent_id: str, dq: "queue.Queue", trigger_when_done: b
                 conductor_events.put({"type": "subagent_done", "id": agent_id, "reply": done})
             break
 
+def _send_subagent_msg(sid: str, msg: str) -> dict:
+    """Upstream SubagentPool._send_msg: put_task + monitor display_queue."""
+    with sub_lock:
+        s = subagents.get(sid)
+    if not s:
+        return {"error": "subagent not found", "id": sid}
+    dq = s.agent.put_task(msg, source=f"subagent:{sid}")
+    mt = threading.Thread(target=monitor_display_queue, args=(sid, dq, True), name=f"monitor-{sid}", daemon=True)
+    mt.start()
+    s.monitor_threads.append(mt)
+    push_cards()
+    return {"id": sid, "status": "running"}
+
 def start_subagent(prompt: str) -> dict:
+    # Match upstream pool.start_subagent / _send_msg order and flags.
     sid = short_id()
     agent = GenericAgent()
     agent.inc_out = True
     agent.verbose = False
-
+    agent.no_print = True
     start_agent_runner(agent, f"subagent-{sid}")
     state = SubAgentState(id=sid, agent=agent, prompt=prompt, status="running")
     with sub_lock:
         subagents[sid] = state
-    dq = agent.put_task(prompt, source=f"subagent:{sid}")
-    mt = threading.Thread(target=monitor_display_queue, args=(sid, dq, True), name=f"monitor-{sid}", daemon=True)
-    mt.start()
-    state.monitor_threads.append(mt)
-    push_cards()
-    return {"id": sid, "status": "running"}
+    return _send_subagent_msg(sid, prompt)
 
 def keyinfo_subagent(sid: str, msg: str) -> dict:
     with sub_lock:
@@ -242,12 +270,7 @@ def input_subagent(sid: str, msg: str) -> dict:
     s.reply = ""
     s.status = "running"
     s.updated_at = time.time()
-    dq = s.agent.put_task(msg, source=f"subagent:{sid}")
-    mt = threading.Thread(target=monitor_display_queue, args=(sid, dq, True), name=f"monitor-{sid}", daemon=True)
-    mt.start()
-    s.monitor_threads.append(mt)
-    push_cards()
-    return {"id": sid, "status": "running"}
+    return _send_subagent_msg(sid, msg)
 
 def conductor_readme() -> str:
     base = f"http://{HOST}:{PORT}"
@@ -261,22 +284,61 @@ def conductor_readme() -> str:
         'POST /subagent/{id}\tbody: {\"action\": \"stop\"}\t中断执行但保留（可继续input/reply）',
         'POST /subagent/{id}\tbody: {\"action\": \"kill\"}\t彻底杀死（从卡片消失，不可复用）',
         "GET /chat?last=N\t返回最近N条对话（默认20）",
-        "GET /subagent\t返回 {\"items\": [...]}\t查看所有subagent状态",
+        "GET /subagent\t返回 {\"items\": [...]}\t查看所有subagent状态（running 时 reply 仅为 <summary>）",
+        "GET /subagent/{id}?max_len=N\t返回单个subagent详情，reply经清洗后截取尾部max_len字（默认5000）。仅在摘要不够判断时使用",
         "GET /readme\t本文档",
         "",
         "触发时机: 用户新消息 | subagent done",
     ])
 
+def _recent_chat_context(limit: int = 24) -> str:
+    """Compact transcript so master agent retains multi-turn context after restart/seed."""
+    rows = []
+    for item in list(chat_messages or [])[-max(1, int(limit or 24)):]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        msg = str(item.get("msg") or "").strip()
+        if not msg:
+            continue
+        if role == "user":
+            label = "用户"
+        elif role == "system":
+            label = "系统"
+        else:
+            label = "总管"
+        # Keep each turn short enough for the master prompt.
+        if len(msg) > 1200:
+            msg = msg[:1200] + "…"
+        rows.append(f"- {label}: {msg}")
+    if not rows:
+        return ""
+    return "近期会话上下文（已按时间排序，请延续，不要假装失忆）：\n" + "\n".join(rows)
+
 def conductor_prompt_from_events(events: list) -> str:
+    # Align with upstream Conductor._build_prompt:
+    # event-type routing + tell master to fetch via API; do NOT inline full subagent logs.
     with sub_lock:
         running = sum(1 for s in subagents.values() if s.status == "running")
         stopped = sum(1 for s in subagents.values() if s.status != "running")
     unread = sum(1 for m in chat_messages if m.get("role") == "user" and not m.get("read"))
-    done_count = sum(1 for e in events if e.get("type") == "subagent_done")
-    summary = f"subagents: {running} running, {stopped} stopped | {unread}条用户未读消息, {done_count}个subagent完成报告"
+    done_count = sum(1 for e in events if isinstance(e, dict) and e.get("type") == "subagent_done")
+    event_type = ""
+    if events and isinstance(events[0], dict):
+        event_type = str(events[0].get("type") or "").strip()
+    if event_type == "user_message":
+        summary = f"[用户消息] {unread}条未读用户消息，GET /chat 读取并处理。"
+    elif event_type == "subagent_done":
+        summary = (
+            f"[subagent完成] {done_count}个完成报告；"
+            f"必须 GET /subagent 查看列表，必要时 GET /subagent/{{id}}?max_len=5000 读清洗后正文再验收；"
+            f"不要仅凭卡片摘要字段是否为空就判断无输出。"
+        )
+    else:
+        summary = f"[唤醒] subagents: {running} running, {stopped} stopped | {unread}条用户未读消息, {done_count}个subagent完成报告"
     base = f"http://{HOST}:{PORT}"
     return f"""你是agent总管。用户只和你对话，你负责调度、验收、交付，目标是降低用户管理多个agent的负担。
-API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GET /subagent看状态；POST /chat是唯一对用户说话方式。
+API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /subagent看状态，GET /subagent/{{id}}?max_len=N 看详情；POST /chat是唯一对用户说话方式。
 
 铁律：
 - 绝不亲自执行任务/探测环境；一切执行交给subagent。你只分析、派遣、审查、沟通。
@@ -290,13 +352,18 @@ API: {base}；先requests，GET /readme查用法，GET /chat读未读对话，GE
 4. 执行分派，完成即停。危险操作（改源码/删数据/安全敏感）必须改成先让subagent出方案；你验收后POST /chat请用户确认，确认后才继续执行。
 
 subagent完成流程：
-1. 读subagent输出；若最后一条不足以判断，GET /subagent或日志补足信息。
-2. 预测用户是否满意；不满意就reply/keyinfo要求返工、修改、优化，继续监督，不急着报告。
-3. 预计用户满意后，POST /chat给简洁交付报告。
+1. GET /subagent 看状态；列表里 running 时 reply 可能是空（只展示 <summary>，这是设计如此）。
+2. 若摘要不够判断，GET /subagent/{{id}}?max_len=3000 读取清洗后的完整输出尾部。
+3. 预测用户是否满意；不满意就reply/keyinfo要求返工；满意后 POST /chat 给简洁交付报告。
 
 原则：
 - 信任subagent足够聪明，不要写具体步骤和容易探测的信息；能自己判断的自己判断，只在真正需要用户决策时打扰。
-{summary}"""
+
+需要处理：
+{summary}
+
+{_recent_chat_context(24)}
+"""
 
 def _auto_cleanup_loop():
     IDLE_TIMEOUT = 3600
@@ -316,12 +383,50 @@ def _auto_cleanup_loop():
         if to_abort:
             push_cards()
 
+def _set_conductor_stream(*, active: bool, text: str = "", done: bool = False):
+    global conductor_stream
+    now = time.time()
+    conductor_stream = {
+        "active": bool(active),
+        "text": str(text or ""),
+        "ts": now,
+        "seq": int(conductor_stream.get("seq", 0) or 0) + 1,
+        "done": bool(done),
+    }
+    schedule_broadcast({
+        "type": "conductor_stream",
+        "active": bool(active),
+        "text": str(text or ""),
+        "done": bool(done),
+        "seq": conductor_stream["seq"],
+        "ts": now,
+    })
+
 def monitor_conductor_queue(dq: "queue.Queue") -> str:
-    while True:
-        item = dq.get()
-        if "done" in item:
-            print("Conductor task done")
-            return item.get("done", "") or ""
+    """Drain master agent queue and publish live stream chunks (next) for the launcher UI."""
+    acc = ""
+    last_push = 0.0
+    _set_conductor_stream(active=True, text="", done=False)
+    try:
+        while True:
+            item = dq.get()
+            if "next" in item:
+                chunk = item.get("next") or ""
+                if chunk:
+                    acc += chunk
+                    now = time.time()
+                    # Throttle UI pushes; still keep full acc for final done.
+                    if (now - last_push) >= 0.05 or len(chunk) > 80:
+                        _set_conductor_stream(active=True, text=acc, done=False)
+                        last_push = now
+            if "done" in item:
+                done = item.get("done") or acc
+                print("Conductor task done")
+                _set_conductor_stream(active=False, text=done or acc, done=True)
+                return str(done or "")
+    except Exception:
+        _set_conductor_stream(active=False, text=acc, done=True)
+        raise
 
 def conductor_loop():
     threading.Thread(target=_auto_cleanup_loop, name="subagent-cleanup", daemon=True).start()
@@ -353,6 +458,7 @@ def conductor_loop():
                     err = next((l for l in reversed(tail.splitlines()) if l.startswith('!!!Error:')), '')
                     add_chat(f"⚠ LLM 暂不可用：{err[:200]}", role="system")
         except Exception as e:
+            _set_conductor_stream(active=False, text="", done=True)
             add_chat(f"Conductor error: {e}", role="system")
 
 @app.on_event("startup")
@@ -380,16 +486,61 @@ def health():
         "unread_user_count": sum(1 for m in chat_messages if m.get("role") == "user" and not m.get("read")),
         "subagent_count": len(subagent_snapshot()),
         "agent_dir": AGENT_DIR,
+        "stream_active": bool(conductor_stream.get("active")),
+        "stream_seq": int(conductor_stream.get("seq", 0) or 0),
+    }
+
+@app.get("/stream")
+def api_stream():
+    """Live master-agent draft for launcher native streaming UI."""
+    return {
+        "active": bool(conductor_stream.get("active")),
+        "text": str(conductor_stream.get("text") or ""),
+        "ts": float(conductor_stream.get("ts") or 0),
+        "seq": int(conductor_stream.get("seq", 0) or 0),
+        "done": bool(conductor_stream.get("done")),
     }
 
 @app.get("/subagent")
 def list_subagents():
     return {"items": subagent_snapshot()}
 
+@app.get("/subagent/{sid}")
+def get_subagent(sid: str, max_len: int = 5000):
+    """Upstream-compatible detail endpoint: cleaned reply tail for master review."""
+    with sub_lock:
+        s = subagents.get(str(sid or "").strip())
+    if not s:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        cap = int(max_len or 5000)
+    except Exception:
+        cap = 5000
+    if cap < 1:
+        cap = 5000
+    cleaned = clean_log_text(s.reply or "")
+    return {
+        "id": s.id,
+        "prompt": s.prompt,
+        "status": s.status,
+        "reply": cleaned[-cap:] if len(cleaned) > cap else cleaned,
+        "created_at": s.created_at,
+        "updated_at": s.updated_at,
+    }
+
+# Upstream-style instruction after dispatch: stop and wait for next wake event.
+INSTR_DISPATCHED = (
+    "Task received. I'll handle THIS TASK from here. "
+    "You MUST stop now and end your reply. Wait for next event. "
+    "Note: GET /subagent list reply may be empty while status=running "
+    "(only <summary> is shown by design). After completion, GET /subagent "
+    "and if needed GET /subagent/{id}?max_len=5000 for cleaned full output."
+)
+
 @app.post("/subagent")
 def api_start_subagent(body: StartSubagentIn):
     result = start_subagent(body.prompt)
-    result["instruction"] = "Task received. I'll handle it from here. You MUST stop now and end your reply. Wait for next event."
+    result["instruction"] = INSTR_DISPATCHED
     return result
 
 @app.post("/subagent/{sid}")
@@ -405,7 +556,7 @@ def api_subagent_action(sid: str, body: SubagentActionIn):
         return result
     if action in ("input", "reply", "append", "message", "msg"):
         result = input_subagent(sid, body.msg)
-        result["instruction"] = "Task received. I'll handle it from here. You MUST stop now and end your reply."
+        result["instruction"] = INSTR_DISPATCHED
         return result
     if action in ("abort", "stop"):
         s.agent.abort()
@@ -417,6 +568,8 @@ def api_subagent_action(sid: str, body: SubagentActionIn):
         s.agent.abort()
         s.status = "aborted"
         s.updated_at = time.time()
+        with sub_lock:
+            subagents.pop(sid, None)
         push_cards()
         return {"id": sid, "status": "aborted"}
     return JSONResponse({"error": f"unknown action: {body.action}"}, status_code=400)
@@ -426,9 +579,59 @@ def api_get_chat(last: int = 20):
     mark_all_user_messages_read()
     return {"items": chat_messages[-last:]}
 
+class ChatSeedIn(BaseModel):
+    items: list = []
+    session_id: str = ""
+    replace: bool = True
+
+@app.post("/chat/seed")
+def api_seed_chat(body: ChatSeedIn):
+    """Restore launcher session transcript into process memory without waking the loop.
+
+    Used so reopen/restart keeps master context for the selected Conductor session.
+    """
+    global chat_messages
+    items = body.items if isinstance(body.items, list) else []
+    restored = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        role = str(raw.get("role") or "assistant").strip().lower() or "assistant"
+        if role in ("error",):
+            role = "system"
+        if role not in ("user", "conductor", "system", "assistant"):
+            role = "assistant"
+        if role == "assistant":
+            role = "conductor"
+        msg = str(raw.get("msg") or raw.get("text") or "").strip()
+        if not msg:
+            continue
+        restored.append({
+            "id": str(raw.get("id") or short_id()),
+            "role": role,
+            "msg": msg,
+            "ts": int(raw.get("ts") or now_ms()),
+            "read": True,
+            "session_id": str(body.session_id or "").strip(),
+        })
+    if bool(body.replace):
+        chat_messages = restored[-200:]
+    else:
+        chat_messages.extend(restored)
+        if len(chat_messages) > 200:
+            del chat_messages[:-200]
+    schedule_broadcast({"type": "chat_seed", "count": len(chat_messages), "session_id": str(body.session_id or "")})
+    return {"ok": True, "count": len(chat_messages), "session_id": str(body.session_id or "")}
+
 @app.post("/chat")
 def api_chat(body: ChatIn):
-    return add_chat(body.msg, role=body.role)
+    role = str(body.role or "conductor").strip().lower() or "conductor"
+    msg = str(body.msg or "").strip()
+    item = add_chat(msg, role=role)
+    # Launcher native UI posts role=user over HTTP (no websocket). Wake the loop.
+    if role == "user" and msg:
+        conductor_events.put({"type": "user_message", "msg": msg})
+    return item
 
 @app.websocket("/ws")
 async def websocket(ws: WebSocket):
@@ -450,7 +653,9 @@ async def websocket(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn, webbrowser
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
+    open_browser = str(os.environ.get("GA_LAUNCHER_CONDUCTOR_NO_BROWSER") or "").strip().lower() not in ("1", "true", "yes", "on")
+    if open_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
     uvicorn.run("conductor:app", host=HOST, port=PORT, reload=False)
 '''
 

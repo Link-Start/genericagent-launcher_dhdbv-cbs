@@ -95,21 +95,83 @@ class ChatViewMixin:
             refresher()
 
     def _add_message_row(self, role: str, text: str, finished: bool = True, *, auto_scroll: bool = True):
-        on_resend = self._regenerate_from_row if role == "assistant" else None
+        role_key = str(role or "").strip().lower() or "assistant"
+        on_resend = self._regenerate_from_row if role_key == "assistant" else None
         row = build_message_row(
             text,
-            role,
+            role_key,
             self.msg_root,
             on_resend=on_resend,
             avatar_cfg=getattr(self, "cfg", None),
             row_cls=MessageRow,
         )
-        row.set_finished(finished)
+        setter = getattr(row, "set_finished", None)
+        if callable(setter):
+            setter(finished)
         self.msg_layout.insertWidget(self._message_row_insert_index(), row)
         self._rendered_message_rows.append(row)
         self._sync_message_layout_alignment()
         if auto_scroll:
             self._scroll_to_bottom()
+        return row
+
+    def _normalize_chat_error_text(self, text: str) -> str:
+        raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
+            return ""
+        # Prefer first meaningful line as a compact banner; keep full text in tooltip.
+        lines = [ln.strip() for ln in raw.split("\n") if str(ln or "").strip()]
+        if not lines:
+            return ""
+        head = lines[0]
+        if head.startswith("```") and len(lines) > 1:
+            head = lines[1]
+        head = " ".join(head.split()).strip()
+        if len(head) > 220:
+            head = head[:217].rstrip() + "..."
+        return head
+
+    def _append_chat_error_line(self, text: str, *, persist: bool = True, auto_scroll: bool = True):
+        full = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        msg = self._normalize_chat_error_text(full)
+        if not msg:
+            return None
+        if persist and isinstance(getattr(self, "current_session", None), dict):
+            bubbles = self.current_session.setdefault("bubbles", [])
+            last = bubbles[-1] if bubbles else None
+            if not (
+                isinstance(last, dict)
+                and str(last.get("role") or "").strip().lower() == "error"
+                and str(last.get("text") or "").strip() == msg
+            ):
+                bubbles.append({"role": "error", "text": msg, "detail": full if full != msg else ""})
+                persister = getattr(self, "_persist_session", None)
+                if callable(persister):
+                    try:
+                        persister(self.current_session)
+                    except Exception:
+                        pass
+        rows = getattr(self, "_rendered_message_rows", None) or []
+        if rows:
+            last_row = rows[-1]
+            if (
+                str(getattr(last_row, "_role", "") or "").strip().lower() == "error"
+                and str(getattr(last_row, "_text", "") or "").strip() == msg
+            ):
+                return last_row
+        row = self._add_message_row("error", msg, finished=True, auto_scroll=auto_scroll)
+        if row is not None and full and full != msg:
+            setter = getattr(row, "set_detail", None)
+            if callable(setter):
+                try:
+                    setter(full)
+                except Exception:
+                    pass
+            elif hasattr(row, "_label") and row._label is not None:
+                try:
+                    row._label.setToolTip(full)
+                except Exception:
+                    pass
         return row
 
     def _discard_stream_row(self, row=None):

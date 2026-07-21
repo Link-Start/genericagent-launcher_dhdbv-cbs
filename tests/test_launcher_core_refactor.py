@@ -1141,6 +1141,251 @@ class LauncherCoreFacadeTests(unittest.TestCase):
         self.assertFalse(dummy._busy)
         self.assertEqual(dummy.statuses[-1], "已完成。")
 
+    def test_stream_done_shows_inline_error_without_mixing_into_assistant_body(self):
+        class Button:
+            def setEnabled(self, _value):
+                pass
+
+        class Row:
+            def __init__(self):
+                self.updates = []
+
+            def update_content(self, text, *, finished):
+                self.updates.append((text, bool(finished)))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+
+            def __init__(self):
+                self._abort_requested = False
+                self._stream_row = Row()
+                self._busy = True
+                self._current_stream_text = "partial"
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.statuses = []
+                self.notifications = []
+                self.errors = []
+                self.current_session = {"bubbles": [{"role": "user", "text": "hi"}], "token_usage": {"events": []}}
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _clear_active_turn_attachments(self):
+                pass
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, final_text):
+                self.notifications.append(str(final_text))
+
+            def _persist_session(self, _session):
+                pass
+
+            def _is_remote_session(self, _session):
+                return False
+
+            def _request_backend_state(self, _sid):
+                pass
+
+            def _current_llm_name(self):
+                return "demo"
+
+            def _finalize_usage_event_billing(self, _target):
+                pass
+
+            def _turn_auto_jump_latest_enabled(self):
+                return False
+
+            def _append_chat_error_line(self, text, *, persist=True, auto_scroll=True):
+                self.errors.append((str(text), bool(persist), bool(auto_scroll)))
+
+        dummy = DummyBridge()
+        row = dummy._stream_row
+        dummy._stream_done("partial reply", error_text="Connection timed out")
+
+        self.assertEqual(row.updates, [("partial reply", True)])
+        self.assertEqual(dummy.notifications, [])
+        self.assertEqual(dummy.errors, [("Connection timed out", True, True)])
+        self.assertTrue(str(dummy.statuses[-1]).startswith("错误:"))
+        bubbles = dummy.current_session.get("bubbles") or []
+        self.assertEqual(bubbles[-1].get("role"), "assistant")
+        self.assertEqual(bubbles[-1].get("text"), "partial reply")
+        self.assertFalse(any(str(item.get("role") or "") == "error" for item in bubbles))
+
+    def test_stream_done_promotes_llmcore_http_error_text_to_inline_error(self):
+        class Button:
+            def setEnabled(self, _value):
+                pass
+
+        class Row:
+            def __init__(self):
+                self.updates = []
+                self.discarded = False
+
+            def update_content(self, text, *, finished):
+                self.updates.append((text, bool(finished)))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+            _stream_partial_text = BridgeRuntimeMixin._stream_partial_text
+
+            def __init__(self):
+                self._abort_requested = False
+                self._stream_row = Row()
+                self._busy = True
+                self._current_stream_text = (
+                    '**LLM Running (Turn 1) ...**\n\n!!!Error: HTTP 401: {"error":{"code":"invalid_api_key"}}'
+                )
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.statuses = []
+                self.notifications = []
+                self.errors = []
+                self.current_session = {"bubbles": [{"role": "user", "text": "hi"}], "token_usage": {"events": []}}
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _clear_active_turn_attachments(self):
+                pass
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, final_text):
+                self.notifications.append(str(final_text))
+
+            def _persist_session(self, _session):
+                pass
+
+            def _is_remote_session(self, _session):
+                return False
+
+            def _request_backend_state(self, _sid):
+                pass
+
+            def _current_llm_name(self):
+                return "demo"
+
+            def _finalize_usage_event_billing(self, _target):
+                pass
+
+            def _turn_auto_jump_latest_enabled(self):
+                return False
+
+            def _discard_stream_row(self, row=None):
+                if row is not None:
+                    row.discarded = True
+
+            def _append_chat_error_line(self, text, *, persist=True, auto_scroll=True):
+                self.errors.append(str(text))
+
+        dummy = DummyBridge()
+        row = dummy._stream_row
+        text = '**LLM Running (Turn 1) ...**\n\n!!!Error: HTTP 401: {"error":{"code":"invalid_api_key","message":"Invalid API Key"}}'
+        dummy._stream_done(text)
+
+        self.assertTrue(row.discarded or row.updates == [])
+        self.assertTrue(any("HTTP 401" in err for err in dummy.errors))
+        self.assertTrue(str(dummy.statuses[-1]).startswith("错误:"))
+        self.assertEqual(dummy.notifications, [])
+        bubbles = dummy.current_session.get("bubbles") or []
+        self.assertFalse(any("!!!Error" in str((b or {}).get("text") or "") for b in bubbles))
+
+    def test_stream_done_recovers_partial_text_when_error_event_has_empty_body(self):
+        class Button:
+            def setEnabled(self, _value):
+                pass
+
+        class Row:
+            def __init__(self):
+                self._text = "streamed so far"
+                self.updates = []
+
+            def update_content(self, text, *, finished):
+                self._text = text
+                self.updates.append((text, bool(finished)))
+
+        class DummyBridge(BridgeRuntimeMixin):
+            _stream_done = BridgeRuntimeMixin._stream_done
+            _stream_partial_text = BridgeRuntimeMixin._stream_partial_text
+
+            def __init__(self):
+                self._abort_requested = False
+                self._stream_row = Row()
+                self._busy = True
+                self._current_stream_text = "streamed so far"
+                self._pending_stream_text = None
+                self.send_btn = Button()
+                self.stop_btn = Button()
+                self.statuses = []
+                self.notifications = []
+                self.errors = []
+                self.current_session = {"bubbles": [{"role": "user", "text": "hi"}], "token_usage": {"events": []}}
+
+            def _set_status(self, text):
+                self.statuses.append(str(text))
+
+            def _refresh_composer_enabled(self):
+                pass
+
+            def _clear_active_turn_attachments(self):
+                pass
+
+            def _refresh_token_label(self):
+                pass
+
+            def _scroll_to_bottom(self):
+                pass
+
+            def _notify_reply_done(self, final_text):
+                self.notifications.append(str(final_text))
+
+            def _persist_session(self, _session):
+                pass
+
+            def _is_remote_session(self, _session):
+                return False
+
+            def _request_backend_state(self, _sid):
+                pass
+
+            def _current_llm_name(self):
+                return "demo"
+
+            def _finalize_usage_event_billing(self, _target):
+                pass
+
+            def _turn_auto_jump_latest_enabled(self):
+                return False
+
+            def _append_chat_error_line(self, text, *, persist=True, auto_scroll=True):
+                self.errors.append(str(text))
+
+        dummy = DummyBridge()
+        row = dummy._stream_row
+        dummy._stream_done("", error_text="HTTP 429 rate limited")
+
+        self.assertEqual(row.updates, [("streamed so far", True)])
+        self.assertEqual(dummy.errors, ["HTTP 429 rate limited"])
+        self.assertEqual(dummy.current_session["bubbles"][-1]["text"], "streamed so far")
+
     def test_stream_done_skips_reply_notification_after_abort(self):
         class Button:
             def setEnabled(self, _value):
@@ -10562,9 +10807,13 @@ native_oai_config2 = {
             def __init__(self):
                 self.agent_dir = "C:\\demo"
                 self.pages = DummyPages()
+                self.app_content_stack = DummyPages()
+                self._app_workspace = object()
                 self._settings_page = object()
+                self._chat_page = object()
                 self._current_settings_category = "api"
                 self._settings_top_back_btn = None
+                self._main_nav_mode = "chat"
                 self.events = []
 
             def _ensure_settings_page_built(self):
@@ -10576,16 +10825,42 @@ native_oai_config2 = {
             def _refresh_welcome_state(self):
                 self.events.append("refresh_welcome")
 
+            def _set_main_nav(self, mode, *, switch_stack=True):
+                self._main_nav_mode = str(mode)
+                self.events.append(("nav", str(mode), bool(switch_stack)))
+                if switch_stack:
+                    self.app_content_stack.current = self._settings_page if str(mode) == "settings" else self._chat_page
+
             def _settings_reload(self, *, categories=None, force=False):
-                self.events.append(("reload", list(categories or []), bool(force), self.pages.current is self._settings_page))
+                self.events.append(
+                    (
+                        "reload",
+                        list(categories or []),
+                        bool(force),
+                        self.app_content_stack.current is self._settings_page,
+                    )
+                )
 
         dummy = DummyNav()
+        dummy._settings_page_built = False
         with mock.patch.object(navigation.lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
             navigation.QTimer, "singleShot", side_effect=lambda *_args: _args[-1]()
         ):
             dummy._show_settings()
-        self.assertEqual(dummy.pages.current, dummy._settings_page)
+        self.assertEqual(dummy.pages.current, dummy._app_workspace)
+        self.assertEqual(dummy.app_content_stack.current, dummy._settings_page)
+        self.assertIn(("nav", "settings", True), dummy.events)
         self.assertIn(("reload", ["api"], True, True), dummy.events)
+
+        # Second open should not force rebuild when category is already cached.
+        dummy.events.clear()
+        dummy._settings_page_built = True
+        dummy._settings_loaded_categories = {"api"}
+        with mock.patch.object(navigation.lz, "is_valid_agent_dir", return_value=True), mock.patch.object(
+            navigation.QTimer, "singleShot", side_effect=lambda *_args: _args[-1]()
+        ):
+            dummy._show_settings()
+        self.assertFalse(any(isinstance(item, tuple) and item and item[0] == "reload" for item in dummy.events))
 
     def test_settings_reload_skips_target_combo_refresh_for_local_only_categories(self):
         class DummyLabel:
@@ -13711,7 +13986,7 @@ native_oai_config2 = {
                 break
 
         done_item = items[-1]
-        self.assertEqual(captured["max_turns"], 80)
+        self.assertEqual(captured["max_turns"], 180)
         self.assertTrue(captured["yield_info"])
         self.assertEqual(agent.llmclient.log_path, agent.log_path)
         self.assertEqual(done_item["turn"], 2)
@@ -13792,6 +14067,76 @@ native_oai_config2 = {
         self.assertEqual(item["turn"], 1)
         self.assertEqual(item["outputs"], ["**LLM Running (Turn 1) ...**legacy-body"])
         self.assertEqual(agent.history, ["legacy-history"])
+
+    def test_patch_agent_launcher_multimodal_emits_error_field_without_appending_to_done_text(self):
+        queue_mod = __import__("queue")
+        threading_mod = __import__("threading")
+
+        class DummyBackend:
+            def __init__(self):
+                self.history = []
+                self.extra_sys_prompt = ""
+
+        class DummyLLMClient:
+            def __init__(self):
+                self.backend = DummyBackend()
+                self.log_path = ""
+
+        class DummyHandler:
+            def __init__(self, parent, history, temp_dir):
+                self.parent = parent
+                self.history_info = ["history-updated"]
+                self.working = {}
+
+        class DummyAgent:
+            def __init__(self):
+                self.task_queue = queue_mod.Queue()
+                self.task_dir = None
+                self.history = []
+                self.handler = None
+                self.stop_sig = False
+                self.is_running = False
+                self.inc_out = False
+                self.verbose = True
+                self.llmclient = DummyLLMClient()
+                self.log_path = os.path.join("C:\\demo", "temp", "model_responses", "err.txt")
+
+            def abort(self):
+                self.stop_sig = True
+
+            def _handle_slash_cmd(self, raw_query, display_queue):
+                return raw_query
+
+        def fake_agent_runner_loop(*_args, **_kwargs):
+            yield "before-error"
+            raise RuntimeError("boom")
+
+        agentmain = types.SimpleNamespace(
+            smart_format=lambda text, max_str_len=200: text,
+            get_system_prompt=lambda: "system",
+            GenericAgentHandler=DummyHandler,
+            TOOLS_SCHEMA=[],
+            agent_runner_loop=fake_agent_runner_loop,
+            consume_file=lambda *_args, **_kwargs: False,
+            format_error=lambda e: f"ERR:{e}",
+            __file__=os.path.join("C:\\demo", "agentmain.py"),
+        )
+        agent = DummyAgent()
+        bridge._patch_agent_launcher_multimodal(agent, agentmain)
+
+        worker = threading_mod.Thread(target=agent.run, daemon=True)
+        worker.start()
+        dq = agent.put_task("hello")
+        item = None
+        while True:
+            item = dq.get(timeout=2)
+            if "done" in item:
+                break
+
+        self.assertEqual(item["done"], "before-error")
+        self.assertEqual(item.get("error"), "ERR:boom")
+        self.assertNotIn("ERR:boom", str(item.get("done") or ""))
+        self.assertNotIn("```", str(item.get("done") or ""))
 
     def test_load_remote_session_without_saved_reasoning_keeps_combo_on_follow_config(self):
         class DummyCombo:
